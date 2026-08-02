@@ -1,0 +1,90 @@
+sample_id: datavideo_multichart_v2
+chart_type: multichart
+raw_clips_jsonl: data/raw/datavideo_clips.jsonl
+processed_root: data/processed
+generated_root: data/generated_v2
+reviewed_dir: data/reviewed/datavideo_multichart_v2
+review_db: data/review/review.db
+
+context:
+  padding_before_seconds: 5.0
+  padding_after_seconds: 5.0
+  cookies: www.youtube.com_cookies.txt
+  proxy: http://127.0.0.1:<port>
+  max_height: 720
+
+asr:
+  model_path_env: WHISPER_MODEL_PATH
+  device: cuda
+  compute_type: float16
+  word_timestamps: true
+  vad_filter: true
+  sentence_safety_margin_seconds: 0.2
+  max_boundary_expansion_seconds: 5.0
+  pause_threshold_seconds: 0.45
+  cache: true
+
+model:
+  env_var: MODEL_PATH
+  prompt_version: qwen_multichart_assets_v2_direct_values
+  batch_size: 1
+  max_frames_per_call: 1
+  dtype_preference: bf16
+  allow_heuristic_fallback: false
+
+video_standardization:
+  fps: 30
+  crf: 18
+  video_codec: libx264
+  pixel_format: yuv420p
+  audio_codec: aac
+  audio_rate: 48000
+  wav_rate: 16000
+  wav_channels: 1
+
+sampling:
+  fine_fps: 4
+  short_side: 768
+
+keyframes:
+  names:
+    - initial
+  sample_fps: 4
+  max_state_keyframes: 3
+  state_enabled_chart_types:
+    - pictograph
+    - treemap
+  prefer_late_chart_types:
+    - bar
+    - pie
+    - donut
+  tail_frame_min_margin_seconds: 0.25
+  purpose: representative static frame for SVG tracing plus optional state frames for review
+
+clip_data:
+  max_frames: 10
+  purpose: recover directly printed chart data from the whole clip sequence, not only the keyframe
+
+animation:
+  sample_fps: 2
+  types:
+    - no_clear_animation
+    - bar_grow
+    - bar_shrink
+    - line_draw_upward
+    - line_draw_downward
+    - pie_or_donut_segments_appear
+    - map_region_highlight
+    - chart_type_transition
+    - element_appear
+    - element_disappear
+    - element_highlight
+    - other
+  purpose: one-sentence overall target-chart animation description from the complete visual clip
+
+vtracer:
+  color_precision: 6
+  filter_speckle: 4
+  mode: spline
+  hierarchical: stacked
+  path_precision: 8

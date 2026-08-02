@@ -1,0 +1,23 @@
+paths:
+  raw_videos: data/raw/videos
+  keyframes: data/keyframes
+  svg: data/svg
+  audio: data/audio
+  transcripts: data/transcripts
+  annotations: data/annotations
+
+video:
+  sample_fps: 1
+  min_segment_seconds: 3
+  keyframes_per_segment: 3
+
+annotation_fields:
+  - video_id
+  - segment_start
+  - segment_end
+  - chart_type
+  - visual_motion
+  - narration_summary
+  - alignment_notes
+  - keyframe_paths
+  - svg_paths

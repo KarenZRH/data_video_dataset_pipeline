@@ -1,0 +1,15 @@
+pillow
+pandas
+pyyaml
+streamlit
+opencv-python-headless
+cairosvg
+vtracer
+pytest
+torch
+torchvision
+transformers
+accelerate
+qwen-vl-utils
+yt-dlp
+faster-whisper

@@ -1,0 +1,11 @@
+name: DataVideo
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - git
+  - ffmpeg
+  - pip
+  - pip:
+      - -r requirements.txt
