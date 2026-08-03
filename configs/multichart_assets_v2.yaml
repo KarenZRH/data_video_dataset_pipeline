@@ -88,6 +88,16 @@ animation:
     - other
   purpose: one-sentence overall target-chart animation description from the complete visual clip
 
+quality:
+  enable_vlm: false
+  model:
+    client_module: datavideo.qwen_vl
+    client_class: QwenVLClient
+    env_var: QUALITY_MODEL_PATH
+    prompt_version: datavideo_quality_review_v1
+    dtype_preference: bf16
+  purpose: independent quality control; use a separate model/provider from generation when available
+
 vtracer:
   color_precision: 6
   filter_speckle: 4

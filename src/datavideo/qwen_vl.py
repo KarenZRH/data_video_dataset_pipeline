@@ -66,6 +66,18 @@ Use null for values or labels that cannot be read reliably. Do not invent values
 Schema: {"title": null, "x_axis": null, "y_axis": null, "unit": null, "bars": [{"label": null, "value": null}], "uncertain_fields": [], "notes": ""}
 """
 
+QUALITY_REVIEW_PROMPT_PREFIX = """Review these generated dataset artifacts as an independent quality-control model.
+Return only strict JSON:
+{
+  "needs_review": boolean,
+  "severity": "low|medium|high",
+  "issue_codes": [],
+  "evidence": [],
+  "recommended_action": "pass|manual_review|rerun"
+}
+Do not silently approve if visual evidence, recovered data, semantic roles, or state transitions look inconsistent.
+"""
+
 MERGED_CLIP_REVIEW_PROMPT = """You are reviewing a contact sheet from one merged video segment.
 
 Question:
@@ -773,6 +785,38 @@ class QwenVLClient:
                     "failure_reason": f"qwen inference failed: {exc}",
                 }
         return self._unavailable_semantic_components(self.load_error or "qwen unavailable")
+
+    def review_quality(self, image_paths: list[str], prompt: str) -> dict[str, Any]:
+        if self.load():
+            raw: str | None = None
+            try:
+                raw = self._generate(image_paths, QUALITY_REVIEW_PROMPT_PREFIX + "\n\n" + prompt, max_new_tokens=768)
+                result = _json_from_text(raw)
+                return {
+                    "result": {
+                        "needs_review": bool(result.get("needs_review", False)),
+                        "severity": str(result.get("severity") or "medium"),
+                        "issue_codes": result.get("issue_codes") if isinstance(result.get("issue_codes"), list) else [],
+                        "evidence": result.get("evidence") if isinstance(result.get("evidence"), list) else [],
+                        "recommended_action": str(result.get("recommended_action") or "manual_review"),
+                    },
+                    "raw_response": raw,
+                    "model_status": "qwen",
+                    "failure_reason": None,
+                }
+            except Exception as exc:
+                return {
+                    "result": {"needs_review": True, "severity": "medium", "issue_codes": ["qc_vlm_failed"], "evidence": [str(exc)], "recommended_action": "manual_review"},
+                    "raw_response": raw,
+                    "model_status": "qwen_unavailable",
+                    "failure_reason": f"qwen quality review failed: {exc}",
+                }
+        return {
+            "result": {"needs_review": True, "severity": "medium", "issue_codes": ["qc_vlm_unavailable"], "evidence": [self.load_error or "qwen unavailable"], "recommended_action": "manual_review"},
+            "raw_response": None,
+            "model_status": "qwen_unavailable",
+            "failure_reason": self.load_error or "qwen unavailable",
+        }
 
     def _unavailable_chart(self, reason: str) -> dict[str, Any]:
         result = chart_result(

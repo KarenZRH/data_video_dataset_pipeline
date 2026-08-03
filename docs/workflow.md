@@ -167,6 +167,28 @@ Sampling is two-stage: keep the coarse scan at 2 FPS, use cheap frame/chart-regi
 
 State merging is local in time: only consecutive rows with the same entity set and values are merged, preserving `state_start`, `state_end`, and evidence. `A -> A -> B -> B -> A` remains three states (`A`, `B`, `A`), while pure animation interpolation with unchanged printed data remains one state. Entity additions are `insert`, value changes are `update`, and disappearances are `remove`.
 
+## Quality Control
+
+After keyframes, data tables, semantic SVGs, animation detection, and narration are generated, run quality control to produce a review queue:
+
+```bash
+python -m datavideo.cli quality-check --config configs/multichart_assets_v2.yaml
+```
+
+The checker uses three layers:
+
+1. Python rule checks for required files, JSON/CSV schema, include/exclude consistency, state counts, and event consistency.
+2. Python cross-artifact checks for `dynamic_data` entity IDs against `semantic.svg` and state-level semantic SVGs.
+3. Optional VLM review over keyframes, semantic previews, dynamic data summaries, animation detection, and narration-derived evidence.
+
+The VLM quality model is configured separately under `quality.model`, so it can use a different provider from the production model. `quality.enable_vlm=false` runs only the deterministic Python checks. Outputs are written to:
+
+```text
+data/generated_v2/quality/quality_report.json
+data/generated_v2/quality/quality_flags.csv
+data/generated_v2/quality/quality_review_queue.csv
+```
+
 ## Intervals
 
 `data/processed/<clip_id>/intervals.json` stores machine/source facts only:

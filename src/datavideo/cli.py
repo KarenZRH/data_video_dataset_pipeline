@@ -17,6 +17,7 @@ from .media import extract_clip, ffprobe, normalize_video
 from .merge_review import review_merged_clips
 from .model_client import make_qwen_client
 from .review_db import init_db
+from .quality import run_quality_check
 from .semantic import build_semantic_svg
 from .schemas import ensure_dir, read_jsonl, write_json, write_jsonl
 from datavideo_multichart.assets import run_pipeline as run_multichart_assets_pipeline
@@ -214,6 +215,7 @@ def main() -> None:
             "multichart-asr-v2",
             "multichart-propose-v2",
             "multichart-review-v2",
+            "quality-check",
         ],
     )
     parser.add_argument("--config", default="configs/stage1_bar.yaml")
@@ -249,6 +251,8 @@ def main() -> None:
         report = run_multichart_proposal_v2_pipeline(cfg, force=args.force)
     elif args.command == "multichart-review-v2":
         report = apply_multichart_v2_reviews(cfg)
+    elif args.command == "quality-check":
+        report = run_quality_check(cfg, force=args.force)
     else:
         stage0(cfg, force=args.force)
         report = stage1(cfg, force=args.force)
