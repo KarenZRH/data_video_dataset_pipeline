@@ -5,11 +5,11 @@ from typing import Any
 
 from datavideo.context import create_context_media
 from datavideo.narration import transcribe_context_audio
+from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
-from datavideo.svg_trace import trace_svg
 
 from .animation import detect_animation
-from .assets import recover_clip_data, select_keyframe
+from .assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
 from .qwen import MultichartQwenClient
 
 
@@ -48,8 +48,9 @@ def _write_candidate_report(
     asr_report: dict[str, Any],
     keyframes: dict[str, Any],
     animation: dict[str, Any],
-    trace: dict[str, Any],
+    semantic: dict[str, Any],
     chart_data: dict[str, Any],
+    semantic_state_svgs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clip_payload = _reference_clip_metadata(row)
     clip_payload["animation_description"] = animation.get("overall_description")
@@ -64,7 +65,8 @@ def _write_candidate_report(
         "clip_video": str(clip_root / "clip.mp4"),
         "keyframes": keyframes,
         "animation_detection": animation,
-        "trace": trace,
+        "semantic": semantic,
+        "semantic_state_svgs": semantic_state_svgs or {},
         "chart_data": chart_data,
     }
     write_json(clip_root / "clip_report.json", clip_report)
@@ -177,13 +179,19 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 force=asset_force,
             )
             initial = keyframes["assets"]["initial"]
-            trace = trace_svg(initial, clip_root, cfg, force=asset_force)
+            semantic = build_semantic_svg(initial, clip_root, cfg, force=asset_force)
             chart_data = recover_clip_data(
                 cfg,
                 keyframes,
                 _reference_clip_metadata(row),
                 clip_root,
                 client=client,
+                force=asset_force,
+            )
+            semantic_state_svgs = build_semantic_state_svgs(
+                chart_data.get("semantic_state_inputs"),
+                clip_root,
+                cfg,
                 force=asset_force,
             )
 
@@ -195,7 +203,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 asr_report,
                 keyframes,
                 animation,
-                trace,
+                semantic,
+                semantic_state_svgs,
                 chart_data,
             )
             clip_report["visual_boundary_source"] = "web_reference_interval"

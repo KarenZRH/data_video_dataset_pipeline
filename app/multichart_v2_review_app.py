@@ -198,12 +198,12 @@ with left:
     st.caption(f"Source time range: {clip.get('start_time')} - {clip.get('end_time')} | duration {duration:.3f}s")
 
 with right:
-    st.subheader("Trace Preview")
-    preview = clip_root / "trace_preview.png"
+    st.subheader("Semantic Preview")
+    preview = clip_root / "semantic_preview.png"
     if preview.exists():
-        st.image(str(preview), caption="trace_preview.png", use_container_width=True)
+        st.image(str(preview), caption="semantic_preview.png", use_container_width=True)
     svg_report = read_json(clip_root / "svg_report.json") if (clip_root / "svg_report.json").exists() else {}
-    with st.expander("Trace report", expanded=False):
+    with st.expander("Semantic SVG report", expanded=False):
         st.json(svg_report)
 
 st.subheader("Final Keyframe")

@@ -1,6 +1,6 @@
 # 当前工作流
 
-当前主线是 **bar-chart-dominant data-video clip**：从一个 raw video 中找出以柱状/条形 mark 为主要数据表达的片段，生成 clip、关键帧、SVG trace、图表数据草稿，再进入 Streamlit 审核页。
+当前主线是 **bar-chart-dominant data-video clip**：从一个 raw video 中找出以柱状/条形 mark 为主要数据表达的片段，生成 clip、关键帧、semantic SVG、图表数据草稿，再进入 Streamlit 审核页。
 
 ## 0. 当前 baseline 和入口
 
@@ -445,7 +445,7 @@ combined_score =
 
 ### 7.3 initial frame 转 SVG
 
-代码路径：`src/datavideo/svg_trace.py::trace_svg()`
+代码路径：`src/datavideo/semantic.py::build_semantic_svg()`
 
 工具：`vtracer`
 
@@ -469,8 +469,8 @@ combined_score =
 
 输出：
 
-- `trace.svg`
-- `trace_preview.png`
+- `semantic.svg`
+- `semantic_preview.png`
 - `svg_report.json`
 
 ### 7.4 从 initial frame 恢复柱状图数据
@@ -534,7 +534,7 @@ streamlit run app/review_app.py --server.address 127.0.0.1 --server.port 8501
 2. 可编辑 `Start` / `End`，step 为 0.1 秒，显示 3 位小数。
 3. 右侧显示 `svg_report.json`。
 4. 展示 `keyframes/initial.png`。
-5. 对比 `initial.png` 与 `trace_preview.png`。
+5. 对比 `initial.png` 与 `semantic_preview.png`。
 6. 读取 `chart_data.csv`，用 `st.data_editor` 让人工修改 `label/value` 行。
 7. expander 中显示 `chart_metadata.json` 和 `chart_data_validation.json`。
 8. 审核决策：
@@ -591,8 +591,8 @@ apply_latest_reviews(cfg)
 1. 建目录：`reviewed_dir/clips/<clip_id>/`
 2. 从 generated clip 目录复制：
    - `keyframes/`
-   - `trace.svg`
-   - `trace_preview.png`
+   - `semantic.svg`
+   - `semantic_preview.png`
    - `svg_report.json`
    - `chart_data_raw.json`
    - `chart_metadata.json`
@@ -629,7 +629,7 @@ reviewed_dir/clips/<clip_id>/
 4. 合并 positive frames。
 5. 对每个候选片段 8 FPS 细抽帧。
 6. 再次模型识别并 refine 边界。
-7. 截 clip、选 keyframe、trace SVG、恢复数据。
+7. 截 clip、选 keyframe、生成 semantic SVG、恢复数据。
 
 这个流程更偏“chart visible”而不是当前严格的 bar-dominant data-video semantic process。
 
@@ -669,8 +669,8 @@ data/generated/bar_002/
     keyframes/initial.png
     keyframes/keyframe_manifest.json
     keyframes/keyframe_scores.jsonl
-    trace.svg
-    trace_preview.png
+    semantic.svg
+    semantic_preview.png
     svg_report.json
     chart_data_raw.json
     chart_data.csv

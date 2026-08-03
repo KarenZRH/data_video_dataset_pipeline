@@ -96,12 +96,17 @@ data/generated_v2/<clip_id>/
     states/
     keyframe_manifest.json
     keyframe_scores.jsonl
-  trace.svg
-  trace_preview.png
+  semantic.svg
+  semantic_preview.png
   animation_detection_raw.json
   animation_detection.json
   chart_data_clip_raw.json
   chart_data.csv
+  dynamic_data.json
+  dynamic_data.csv
+  final_data_table.csv
+  data_change_events.csv
+  data_events.jsonl
   chart_data_validation.json
   clip_report.json
 ```
@@ -113,11 +118,16 @@ data/reviewed/datavideo_multichart_v2/clips/<clip_id>/
   clip.mp4                  # strict webpage reference visual clip
   intervals.json
   keyframes/final.png
-  trace.svg
-  trace_preview.png
+  semantic.svg
+  semantic_preview.png
   animation_detection.json
   animation_reviewed.json
   chart_data.csv
+  dynamic_data.json
+  dynamic_data.csv
+  final_data_table.csv
+  data_change_events.csv
+  data_events.jsonl
   narration_reviewed.json
   narration/
     selected_full_sentences.jsonl
@@ -137,6 +147,25 @@ data/review/review.db
 ```
 
 `data/reviewed/...` is reserved for rebuilt final reviewed artifacts only.
+
+## Dynamic Data Recovery
+
+`dynamic_data.json` and `dynamic_data.csv` are the canonical machine outputs for recovered data states. `final_data_table.csv` stores the latest known value or qualitative fact per entity, `data_change_events.csv` stores insert/update/remove events, `chart_data.csv` remains the review-table compatible view, and `data_events.jsonl` mirrors change events for downstream animation tooling.
+
+Each dynamic state row contains:
+
+```text
+clip_id,state_id,entity_id,metric,value,unit,state_start,state_end,
+source_type,evidence_frames,evidence_sentence_id,confidence,review_status
+```
+
+Recovery uses the visual clip first. Qwen is asked to recover only values printed in selected evidence frames; it must not convert bar length or line position into a true value unless a printed value or reliable scale is visible. If no visual value is recoverable, narration still runs and may provide exact numeric facts from complete overlapping/corresponding sentences. English number words are supported, such as `two full days -> 2 day`. If at least one reliable numeric fact exists, the clip may be included as `data_completeness=partial`; missing entities remain qualitative/null. If neither source has verifiable quantitative data, the clip is excluded with `exclude_reason=no_recoverable_quantitative_data`.
+
+Visual and narration evidence are fused by stable identity. Matching values become `source_type=both`; conflicts keep both pieces of evidence and set `review_status=needs_review`. A narration sentence that only says increase/decrease without a number is not a numeric data row. Qualitative narration such as `a lot of time` may be retained as a partial, non-numeric entity fact.
+
+Sampling is two-stage: keep the coarse scan at 2 FPS, use cheap frame/chart-region/OCR-change signals to mark possible data-change windows, extract state/evidence frames at 8 FPS only inside those windows, and fall back to source FPS inside a window only when the fine sample is still too sparse. Qwen is called only on selected representative state/evidence frames, not on every high-FPS frame.
+
+State merging is local in time: only consecutive rows with the same entity set and values are merged, preserving `state_start`, `state_end`, and evidence. `A -> A -> B -> B -> A` remains three states (`A`, `B`, `A`), while pure animation interpolation with unchanged printed data remains one state. Entity additions are `insert`, value changes are `update`, and disappearances are `remove`.
 
 ## Intervals
 
@@ -241,7 +270,7 @@ transcript_provenance.json
 
 ## 4. Visual Assets
 
-Generate keyframes, SVG trace, and chart data from the strict visual clip:
+Generate keyframes, semantic SVG, and chart data from the strict visual clip:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
@@ -265,7 +294,7 @@ It writes `data/generated_v2/<clip_id>/clip.mp4` as the visual clip used for rev
 - optional `keyframes/states/state_*.png`;
 - a Qwen whole-clip target-chart animation description;
 - optional major target-chart animation actions with evidence timestamps;
-- `trace.svg` and `trace_preview.png`;
+- `semantic.svg` and `semantic_preview.png`;
 - chart data from visual-clip frame sequences.
 
 Animation-detection rule:
@@ -443,7 +472,7 @@ The page reviews:
 - selected keyframe and state frames;
 - animation overall description and optional major-action table;
 - narration sentences and editable reviewed narration text;
-- PNG/SVG trace outputs;
+- PNG/SVG semantic outputs;
 - recovered chart data;
 - asset decision.
 

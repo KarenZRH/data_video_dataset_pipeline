@@ -62,17 +62,17 @@ initial_path = clip_root / "keyframes" / "initial.png"
 if initial_path.exists():
     st.image(str(initial_path), caption="initial.png", use_container_width=True)
 
-st.subheader("Initial vs Trace Preview")
+st.subheader("Initial vs Semantic Preview")
 cols = st.columns(2)
 with cols[0]:
     if initial_path.exists():
         st.image(str(initial_path), caption="initial.png", use_container_width=True)
 with cols[1]:
-    preview = clip_root / "trace_preview.png"
+    preview = clip_root / "semantic_preview.png"
     if not preview.exists():
-        preview = generated / "trace_preview.png"
+        preview = generated / "semantic_preview.png"
     if preview.exists():
-        st.image(str(preview), caption="trace_preview.png", use_container_width=True)
+        st.image(str(preview), caption="semantic_preview.png", use_container_width=True)
 
 st.subheader("Recovered Data")
 csv_path = clip_root / "chart_data.csv"

@@ -17,8 +17,8 @@ from .media import extract_clip, ffprobe, normalize_video
 from .merge_review import review_merged_clips
 from .model_client import make_qwen_client
 from .review_db import init_db
+from .semantic import build_semantic_svg
 from .schemas import ensure_dir, read_jsonl, write_json, write_jsonl
-from .svg_trace import trace_svg
 from datavideo_multichart.assets import run_pipeline as run_multichart_assets_pipeline
 from datavideo_multichart_v2.pipeline import (
     run_asr_pipeline as run_multichart_asr_v2_pipeline,
@@ -154,7 +154,7 @@ def stage1(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
         keyframe_dir = clip_root / "keyframes"
         keyframe_manifest = extract_scored_keyframe(normalized, refined, keyframe_dir, cfg, force=force)
         initial = keyframe_manifest["assets"]["initial"]
-        trace_report = trace_svg(initial, clip_root, cfg, force=force)
+        semantic_report = build_semantic_svg(initial, clip_root, cfg, force=force)
         data_report = recover_chart_data(cfg, initial, clip_root)
 
         clip_reports.append(
@@ -162,7 +162,7 @@ def stage1(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 "clip": refined,
                 "clip_video": str(clip_video),
                 "keyframes": keyframe_manifest,
-                "trace": trace_report,
+                "semantic": semantic_report,
                 "chart_data": data_report,
             }
         )
@@ -185,7 +185,7 @@ def stage1(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
         "selected_clip": first_report["clip"],
         "clip_video": first_report["clip_video"],
         "keyframes": first_report["keyframes"],
-        "trace": first_report["trace"],
+        "semantic": first_report["semantic"],
         "chart_data": first_report["chart_data"],
         "model_path": os.environ.get(cfg["model"]["env_var"]),
         "prompt_version": cfg["model"]["prompt_version"],

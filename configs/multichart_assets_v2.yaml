@@ -62,7 +62,13 @@ keyframes:
   purpose: representative static frame for SVG tracing plus optional state frames for review
 
 clip_data:
+  coarse_fps: 2
+  fine_fps: 8
   max_frames: 10
+  max_new_tokens: 4096
+  motion_change_threshold: 0.08
+  min_fine_window_frames: 2
+  max_source_fps: 30
   purpose: recover directly printed chart data from the whole clip sequence, not only the keyframe
 
 animation:

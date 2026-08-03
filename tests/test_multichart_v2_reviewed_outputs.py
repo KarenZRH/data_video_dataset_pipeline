@@ -26,6 +26,10 @@ def test_apply_latest_reviews_writes_reviewed_narration(tmp_path):
     write_json(clip_root / "chart_metadata.json", {})
     write_json(clip_root / "chart_data_validation.json", {})
     write_json(clip_root / "chart_data_clip_raw.json", {})
+    write_json(clip_root / "dynamic_data.json", {"states": [{"entity_id": "car", "value": 20}]})
+    (clip_root / "dynamic_data.csv").write_text("entity_id,value\ncar,20\n", encoding="utf-8")
+    (clip_root / "final_data_table.csv").write_text("entity,value,unit\nCAR,20,%\n", encoding="utf-8")
+    (clip_root / "data_change_events.csv").write_text("event_type,entity\ninsert,CAR\n", encoding="utf-8")
     write_json(clip_root / "animation_detection.json", {"overall_description": "machine animation"})
     write_json(clip_root / "animation_detection_raw.json", {})
     write_json(
@@ -93,3 +97,7 @@ def test_apply_latest_reviews_writes_reviewed_narration(tmp_path):
     assert reviewed_clip["narration_text"] == "hello world"
     assert read_json(Path(cfg["reviewed_dir"]) / "clips" / "bar_1" / "narration_reviewed.json")["full_text"] == "hello world"
     assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_1" / "narration" / "selected_full_sentences.jsonl").exists()
+    assert read_json(Path(cfg["reviewed_dir"]) / "clips" / "bar_1" / "dynamic_data.json")["states"][0]["entity_id"] == "car"
+    assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_1" / "dynamic_data.csv").exists()
+    assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_1" / "final_data_table.csv").exists()
+    assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_1" / "data_change_events.csv").exists()

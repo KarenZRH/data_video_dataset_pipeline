@@ -67,10 +67,14 @@ Rules:
 - Extract only values directly printed in the frames: numbers, percentages, dates, years, ranks, counts, currency, labels, and units.
 - HARD CONSTRAINT: do not infer or estimate numeric values. Never convert bar length, line height, area size, pie/donut angle, map color, pictograph icon count, treemap area, or geometry into numbers.
 - A row is valid only when its numeric value is visible as printed text in at least one frame. Put that exact visible text in raw_text and evidence_text.
+- Only include multiple rows for the same label/series when the printed data value itself changes. Do not create rows for bar entrance, line drawing, zooming, highlighting, or other pure animation interpolation if the printed value is unchanged.
+- If the same printed data value appears in several consecutive frames, keep at most representative rows with source_frame/time_seconds evidence; downstream code will merge consecutive identical states.
 - If labels are visible but no numeric values are printed, set has_extractable_data=false. Do not create approximate relative percentages such as 20/50/100.
 - If a number is printed in a label/callout/legend/node/segment/bar/category, include it.
 - If a printed value appears in multiple frames, deduplicate it.
-- If the clip shows changing years/states, keep the year/state in the row when visible. For bar charts with a changing time state, extract at least start and end states when printed values exist.
+- If the clip shows changing years/states, keep the year/state in every row when visible. For bar charts with a changing time state, extract every distinct printed year/state that is visible enough to read, including at least the first and last states.
+- For each distinct printed year/state, return a complete set of rows for all visible entities in that state. Do not split one year/state into several states just because bars appear one after another.
+- If the same chart changes from one printed year/state to another, preserve rows for both years/states even when labels are identical.
 - If labels are visible but values require visual estimation or counting, set needs_manual_data=true and create manual_stub_rows.
 - Preserve units exactly as shown when visible.
 - For pictographs, read numbers in titles, annotations, legends, icon labels, and explanatory text. Do not count icons unless a printed unit-per-icon rule and count are both visible.
@@ -87,6 +91,15 @@ Schema:
   "y_axis": null,
   "series": [],
   "temporal_change": boolean,
+  "states": [
+    {
+      "state": null,
+      "year": null,
+      "source_frame": null,
+      "time_seconds": null,
+      "rows": []
+    }
+  ],
   "rows": [
     {
       "state": null,
@@ -100,7 +113,8 @@ Schema:
       "raw_text": null,
       "evidence_text": null,
       "source_frame": null,
-      "time_seconds": null
+      "time_seconds": null,
+      "confidence": null
     }
   ],
   "manual_stub_rows": [
@@ -229,12 +243,68 @@ def _normalize_keyframe_score(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _flatten_chart_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    direct_rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+    rows.extend(row for row in direct_rows if isinstance(row, dict))
+    grouped_states = result.get("states") if isinstance(result.get("states"), list) else []
+    for state in grouped_states:
+        if not isinstance(state, dict):
+            continue
+        state_rows = state.get("rows") if isinstance(state.get("rows"), list) else []
+        for row in state_rows:
+            if not isinstance(row, dict):
+                continue
+            rows.append(
+                {
+                    **row,
+                    "state": row.get("state", state.get("state")),
+                    "year": row.get("year", state.get("year")),
+                    "source_frame": row.get("source_frame", state.get("source_frame")),
+                    "time_seconds": row.get("time_seconds", state.get("time_seconds")),
+                }
+            )
+    return rows
+
+
+def _row_dedupe_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("year"),
+        row.get("state"),
+        row.get("label"),
+        row.get("series"),
+        row.get("x"),
+        row.get("y"),
+        row.get("value"),
+        row.get("unit"),
+        row.get("raw_text"),
+        row.get("source_frame"),
+        row.get("time_seconds"),
+    )
+
+
+def _looks_like_chart_title_entity(row: dict[str, Any], result: dict[str, Any]) -> bool:
+    label = str(row.get("label") or row.get("series") or "").strip().lower()
+    if not label:
+        return False
+    title = str(result.get("title") or "").strip().lower()
+    y_axis = str(result.get("y_axis") or "").strip().lower()
+    if title and label == title:
+        return True
+    if y_axis and re.fullmatch(re.escape(y_axis) + r"\s+\d{4}", label):
+        return True
+    return False
+
+
 def _normalize_chart_data(result: dict[str, Any], chart_type: str) -> dict[str, Any]:
-    rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+    rows = _flatten_chart_rows(result)
     visible_text = result.get("visible_text") if isinstance(result.get("visible_text"), list) else []
     normalized_rows = []
+    seen_rows = set()
     for row in rows:
         if isinstance(row, dict):
+            if _looks_like_chart_title_entity(row, result):
+                continue
             candidate = (
                 {
                     "state": row.get("state"),
@@ -249,10 +319,15 @@ def _normalize_chart_data(result: dict[str, Any], chart_type: str) -> dict[str, 
                     "evidence_text": row.get("evidence_text", row.get("raw_text")),
                     "source_frame": row.get("source_frame"),
                     "time_seconds": row.get("time_seconds"),
+                    "confidence": row.get("confidence"),
                 }
             )
             if _has_direct_numeric_evidence(candidate, visible_text):
                 candidate["evidence_text"] = _best_evidence_text(candidate, visible_text)
+                dedupe_key = _row_dedupe_key(candidate)
+                if dedupe_key in seen_rows:
+                    continue
+                seen_rows.add(dedupe_key)
                 normalized_rows.append(candidate)
     has_extractable = _as_bool(result.get("has_extractable_data", bool(normalized_rows)))
     if not normalized_rows:
@@ -356,6 +431,17 @@ def _has_direct_numeric_evidence(row: dict[str, Any], visible_text: list[Any] | 
     )
     if not has_printed_number:
         return False
+    value_text = str(row.get("value") or "").replace(",", "").strip()
+    label_text = str(row.get("label") or "").replace(",", "").strip()
+    x_text = str(row.get("x") or "").replace(",", "").strip()
+    unit_text = str(row.get("unit") or "").lower()
+    raw_text = f"{row.get('raw_text') or ''} {row.get('evidence_text') or ''}".lower()
+    if value_text and value_text in {label_text, x_text} and re.fullmatch(r"\d{4}", value_text):
+        return False
+    if unit_text in {"$", "usd", "dollar", "dollars"} and value_text:
+        currency_pattern = rf"(?:[$€£¥]\s*{re.escape(value_text)}|{re.escape(value_text)}\s*(?:dollars?|usd)\b)"
+        if not re.search(currency_pattern, raw_text.replace(",", ""), re.I):
+            return False
     normalized_evidence = evidence.replace(",", "")
     for value in numeric_values:
         normalized_value = str(value).replace(",", "").strip()
@@ -406,7 +492,8 @@ class MultichartQwenClient:
                 prompt = CLIP_DATA_PROMPT.replace(
                     "__CHART_CONTEXT__", json.dumps(chart_context, ensure_ascii=False, indent=2)
                 ).replace("__FRAME_CONTEXT__", json.dumps(frame_context, ensure_ascii=False, indent=2))
-                raw = self.base._generate(image_paths, prompt, max_new_tokens=1024)
+                max_tokens = int(self.cfg.get("clip_data", {}).get("max_new_tokens", 4096))
+                raw = self.base._generate(image_paths, prompt, max_new_tokens=max_tokens)
                 data = _normalize_chart_data(_json_from_text(raw), chart_type)
                 return {"data": data, "raw_response": raw, "model_status": "qwen", "failure_reason": None}
             except Exception as exc:

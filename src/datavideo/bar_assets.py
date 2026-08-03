@@ -8,8 +8,8 @@ from .chart_data import recover_chart_data
 from .keyframes import extract_scored_keyframe
 from .media import extract_clip
 from .model_client import make_qwen_client
+from .semantic import build_semantic_svg
 from .schemas import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
-from .svg_trace import trace_svg
 
 
 def run_bar_assets_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
@@ -47,14 +47,14 @@ def run_bar_assets_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[st
 
         keyframes = extract_scored_keyframe(normalized, clip, keyframe_dir, cfg, client=client, force=force)
         initial = keyframes["assets"]["initial"]
-        trace = trace_svg(initial, clip_root, cfg, force=force)
+        semantic = build_semantic_svg(initial, clip_root, cfg, force=force)
         chart_data = recover_chart_data(cfg, initial, clip_root, client=client)
 
         report = {
             "clip": clip,
             "clip_video": str(clip_video),
             "keyframes": keyframes,
-            "trace": trace,
+            "semantic": semantic,
             "chart_data": chart_data,
         }
         write_json(clip_report_path, report)

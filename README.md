@@ -165,8 +165,13 @@ python -m datavideo.cli multichart-assets --config configs/multichart_assets.yam
 ```
 
 Each completed clip directory contains `clip.mp4`, `keyframes/initial.png`,
-`trace.svg`, `trace_preview.png`, and JSON reports. `chart_data.csv` is written
-only when the selected keyframe contains concrete readable chart data.
+`semantic.svg`, `semantic_preview.png`, and JSON reports. Dynamic data recovery writes
+`dynamic_data.json`, `dynamic_data.csv`, `final_data_table.csv`,
+`data_change_events.csv`, `data_events.jsonl`, and the review-compatible `chart_data.csv`
+when visual frames or corresponding narration contain verifiable numeric values. Clips
+with at least one reliable numeric fact can be included as partial data; clips without
+recoverable quantitative data are excluded with `no_recoverable_quantitative_data`.
+Geometry-only bar/line interpolation is not treated as data.
 
 The Qwen model path is read from `MODEL_PATH`. The implementation prefers BF16 when CUDA reports BF16 support, otherwise FP16. If Qwen chart detection is unavailable, the pipeline records the failure and does not create positive clips from fallback guesses.
 
@@ -193,5 +198,5 @@ Do not continue new experiments from `data/reviewed/bar_001/candidates/` or old 
 ## Next Build Steps
 
 - Use `data/generated/bar_001/final_bar_clips.jsonl` as the source of accepted clips.
-- `bar-assets` now selects a complete static-form keyframe for each accepted bar clip, writes VTracer `trace.svg`, recovers chart data, and prepares Streamlit review assets.
+- `bar-assets` now selects a complete static-form keyframe for each accepted bar clip, writes VTracer `semantic.svg`, recovers chart data, and prepares Streamlit review assets.
 - Later: add animation description, Whisper transcription, narration-animation alignment, and Streamlit/manual review for the revised schema.

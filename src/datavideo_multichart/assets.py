@@ -7,8 +7,8 @@ from typing import Any
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
 from datavideo.media import ffprobe, normalize_video
+from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
-from datavideo.svg_trace import trace_svg
 
 from .qwen import MultichartQwenClient
 
@@ -273,8 +273,8 @@ def _cached_report(path: Path, row: dict[str, Any], force: bool) -> dict[str, An
     if cached_clip.get("clip_id") != expected_id or cached_clip.get("video_id") != row.get("video_id"):
         return None
     keyframe = Path(cached.get("keyframes", {}).get("assets", {}).get("initial", ""))
-    trace_svg_path = Path(cached.get("trace", {}).get("trace_svg", ""))
-    if keyframe.exists() and trace_svg_path.exists():
+    semantic_svg_path = Path(cached.get("semantic", {}).get("semantic_svg", ""))
+    if keyframe.exists() and semantic_svg_path.exists():
         return cached
     return None
 
@@ -318,7 +318,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 force=force,
             )
             initial = keyframes["assets"]["initial"]
-            trace = trace_svg(initial, clip_root, cfg, force=force)
+            semantic = build_semantic_svg(initial, clip_root, cfg, force=force)
             chart_data = recover_chart_data(cfg, initial, row, clip_root, client=client, force=force)
 
             clip_payload = {
@@ -332,7 +332,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 "media": media,
                 "clip_video": str(clip_video),
                 "keyframes": keyframes,
-                "trace": trace,
+                "semantic": semantic,
                 "chart_data": chart_data,
             }
             write_json(clip_report_path, report)

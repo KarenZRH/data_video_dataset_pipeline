@@ -24,8 +24,8 @@ def test_apply_latest_reviews_builds_clean_reviewed_set(tmp_path):
         (root / "keyframes").mkdir(parents=True)
         (root / "clip.mp4").write_bytes(b"mp4")
         (root / "keyframes" / "initial.png").write_bytes(b"png")
-        (root / "trace.svg").write_text("<svg />\n", encoding="utf-8")
-        (root / "trace_preview.png").write_bytes(b"png")
+        (root / "semantic.svg").write_text("<svg />\n", encoding="utf-8")
+        (root / "semantic_preview.png").write_bytes(b"png")
         write_json(root / "svg_report.json", {"success": True})
         write_json(root / "chart_metadata.json", {})
         write_json(root / "chart_data_validation.json", {})
@@ -72,5 +72,7 @@ def test_apply_latest_reviews_builds_clean_reviewed_set(tmp_path):
     assert report["excluded_count"] == 1
     assert read_jsonl(Path(cfg["reviewed_dir"]) / "final_bar_clips.jsonl")[0]["clip_id"] == "bar_final_000"
     assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_final_000" / "clip.mp4").exists()
+    assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_final_000" / "semantic.svg").exists()
+    assert (Path(cfg["reviewed_dir"]) / "clips" / "bar_final_000" / "semantic_preview.png").exists()
     assert "A,10" in (Path(cfg["reviewed_dir"]) / "clips" / "bar_final_000" / "chart_data.csv").read_text()
     assert not (Path(cfg["reviewed_dir"]) / "clips" / "bar_final_001").exists()

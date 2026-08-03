@@ -212,6 +212,44 @@ Return strict JSON only:
 }
 """
 
+SEMANTIC_COMPONENT_PROMPT = """You are extracting coarse semantic structure from one chart keyframe.
+
+Return one strict JSON object only. Do not use markdown fences. Do not invent data values.
+
+Task:
+- Identify entities and their roles.
+- Give rough bounding boxes for visible semantic parts.
+- Use readable text when visible; otherwise set text to null and text_status to "unreadable".
+- Group parts that belong to the same entity.
+- Do not output final component ids. The program will compile stable ids later.
+
+Allowed chart_type values: horizontal_bar, vertical_bar, line, mixed, unknown
+Allowed role values: icon, category_label, value_label, bar, series, axis, annotation, title
+
+Required JSON shape:
+- chart_type: one allowed chart_type string.
+- entities: array. Each entity has entity_key, label, confidence, components.
+- components inside an entity: array. Each component has role, bbox_px, label, text, text_status, confidence, reason.
+- standalone_components: array using the same component object shape for title, axis, annotations, decorations worth keeping, or ungrouped series.
+- warnings: array of strings.
+
+bbox_px rules:
+- bbox_px is [left_px, top_px, right_px, bottom_px] in image pixel coordinates.
+- Use actual visible coordinates from the image.
+- right_px must be greater than left_px, and bottom_px must be greater than top_px.
+- Never output placeholder boxes. If a component is not visible enough to locate, omit that component and add a warning.
+
+Semantic rules:
+- A bar is a data-encoding rectangle. A colored label box is not a bar.
+- A line chart curve/path is a series, never a bar.
+- An icon is a pictorial symbol or illustration tied to an entity.
+- A title is the top heading. Axes and baselines are axis.
+- If the image has multiple repeated rows or repeated series, create one entity per repeated item.
+- For bar-chart rows, include icon when visible, category_label when visible, and bar when visible.
+- For line charts, include one series per distinct visible curve when possible.
+- Keep boxes coarse but sensible; OCR and OpenCV will refine them later.
+"""
+
 def _json_from_text(text: str) -> dict[str, Any]:
     match = re.search(r"\{.*\}", text, re.S)
     payload = match.group(0) if match else text
@@ -434,6 +472,110 @@ def _normalize_keyframe_score(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_semantic_components(result: dict[str, Any]) -> dict[str, Any]:
+    allowed_roles = {"bar", "icon", "category_label", "value_label", "series", "axis", "annotation", "title"}
+    chart_type = str(result.get("chart_type", "unknown") or "unknown")
+
+    def _normalize_bbox(bbox: Any) -> list[int] | None:
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return None
+        try:
+            return [int(round(float(value))) for value in bbox]
+        except Exception:
+            return None
+
+    entities: list[dict[str, Any]] = []
+    for index, item in enumerate(result.get("entities", []), start=1):
+        if not isinstance(item, dict):
+            continue
+        entity_key = str(item.get("entity_key") or item.get("label") or f"entity-{index}").strip()
+        label = str(item.get("label") or entity_key).strip()
+        components: list[dict[str, Any]] = []
+        for component in item.get("components", []):
+            if not isinstance(component, dict):
+                continue
+            role = str(component.get("role") or "").strip()
+            if role not in allowed_roles:
+                continue
+            bbox = _normalize_bbox(component.get("bbox_px"))
+            if bbox is None:
+                continue
+            text = component.get("text")
+            text_status = str(component.get("text_status") or ("readable" if text else "unreadable"))
+            components.append(
+                {
+                    "role": role,
+                    "bbox_px": bbox,
+                    "label": str(component.get("label") or label or role).strip(),
+                    "text": None if text is None else str(text),
+                    "text_status": text_status,
+                    "confidence": _clamp01(component.get("confidence", 0.0)),
+                    "reason": str(component.get("reason", "") or ""),
+                    "animation_axis": str(component.get("animation_axis") or "") or None,
+                    "anchor": str(component.get("anchor") or "") or None,
+                }
+            )
+        if components:
+            entities.append(
+                {
+                    "entity_key": entity_key,
+                    "label": label,
+                    "confidence": _clamp01(item.get("confidence", 0.0)),
+                    "components": components,
+                }
+            )
+
+    standalone_components: list[dict[str, Any]] = []
+    for item in result.get("standalone_components", []):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role not in allowed_roles:
+            continue
+        bbox = _normalize_bbox(item.get("bbox_px"))
+        if bbox is None:
+            continue
+        text = item.get("text")
+        standalone_components.append(
+            {
+                "role": role,
+                "bbox_px": bbox,
+                "label": str(item.get("label") or role).strip(),
+                "text": None if text is None else str(text),
+                "text_status": str(item.get("text_status") or ("readable" if text else "unreadable")),
+                "confidence": _clamp01(item.get("confidence", 0.0)),
+                "reason": str(item.get("reason", "") or ""),
+                "animation_axis": str(item.get("animation_axis") or "") or None,
+                "anchor": str(item.get("anchor") or "") or None,
+            }
+        )
+
+    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+    return {
+        "chart_type": chart_type,
+        "entities": entities,
+        "standalone_components": standalone_components,
+        "warnings": [str(warning) for warning in warnings],
+    }
+
+
+def _semantic_layout_quality_error(layout: dict[str, Any]) -> str | None:
+    components = []
+    for entity in layout.get("entities", []):
+        components.extend(entity.get("components", []))
+    components.extend(layout.get("standalone_components", []))
+    if not components:
+        return "semantic layout contains no components"
+    degenerate = [
+        component
+        for component in components
+        if component["bbox_px"][2] <= component["bbox_px"][0] or component["bbox_px"][3] <= component["bbox_px"][1]
+    ]
+    if len(degenerate) == len(components):
+        return "semantic layout contains only degenerate bboxes"
+    return None
+
+
 class QwenVLClient:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
@@ -573,6 +715,65 @@ class QwenVLClient:
                 return self._unknown_data(f"qwen inference failed: {exc}")
         return self._unknown_data(self.load_error or "qwen unavailable")
 
+    def identify_semantic_components(
+        self,
+        image_path: str,
+        chart_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self.load():
+            raw: str | None = None
+            try:
+                try:
+                    from PIL import Image
+
+                    with Image.open(image_path) as image:
+                        image_size = f"{image.width}x{image.height}"
+                except Exception:
+                    image_size = "unknown"
+                prompt = (
+                    SEMANTIC_COMPONENT_PROMPT
+                    + f"\nImage size in pixels: {image_size}.\nChart metadata:\n"
+                    + json.dumps(chart_metadata or {}, ensure_ascii=False, indent=2)
+                )
+                raw = self._generate([image_path], prompt, max_new_tokens=1024)
+                try:
+                    result = _normalize_semantic_components(_json_from_text(raw))
+                    quality_error = _semantic_layout_quality_error(result)
+                    if quality_error:
+                        raise ValueError(quality_error)
+                except Exception as first_exc:
+                    retry_prompt = (
+                        prompt
+                        + "\n\nYour previous response was invalid or unusable: "
+                        + str(first_exc)
+                        + "\nReturn the full corrected JSON object only, with real non-placeholder bbox_px values."
+                    )
+                    retry_raw = self._generate([image_path], retry_prompt, max_new_tokens=1024)
+                    raw = raw + "\n\n--- RETRY ---\n" + retry_raw
+                    result = _normalize_semantic_components(_json_from_text(retry_raw))
+                    quality_error = _semantic_layout_quality_error(result)
+                    if quality_error:
+                        raise ValueError(quality_error)
+                return {
+                    "result": result,
+                    "raw_response": raw,
+                    "model_status": "qwen",
+                    "failure_reason": None,
+                }
+            except Exception as exc:
+                result = {
+                    "objects": [],
+                    "entity_groups": [],
+                    "warnings": [f"Qwen semantic component identification unavailable: {exc}"],
+                }
+                return {
+                    "result": result,
+                    "raw_response": raw,
+                    "model_status": "qwen_unavailable",
+                    "failure_reason": f"qwen inference failed: {exc}",
+                }
+        return self._unavailable_semantic_components(self.load_error or "qwen unavailable")
+
     def _unavailable_chart(self, reason: str) -> dict[str, Any]:
         result = chart_result(
             is_chart=False,
@@ -693,3 +894,11 @@ class QwenVLClient:
             "notes": f"Could not reliably recover values: {reason}",
         }
         return {"data": data, "raw_response": None, "model_status": "unavailable", "failure_reason": reason}
+
+    def _unavailable_semantic_components(self, reason: str) -> dict[str, Any]:
+        result = {
+            "objects": [],
+            "entity_groups": [],
+            "warnings": [f"Qwen semantic component identification unavailable: {reason}"],
+        }
+        return {"result": result, "raw_response": None, "model_status": "qwen_unavailable", "failure_reason": reason}

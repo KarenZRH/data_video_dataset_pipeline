@@ -116,12 +116,16 @@ def apply_latest_reviews(cfg: dict[str, Any]) -> dict[str, Any]:
 def _copy_review_assets(source_root: Path, clip_root: Path) -> None:
     for name in [
         "keyframes",
-        "trace.svg",
-        "trace_preview.png",
+        "semantic.svg",
+        "semantic_preview.png",
         "svg_report.json",
         "chart_data_clip_raw.json",
         "chart_metadata.json",
         "chart_data_validation.json",
+        "dynamic_data.json",
+        "dynamic_data.csv",
+        "final_data_table.csv",
+        "data_change_events.csv",
         "animation_detection.json",
         "animation_detection_raw.json",
         "clip_report.json",
