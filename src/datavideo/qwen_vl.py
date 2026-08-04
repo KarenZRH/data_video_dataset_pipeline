@@ -225,6 +225,8 @@ def _semantic_layout_quality_error(components: dict[str, Any]) -> str | None:
 
 
 class QwenVLClient:
+    _shared: dict[str, Any] | None = None
+
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
         self.model_path = os.environ.get(cfg["model"]["env_var"])
@@ -239,8 +241,19 @@ class QwenVLClient:
             return False
         return bool(self.model_path and Path(self.model_path).exists())
 
+    def _enable_4bit(self) -> bool:
+        if os.environ.get("DATAVIDEO_QUANTIZE_4BIT") == "1":
+            return True
+        return bool(self.cfg.get("model", {}).get("quantize_4bit", False))
+
     def load(self) -> bool:
         if self.model is not None:
+            return True
+        shared = QwenVLClient._shared
+        if shared and self.model_path and Path(self.model_path).resolve() == Path(shared["model_path"]).resolve():
+            self.model = shared["model"]
+            self.processor = shared["processor"]
+            self.model_version = shared["model_version"]
             return True
         if not self.available():
             if not self.load_error:
@@ -256,13 +269,34 @@ class QwenVLClient:
                 min_pixels=224 * 224,
                 max_pixels=768 * 768,
             )
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.model_path,
+            model_kwargs = dict(
                 torch_dtype=_dtype(),
                 device_map="auto",
                 local_files_only=True,
             )
+            if self._enable_4bit():
+                from transformers import BitsAndBytesConfig
+
+                model_kwargs.update(
+                    {
+                        "quantization_config": BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_quant_type="nf4",
+                        ),
+                        "torch_dtype": torch.float16,
+                    }
+                )
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.model_path, **model_kwargs
+            )
             self.model_version = Path(self.model_path).name
+            QwenVLClient._shared = {
+                "model": self.model,
+                "processor": self.processor,
+                "model_version": self.model_version,
+                "model_path": self.model_path,
+            }
             return True
         except Exception as exc:
             self.load_error = str(exc)

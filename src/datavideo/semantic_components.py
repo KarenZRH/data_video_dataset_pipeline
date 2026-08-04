@@ -253,6 +253,13 @@ def _render_box_svg(
 
 def _render_png(svg_path: Path, png_path: Path) -> bool:
     try:
+        import cairosvg
+
+        cairosvg.svg2png(url=str(svg_path), write_to=str(png_path))
+        return png_path.exists()
+    except Exception:
+        pass
+    try:
         subprocess.run(["rsvg-convert", "-o", str(png_path), str(svg_path)], check=True)
         return png_path.exists()
     except Exception:
@@ -320,7 +327,8 @@ def build_semantic_components(
             report["warnings"].extend(annotation.get("warnings", []))
 
         _render_box_svg(image_path, annotation["objects"], components_svg, group_id="semantic-components-inspection")
-        report["success"] = _render_png(components_svg, components_png) and json_path.exists()
+        report["preview_success"] = _render_png(components_svg, components_png)
+        report["success"] = json_path.exists() and bool(annotation.get("objects"))
     except Exception as exc:
         report["failure_reason"] = str(exc)
 
