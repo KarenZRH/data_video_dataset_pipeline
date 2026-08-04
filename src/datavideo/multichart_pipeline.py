@@ -165,7 +165,6 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 force=asset_force,
             )
             initial = keyframes["assets"]["initial"]
-            semantic = build_semantic_svg(initial, clip_root, cfg, force=asset_force)
             chart_data = recover_clip_data(
                 cfg,
                 keyframes,
@@ -174,6 +173,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 client=client,
                 force=asset_force,
             )
+            semantic = build_semantic_svg(initial, clip_root, cfg, force=asset_force)
             semantic_state_svgs = build_semantic_state_svgs(
                 chart_data.get("semantic_state_inputs"),
                 clip_root,

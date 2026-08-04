@@ -59,14 +59,15 @@ keyframes:
     - bar
     - pie
     - donut
+    - combined
   tail_frame_min_margin_seconds: 0.25
   purpose: representative static frame for SVG tracing plus optional state frames for review
 
 clip_data:
   coarse_fps: 2
   fine_fps: 8
-  max_frames: 10
-  max_new_tokens: 4096
+  max_frames: 6
+  max_new_tokens: 2048
   motion_change_threshold: 0.08
   min_fine_window_frames: 2
   max_source_fps: 30
