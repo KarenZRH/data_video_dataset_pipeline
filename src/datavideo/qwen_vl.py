@@ -293,14 +293,13 @@ class QwenVLClient:
             try:
                 prompt = (
                     SEMANTIC_COMPONENT_PROMPT
+                    + "\nOutput JSON schema:\n"
+                    + json.dumps(SEMANTIC_COMPONENT_SCHEMA, ensure_ascii=False, indent=2)
                     + "\nChart metadata, if available:\n"
                     + json.dumps(chart_metadata or {}, ensure_ascii=False, indent=2)
                 )
                 raw = self._generate([image_path], prompt, max_new_tokens=1024)
-                result = _normalize_semantic_components(_json_from_text(raw))
-                quality_error = _semantic_layout_quality_error(result)
-                if quality_error:
-                    raise ValueError(quality_error)
+                result = _json_from_text(raw)
                 return {"result": result, "raw_response": raw, "model_status": "qwen", "failure_reason": None}
             except Exception as exc:
                 return self._unavailable_semantic_components(f"qwen inference failed: {exc}", raw_response=raw)
