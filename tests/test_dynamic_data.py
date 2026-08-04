@@ -8,8 +8,8 @@ from datavideo.dynamic_data import (
     plan_dynamic_state_keyframes,
     plan_state_sampling,
 )
-from datavideo_multichart_v2.qwen import _normalize_chart_data
-from datavideo_multichart_v2.assets import _select_clip_data_rows
+from datavideo.multichart_qwen import _normalize_chart_data
+from datavideo.multichart_assets import _select_clip_data_rows
 
 
 def _visual_data(rows):

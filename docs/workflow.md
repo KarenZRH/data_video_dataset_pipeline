@@ -89,7 +89,7 @@ data/processed/<clip_id>/
 Generated visual assets:
 
 ```text
-data/generated_v2/<clip_id>/
+data/generated/<clip_id>/
   clip.mp4                  # copy/normalized equivalent of processed/<clip_id>/visual_clip.mp4
   keyframes/
     initial.png
@@ -184,9 +184,9 @@ The checker uses three layers:
 The VLM quality model is configured separately under `quality.model`, so it can use a different provider from the production model. `quality.enable_vlm=false` runs only the deterministic Python checks. Outputs are written to:
 
 ```text
-data/generated_v2/quality/quality_report.json
-data/generated_v2/quality/quality_flags.csv
-data/generated_v2/quality/quality_review_queue.csv
+data/generated/quality/quality_report.json
+data/generated/quality/quality_flags.csv
+data/generated/quality/quality_review_queue.csv
 ```
 
 ## Intervals
@@ -216,7 +216,11 @@ This does not block visual asset generation. It only means complete narration is
 
 ## 1. Metadata
 
-Fetch webpage metadata:
+The canonical metadata input is `data-video-list-with-clips.csv`. The main
+pipeline reads rows with webpage start/end times from that CSV.
+
+The older single-site fetcher is still available when you need to refresh the
+legacy JSONL example files:
 
 ```bash
 python scripts/fetch_datavideo_clips.py \
@@ -308,7 +312,7 @@ python -m datavideo.cli assets \
 data/processed/<clip_id>/visual_clip.mp4
 ```
 
-It writes `data/generated_v2/<clip_id>/clip.mp4` as the visual clip used for review and then generates:
+It writes `data/generated/<clip_id>/clip.mp4` as the visual clip used for review and then generates:
 
 - candidate keyframes from visual-clip frames;
 - Qwen keyframe scores;
@@ -467,7 +471,7 @@ Only recover values directly printed in the frames. Do not estimate values from 
 Allowed Qwen inputs:
 
 - `data/processed/<clip_id>/visual_frames/...`;
-- `data/generated_v2/<clip_id>/keyframes/...`;
+- `data/generated/<clip_id>/keyframes/...`;
 - frames or stills derived from `visual_clip.mp4`.
 
 Forbidden Qwen inputs:
@@ -513,7 +517,7 @@ Final visual dataset entry condition:
 asset_review.decision == "approved"
 ```
 
-The same asset review record stores human-reviewed animation fields under `reviewed_value.animation`, with `overall_description`, `major_actions`, and `confidence`. Machine animation remains in `data/generated_v2/<clip_id>/animation_detection.json`; reviewed animation is written by `reviewed` to `animation_reviewed.json`.
+The same asset review record stores human-reviewed animation fields under `reviewed_value.animation`, with `overall_description`, `major_actions`, and `confidence`. Machine animation remains in `data/generated/<clip_id>/animation_detection.json`; reviewed animation is written by `reviewed` to `animation_reviewed.json`.
 
 The same asset review record also stores reviewed narration under `reviewed_value.narration`. Reviewers may edit sentence text or clear `keep_in_reviewed` for sentences that should not enter the final dataset. Machine ASR remains copied for audit; reviewed narration is written to `narration_reviewed.json`.
 
@@ -536,7 +540,7 @@ PYTHONPATH=src python -m datavideo.cli reviewed \
 
 This reads latest asset reviews from `data/review/review.db` and writes final reviewed artifacts to `data/reviewed/datavideo_multichart_v2`.
 
-It does not require or apply old clip-boundary reviews. Final `clip.mp4` is copied from `data/generated_v2/<clip_id>/clip.mp4`, which corresponds to the webpage reference interval.
+It does not require or apply old clip-boundary reviews. Final `clip.mp4` is copied from `data/generated/<clip_id>/clip.mp4`, which corresponds to the webpage reference interval.
 Reviewed animation is copied from the approved asset-review value into `animation_reviewed.json`; machine raw reports are copied for audit. `clip.json` and `final_multichart_v2_clips.jsonl` expose `animation_description` for easy filtering and inspection.
 
 Narration files are copied from processed ASR outputs when available:

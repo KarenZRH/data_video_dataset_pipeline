@@ -3,9 +3,9 @@ from pathlib import Path
 from PIL import Image
 
 from datavideo.schemas import read_json, write_jsonl
-from datavideo_multichart_v2.animation import detect_animation
-from datavideo_multichart_v2.pipeline import _write_candidate_report
-from datavideo_multichart_v2.qwen import ANIMATION_PROMPT, _normalize_animation
+from datavideo.animation import detect_animation
+from datavideo.multichart_pipeline import _write_candidate_report
+from datavideo.multichart_qwen import ANIMATION_PROMPT, _normalize_animation
 
 
 class FakeAnimationClient:

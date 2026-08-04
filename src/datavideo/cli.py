@@ -5,12 +5,12 @@ from typing import Any
 
 from .manifest import load_config
 from .quality import run_quality_check
-from datavideo_multichart_v2.pipeline import (
+from datavideo.multichart_pipeline import (
     run_asr_pipeline,
     run_context_pipeline,
     run_pipeline,
 )
-from datavideo_multichart_v2.reviewed_outputs import apply_latest_reviews
+from datavideo.multichart_reviewed_outputs import apply_latest_reviews
 
 
 def run_command(command: str, cfg: dict[str, Any], *, force: bool = False) -> dict[str, Any]:

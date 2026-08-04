@@ -6,7 +6,7 @@ from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
-from datavideo.media import ffprobe, normalize_video
+from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
 from datavideo.visual_provenance import assert_qwen_visual_inputs
@@ -18,21 +18,11 @@ from datavideo.dynamic_data import (
     write_dynamic_outputs,
 )
 
-from .qwen import MultichartQwenClient
+from .multichart_qwen import MultichartQwenClient
 
 
 def _clip_id(row: dict[str, Any]) -> str:
     return str(row.get("output_stem") or f"{row['chart_type']}_{row['chart_index']}")
-
-
-def _processed_clip_cfg(cfg: dict[str, Any], row: dict[str, Any], clip_id: str) -> dict[str, Any]:
-    return {
-        **cfg,
-        "sample_id": clip_id,
-        "chart_type": row["chart_type"],
-        "video_path": row["output_path"],
-        "processed_dir": str(Path(cfg.get("processed_root", "data/processed")) / clip_id),
-    }
 
 
 def _duration_seconds(video: str | Path) -> float:
@@ -886,107 +876,3 @@ def recover_clip_data(
         "events_path": str(events_path),
     }
 
-
-def _cached_report(path: Path, row: dict[str, Any], force: bool) -> dict[str, Any] | None:
-    if force or not path.exists():
-        return None
-    cached = read_json(path)
-    cached_clip = cached.get("clip", {})
-    expected_id = _clip_id(row)
-    if cached_clip.get("clip_id") != expected_id or cached_clip.get("video_id") != row.get("video_id"):
-        return None
-    keyframe = Path(cached.get("keyframes", {}).get("assets", {}).get("initial", ""))
-    semantic_svg_path = Path(cached.get("semantic", {}).get("semantic_svg", ""))
-    if keyframe.exists() and semantic_svg_path.exists():
-        return cached
-    return None
-
-
-def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    jsonl_path = Path(cfg.get("raw_clips_jsonl", "data/raw/datavideo_clips.jsonl"))
-    processed_root = ensure_dir(cfg.get("processed_root", "data/processed"))
-    generated_root = ensure_dir(cfg.get("generated_root", "data/generated"))
-    rows = read_jsonl(jsonl_path)
-    max_clips = cfg.get("max_clips")
-    if max_clips is not None:
-        rows = rows[: int(max_clips)]
-    client = MultichartQwenClient(cfg)
-
-    clip_reports: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
-    for row in rows:
-        clip_id = _clip_id(row)
-        clip_root = ensure_dir(generated_root / clip_id)
-        clip_report_path = clip_root / "clip_report.json"
-        cached = _cached_report(clip_report_path, row, force)
-        if cached is not None:
-            clip_reports.append(cached)
-            continue
-
-        try:
-            processed_cfg = _processed_clip_cfg({**cfg, "processed_root": str(processed_root)}, row, clip_id)
-            media = normalize_video(processed_cfg, force=force)
-            normalized_video = Path(media["video"])
-            clip_video = clip_root / "clip.mp4"
-            if force or not clip_video.exists():
-                shutil.copy2(normalized_video, clip_video)
-
-            keyframe_dir = ensure_dir(clip_root / "keyframes")
-            keyframes = select_keyframe(
-                normalized_video,
-                row,
-                keyframe_dir,
-                {**cfg, "processed_root": str(processed_root)},
-                client=client,
-                force=force,
-            )
-            initial = keyframes["assets"]["initial"]
-            semantic = build_semantic_svg(initial, clip_root, cfg, force=force)
-            chart_data = recover_clip_data(cfg, keyframes, row, clip_root, client=client, force=force)
-            semantic_state_svgs = build_semantic_state_svgs(
-                chart_data.get("semantic_state_inputs"),
-                clip_root,
-                cfg,
-                force=force,
-            )
-
-            clip_payload = {
-                **row,
-                "clip_id": clip_id,
-                "processed_dir": str(processed_root / clip_id),
-                "generated_dir": str(clip_root),
-            }
-            report = {
-                "clip": clip_payload,
-                "media": media,
-                "clip_video": str(clip_video),
-                "keyframes": keyframes,
-                "semantic": semantic,
-                "semantic_state_svgs": semantic_state_svgs,
-                "chart_data": chart_data,
-            }
-            write_json(clip_report_path, report)
-            failed_path = clip_root / "clip_report_failed.json"
-            if failed_path.exists():
-                failed_path.unlink()
-            clip_reports.append(report)
-        except Exception as exc:
-            failure = {"clip_id": clip_id, "clip": row, "failure_reason": str(exc)}
-            write_json(clip_root / "clip_report_failed.json", failure)
-            failures.append(failure)
-
-    refined_rows = [report["clip"] for report in clip_reports]
-    run_report = {
-        "source": str(jsonl_path),
-        "clip_count": len(rows),
-        "completed_clip_count": len(clip_reports),
-        "failure_count": len(failures),
-        "processed_root": str(processed_root),
-        "generated_root": str(generated_root),
-        "clips": clip_reports,
-        "failures": failures,
-        "config_hash": cfg.get("config_hash"),
-    }
-    write_json(generated_root / "multichart_v2_run_report.json", run_report)
-    write_jsonl(generated_root / "multichart_v2_clips.jsonl", refined_rows)
-    return run_report

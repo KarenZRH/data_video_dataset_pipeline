@@ -3,7 +3,6 @@ from pathlib import Path
 
 from datavideo.semantic import build_semantic_svg
 from datavideo.semantic_components import build_semantic_components
-from datavideo.svg_trace import trace_svg
 
 
 def _write_minimal_png(path: Path) -> None:
@@ -58,10 +57,6 @@ def test_semantic_svg_builds_role_based_scene_graph(tmp_path):
     assert car_bar.attrib["data-role"] == "bar"
     assert car_bar.attrib["data-animation-property"] == "width"
     assert car_bar.attrib["data-anchor"] == "left"
-
-    compatibility_report = trace_svg(image, tmp_path, {}, force=False)
-    assert compatibility_report["semantic_svg"] == report["semantic_svg"]
-
 
 def test_semantic_components_accept_direct_model_output(tmp_path, monkeypatch):
     image = tmp_path / "initial.png"

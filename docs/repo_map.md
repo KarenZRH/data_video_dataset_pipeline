@@ -8,7 +8,7 @@ web-annotated multichart v2 pipeline.
 | Area | Files |
 | --- | --- |
 | CLI entry point | `src/datavideo/cli.py` |
-| Main workflow package | `src/datavideo_multichart_v2/` |
+| Main workflow package | `src/datavideo/` |
 | Shared utilities | `src/datavideo/` |
 | Main config | `configs/multichart_assets_v2.yaml` |
 | Optional Gemini config | `configs/multichart_assets_gemini.yaml` |
@@ -41,7 +41,7 @@ configs/multichart_assets_v2.yaml
 | `frames.py`, `media.py` | FFmpeg frame/media helpers. |
 | `keyframes.py` | Still extraction and image-motion scoring helpers used by v2. |
 | `dynamic_data.py` | Dynamic/static chart data normalization and fusion. |
-| `semantic.py`, `semantic_components.py`, `svg_trace.py` | SVG and semantic component generation. |
+| `semantic.py`, `semantic_components.py` | SVG and semantic component generation. |
 | `quality.py` | Dataset artifact quality checks. |
 | `qwen_vl.py`, `gemini_vl.py`, `model_client.py` | Model backends and model-client factory. |
 | `review_db.py` | SQLite review record storage. |
@@ -58,9 +58,9 @@ to hand off: new users should not choose between competing historical pipelines.
 
 | File | Purpose |
 | --- | --- |
-| `data/raw/datavideo_clips.jsonl` | Small selected clip metadata used by examples. |
-| `data/raw/datavideo_clips_all.jsonl` | Full web-annotated clip metadata from the first clip site. |
-| `data-video-list-with-clips.csv` | Consolidated source-video URL list collected from `websites.txt`. |
+| `data-video-list-with-clips.csv` | Canonical source-video URL list with clip time ranges. |
+| `data/raw/datavideo_clips.jsonl` | Legacy example JSONL kept for reference. |
+| `data/raw/datavideo_clips_all.jsonl` | Legacy web-annotated clip metadata from the first clip site. |
 | `websites.txt` | Source webpages used for URL collection. |
 
 Generated media and review outputs remain local and ignored by git.

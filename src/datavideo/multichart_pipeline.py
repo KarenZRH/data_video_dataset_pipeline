@@ -5,12 +5,13 @@ from typing import Any
 
 from datavideo.context import create_context_media
 from .animation import detect_animation
+from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
 from datavideo.semantic import build_semantic_svg
-from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
+from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
 
-from .assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
-from .qwen import MultichartQwenClient
+from .multichart_assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
+from .multichart_qwen import MultichartQwenClient
 
 
 def _clip_id(row: dict[str, Any]) -> str:
@@ -26,14 +27,7 @@ def _reference_clip_metadata(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = read_jsonl(Path(cfg.get("raw_clips_jsonl", "data/raw/datavideo_clips.jsonl")))
-    clip_id = cfg.get("clip_id")
-    if clip_id:
-        rows = [row for row in rows if _clip_id(row) == clip_id]
-    max_clips = cfg.get("max_clips")
-    if max_clips is not None and not clip_id:
-        rows = rows[: int(max_clips)]
-    return rows
+    return read_clip_rows(cfg)
 
 
 def _write_candidate_report(
@@ -120,7 +114,7 @@ def run_asr_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]
 
 def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
     processed_root = ensure_dir(cfg.get("processed_root", "data/processed"))
-    generated_root = ensure_dir(cfg.get("generated_root", "data/generated_v2"))
+    generated_root = ensure_dir(cfg.get("generated_root", "data/generated"))
     rows = _load_rows(cfg)
     client = MultichartQwenClient(cfg)
 
@@ -217,7 +211,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
     write_jsonl(generated_root / "multichart_v2_clips.jsonl", [report["clip"] for report in clip_reports])
     run_report = {
         "sample_id": cfg["sample_id"],
-        "source": str(Path(cfg.get("raw_clips_jsonl", "data/raw/datavideo_clips.jsonl"))),
+        "source": str(cfg.get("clip_metadata_csv") or cfg.get("raw_clips_jsonl", "data/raw/datavideo_clips.jsonl")),
         "clip_count": len(rows),
         "completed_clip_count": len(clip_reports),
         "failure_count": len(failures),

@@ -2,13 +2,13 @@ from pathlib import Path
 
 from datavideo.review_db import save_review
 from datavideo.schemas import read_json, read_jsonl, write_json, write_jsonl
-from datavideo_multichart_v2.reviewed_outputs import REVIEW_STAGE, apply_latest_reviews
+from datavideo.multichart_reviewed_outputs import REVIEW_STAGE, apply_latest_reviews
 
 
 def _cfg(tmp_path: Path) -> dict:
     return {
         "sample_id": "datavideo_multichart_v2_test",
-        "generated_root": str(tmp_path / "generated_v2"),
+        "generated_root": str(tmp_path / "generated"),
         "reviewed_dir": str(tmp_path / "reviewed"),
         "processed_root": str(tmp_path / "processed"),
         "review_db": str(tmp_path / "review.db"),

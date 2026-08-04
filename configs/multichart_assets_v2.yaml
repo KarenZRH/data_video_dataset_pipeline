@@ -1,8 +1,9 @@
 sample_id: datavideo_multichart_v2
 chart_type: multichart
-raw_clips_jsonl: data/raw/datavideo_clips.jsonl
+clip_metadata_csv: data-video-list-with-clips.csv
+require_time_bounds: true
 processed_root: data/processed
-generated_root: data/generated_v2
+generated_root: data/generated
 reviewed_dir: data/reviewed/datavideo_multichart_v2
 review_db: data/review/review.db
 

@@ -21,7 +21,7 @@ def compose_reviewed_intervals(cfg: dict[str, Any], clip_id: str) -> dict[str, A
 
 
 def apply_latest_reviews(cfg: dict[str, Any]) -> dict[str, Any]:
-    generated = Path(cfg.get("generated_root", cfg.get("generated_dir", "data/generated_v2")))
+    generated = Path(cfg.get("generated_root", cfg.get("generated_dir", "data/generated")))
     reviewed = ensure_dir(cfg.get("reviewed_dir", "data/reviewed/datavideo_multichart_v2"))
     reviewed_clips = reviewed / "clips"
     if reviewed_clips.exists():

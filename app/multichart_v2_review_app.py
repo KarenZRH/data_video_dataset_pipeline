@@ -15,12 +15,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from datavideo.manifest import load_config
 from datavideo.review_db import save_review
 from datavideo.schemas import read_json
-from datavideo_multichart_v2.narration_review import (
+from datavideo.multichart_narration_review import (
     filter_reviewed_narration_sentences,
     load_narration_for_review,
     narration_full_text,
 )
-from datavideo_multichart_v2.reviewed_outputs import REVIEW_STAGE, apply_latest_reviews
+from datavideo.multichart_reviewed_outputs import REVIEW_STAGE, apply_latest_reviews
 
 
 st.set_page_config(page_title="Multichart V2 Review", layout="wide")
@@ -172,7 +172,7 @@ def _clean_records(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 cfg_path = st.sidebar.text_input("Config", os.environ.get("DATAVIDEO_REVIEW_CONFIG", "configs/multichart_assets_v2.yaml"))
 cfg = load_config(ROOT / cfg_path)
-generated = _abs(cfg.get("generated_root", cfg.get("generated_dir", "data/generated_v2")))
+generated = _abs(cfg.get("generated_root", cfg.get("generated_dir", "data/generated")))
 run_report = _load_run_report(generated)
 
 st.title(f"Multichart V2 Review: {cfg['sample_id']}")

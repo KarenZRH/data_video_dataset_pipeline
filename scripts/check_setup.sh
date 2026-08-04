@@ -28,7 +28,6 @@ required = [
     "docs",
     "scripts",
     "src/datavideo",
-    "src/datavideo_multichart_v2",
     "app",
     "tests",
 ]

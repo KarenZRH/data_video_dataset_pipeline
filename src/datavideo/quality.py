@@ -295,7 +295,7 @@ def check_clip_quality(clip_root: str | Path, cfg: dict[str, Any] | None = None)
 
 
 def run_quality_check(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    generated_root = Path(cfg.get("generated_root", "data/generated_v2"))
+    generated_root = Path(cfg.get("generated_root", "data/generated"))
     quality_dir = ensure_dir(generated_root / "quality")
     clip_id = cfg.get("clip_id")
     clip_roots = [generated_root / clip_id] if clip_id else [path for path in sorted(generated_root.iterdir()) if path.is_dir() and path.name != "quality"]

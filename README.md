@@ -5,8 +5,7 @@ web-annotated source videos.
 
 The repository has been consolidated around one current workflow:
 
-- Main workflow: `src/datavideo_multichart_v2/`
-- Shared utilities: `src/datavideo/`
+- Main workflow and shared utilities: `src/datavideo/`
 - Main config: `configs/multichart_assets_v2.yaml`
 - Workflow guide: `docs/workflow.md`
 - Review app: `app/multichart_v2_review_app.py`
@@ -63,11 +62,11 @@ PYTHONPATH=src streamlit run app/multichart_v2_review_app.py
 
 Tracked source metadata:
 
-- `data/raw/datavideo_clips.jsonl`: small selected clip set used by examples.
-- `data/raw/datavideo_clips_all.jsonl`: full extracted clip metadata from the
-  annotation site.
-- `data-video-list-with-clips.csv`: consolidated source-video URL list collected
-  from `websites.txt`.
+- `data-video-list-with-clips.csv`: canonical source-video URL list collected
+  from `websites.txt`; the pipeline uses rows with start/end times.
+- `data/raw/datavideo_clips.jsonl`: legacy example JSONL kept for reference.
+- `data/raw/datavideo_clips_all.jsonl`: legacy extracted clip metadata from the
+  first annotation site.
 
 To refresh webpage clip metadata:
 
