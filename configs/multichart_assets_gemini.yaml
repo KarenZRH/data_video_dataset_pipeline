@@ -1,0 +1,43 @@
+sample_id: datavideo_multichart
+chart_type: multichart
+raw_clips_jsonl: data/raw/datavideo_clips.jsonl
+processed_root: data/processed
+generated_root: data/generated
+reviewed_dir: data/reviewed/datavideo_multichart
+review_db: data/review.db
+
+model:
+  client_module: datavideo.gemini_vl
+  client_class: GeminiFlashClient
+  model_name: gemini-3.6-flash
+  api_key_env: GEMINI_API_KEY
+  prompt_version: gemini_direct_semantic_components_v1
+  temperature: 0.0
+  timeout_seconds: 90
+
+video_standardization:
+  fps: 30
+  crf: 18
+  video_codec: libx264
+  pixel_format: yuv420p
+  audio_codec: aac
+  audio_rate: 48000
+  wav_rate: 16000
+  wav_channels: 1
+
+sampling:
+  fine_fps: 4
+  short_side: 768
+
+keyframes:
+  names:
+    - initial
+  sample_fps: 4
+  purpose: representative static data-visualization frame for semantic component extraction
+
+vtracer:
+  color_precision: 6
+  filter_speckle: 4
+  mode: spline
+  hierarchical: stacked
+  path_precision: 8
