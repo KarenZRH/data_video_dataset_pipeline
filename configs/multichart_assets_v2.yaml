@@ -11,7 +11,7 @@ context:
   padding_before_seconds: 5.0
   padding_after_seconds: 5.0
   cookies: www.youtube.com_cookies.txt
-  proxy: http://127.0.0.1:<port>
+  proxy: null
   max_height: 720
 
 asr:

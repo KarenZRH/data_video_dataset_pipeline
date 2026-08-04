@@ -61,7 +61,7 @@ def _download_context_source(row: dict[str, Any], cfg: dict[str, Any], out_path:
 
     context_cfg = cfg.get("context", {})
     cookies = Path(context_cfg.get("cookies", "www.youtube.com_cookies.txt"))
-    proxy = context_cfg.get("proxy", "http://127.0.0.1:<port>")
+    proxy = context_cfg.get("proxy")
     max_height = int(context_cfg.get("max_height", 720))
     interval = _context_interval(row, cfg)
     section = f"*{_hms(interval['start'])}-{_hms(interval['end'])}"

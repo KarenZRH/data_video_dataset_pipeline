@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jsonl", type=Path, default=Path("data/raw/datavideo_clips.jsonl"))
     parser.add_argument("--video-dir", type=Path, default=Path("data/raw/videos"))
     parser.add_argument("--cookies", type=Path, default=Path("www.youtube.com_cookies.txt"))
-    parser.add_argument("--proxy", default="http://127.0.0.1:<port>")
+    parser.add_argument("--proxy", default=None)
     parser.add_argument("--max-height", type=int, default=720)
     parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument("--download-only", action="store_true")

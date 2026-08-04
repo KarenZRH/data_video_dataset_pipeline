@@ -21,8 +21,9 @@ conda activate DataVideo
 export PYTHONPATH=src
 export MODEL_PATH=/path/to/qwen-vl-model
 export WHISPER_MODEL_PATH=/path/to/faster-whisper-model
-export HTTP_PROXY=http://127.0.0.1:<port>
-export HTTPS_PROXY=http://127.0.0.1:<port>
+# Optional, only if your network requires a proxy:
+# export HTTP_PROXY=http://127.0.0.1:<port>
+# export HTTPS_PROXY=http://127.0.0.1:<port>
 ```
 
 Install/check:

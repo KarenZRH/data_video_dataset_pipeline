@@ -5,11 +5,11 @@ echo "Project: $(pwd)"
 if [ "${CONDA_DEFAULT_ENV:-}" = "DataVideo" ] && [ -n "${CONDA_PREFIX:-}" ]; then
     ENV_BIN="${CONDA_PREFIX}/bin"
 else
-    ENV_BIN="<conda-env>/bin"
+    ENV_BIN=""
 fi
-PYTHON_BIN="${ENV_BIN}/python"
-GIT_BIN="${ENV_BIN}/git"
-FFMPEG_BIN="${ENV_BIN}/ffmpeg"
+PYTHON_BIN="${ENV_BIN:+${ENV_BIN}/}python"
+GIT_BIN="${ENV_BIN:+${ENV_BIN}/}git"
+FFMPEG_BIN="${ENV_BIN:+${ENV_BIN}/}ffmpeg"
 
 if [ ! -x "$PYTHON_BIN" ]; then PYTHON_BIN="$(command -v python || true)"; fi
 if [ ! -x "$GIT_BIN" ]; then GIT_BIN="$(command -v git || true)"; fi
