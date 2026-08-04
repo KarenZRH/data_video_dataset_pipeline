@@ -1,202 +1,89 @@
 # data_video_dataset
 
-Prepare a workflow for turning long videos into chart-centric training data:
+Pipeline and metadata for building a chart-centric data-video clip dataset from
+web-annotated source videos.
 
-1. Find chart segments in long videos.
-2. Save representative keyframes.
-3. Convert chart frames to SVG.
-4. Describe how the chart moves, what the narration says, and when the two align.
+The repository has been consolidated around one current workflow:
+
+- Main workflow: `src/datavideo_multichart_v2/`
+- Shared utilities: `src/datavideo/`
+- Main config: `configs/multichart_assets_v2.yaml`
+- Workflow guide: `docs/workflow.md`
+- Review app: `app/multichart_v2_review_app.py`
+
+Older broad-detection, bar-dominant, and multichart-v1 experiment lines have
+been removed from the runnable surface so new users start from the same path.
+See `docs/repo_map.md` for the current repository map.
 
 ## Environment
 
-The conda environment is:
-
 ```bash
-/path/to/workspace/miniconda3/bin/conda activate DataVideo
+conda activate DataVideo
+export PYTHONPATH=src
+export MODEL_PATH=/path/to/qwen-vl-model
+export WHISPER_MODEL_PATH=/path/to/faster-whisper-model
+export HTTP_PROXY=http://127.0.0.1:<port>
+export HTTPS_PROXY=http://127.0.0.1:<port>
 ```
 
-Installed in the conda environment:
-
-- Python 3.11
-- git
-- ffmpeg
-
-System packages requested:
-
-- git: installed
-- build-essential: installed
-- libgl1: installed
-- ffmpeg: sudo password is required for apt installation, but ffmpeg is available inside the `DataVideo` conda environment
-
-If you want to complete the system-level install later:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git ffmpeg build-essential libgl1
-```
-
-## Project Layout
-
-```text
-data/
-  raw/videos/      long source videos
-  keyframes/       selected chart frames
-  svg/             vectorized chart outputs
-  audio/           extracted audio tracks
-  transcripts/     speech-to-text output with timestamps
-  annotations/     segment, motion, narration, and alignment metadata
-configs/           workflow configuration
-docs/              project notes and workflow design
-notebooks/         experiments
-scripts/           setup and utility scripts
-src/               Python package code
-```
-
-## First Check
+Install/check:
 
 ```bash
 bash scripts/check_setup.sh
+PYTHONPATH=src pytest -q
 ```
 
-## Current Baseline
+## Current Workflow
 
-The current experiment baseline is **bar-chart-dominant clip detection**. From frame sampling through clip extraction and asset generation, use the latest `bar-dominant` and `bar-assets` flow.
-
-Target definition:
-
-- Positive only when the main narrative unit is expressed by bar marks.
-- Bar marks include vertical bars, horizontal bars, grouped/stacked bars, bar-race bars, or bar-like marks whose length, position, order, or label encodes data.
-- Exclude clips where bars appear only briefly and the segment becomes circle, bubble, distance line, map, icon, illustration, decorative motion, or another non-bar visual encoding.
-- Mixed segments should be trimmed to the bar-dominant subclip or excluded.
-
-Current input:
-
-```text
-data/raw/videos/bar_sample.mp4
-```
-
-Current preprocessed media:
-
-```text
-data/processed/bar_001/normalized.mp4
-data/processed/bar_001/audio_16k_mono.wav
-data/processed/bar_001/frames/coarse_2fps/
-data/generated/bar_001/frame_manifest.jsonl
-```
-
-The current four-step detection flow is:
-
-1. Qwen detects bar-chart-dominant frames from existing 2 FPS frames.
-2. Positive frames become bar candidates.
-3. Adjacent candidates are merged if the gap is <= 2 seconds.
-4. Qwen reviews each merged candidate contact sheet for complete bar-dominant data narrative semantics.
-
-Run the current baseline:
+Run the canonical web-annotated multichart v2 stages:
 
 ```bash
-source /path/to/workspace/miniconda3/bin/activate DataVideo
-export PYTHONPATH=/path/to/workspace/projects/data_video_dataset/src
-export MODEL_PATH=/path/to/qwen-vl-model
-CUDA_VISIBLE_DEVICES=0 python -m datavideo.cli bar-dominant --config configs/stage1_bar.yaml --force
-CUDA_VISIBLE_DEVICES=0 python -m datavideo.cli bar-assets --config configs/stage1_bar.yaml --force
+PYTHONPATH=src python -m datavideo.cli context --config configs/multichart_assets_v2.yaml
+PYTHONPATH=src python -m datavideo.cli asr --config configs/multichart_assets_v2.yaml
+PYTHONPATH=src python -m datavideo.cli assets --config configs/multichart_assets_v2.yaml
+PYTHONPATH=src python -m datavideo.cli quality --config configs/multichart_assets_v2.yaml
+PYTHONPATH=src python -m datavideo.cli reviewed --config configs/multichart_assets_v2.yaml
 ```
 
-Current outputs:
+For one clip:
 
-```text
-data/generated/bar_001/bar_candidates.jsonl
-data/generated/bar_001/bar_merged_clips.jsonl
-data/generated/bar_001/final_bar_clips.jsonl
-data/generated/bar_001/bar_final_xxx.mp4
-data/generated/bar_001/bar_final_xxx_contact_sheet.jpg
+```bash
+PYTHONPATH=src python -m datavideo.cli assets \
+  --config configs/multichart_assets_v2.yaml \
+  --clip-id bar_1
 ```
-
-Latest run result:
-
-```text
-frames: 200
-bar candidates: 5
-merged candidates: 4
-final clips: 2
-
-bar_final_000: 16.000s - 27.000s
-bar_final_001: 70.000s - 78.000s
-```
-
-Merged candidate videos/contact sheets are used only in a temporary review directory. Only accepted final clips are saved.
-
-Old generic data-video detection outputs were intentionally cleared. Avoid using the older `detect` or `merge-review` outputs as the active baseline.
-
-Outputs are separated by purpose:
-
-- `data/raw/videos/`: source long videos
-- `data/processed/bar_001/`: normalized media and sampled frames
-- `data/generated/bar_001/`: machine-generated manifests, clips, keyframes, SVG, chart data
-- `data/generated/bar_001/clips/<clip_id>/`: per-clip video, `keyframes/initial.png`, SVG, and chart data
-- `data/reviewed/bar_001/`: human-reviewed values
-- `data/review.db`: SQLite audit records
 
 Review UI:
 
 ```bash
-streamlit run app/review_app.py --server.address 127.0.0.1 --server.port 8501
+PYTHONPATH=src streamlit run app/multichart_v2_review_app.py
 ```
 
-## Multichart Clip Assets
+## Metadata
 
-The newer multichart data-video clip workflow lives in a separate package:
+Tracked source metadata:
 
-```text
-src/datavideo_multichart/
-```
+- `data/raw/datavideo_clips.jsonl`: small selected clip set used by examples.
+- `data/raw/datavideo_clips_all.jsonl`: full extracted clip metadata from the
+  annotation site.
+- `data-video-list-with-clips.csv`: consolidated source-video URL list collected
+  from `websites.txt`.
 
-It reads clip metadata from `data/raw/datavideo_clips.jsonl`, normalizes each
-clip from `data/raw/videos/`, extracts audio and candidate frames into
-`data/processed/<clip_id>/`, and writes per-clip assets into
-`data/generated/<clip_id>/`.
-
-Run it with the `DataVideo` conda environment:
+To refresh webpage clip metadata:
 
 ```bash
-source /path/to/workspace/miniconda3/bin/activate DataVideo
-export PYTHONPATH=/path/to/workspace/projects/data_video_dataset/src
-export MODEL_PATH=/path/to/qwen-vl-model
-python -m datavideo.cli multichart-assets --config configs/multichart_assets.yaml
+python scripts/fetch_datavideo_clips.py \
+  --clips-per-chart 2 \
+  --jsonl data/raw/datavideo_clips.jsonl \
+  --video-dir data/raw/videos \
+  --cookies www.youtube.com_cookies.txt \
+  --proxy http://127.0.0.1:<port>
 ```
 
-Each completed clip directory contains `clip.mp4`, `keyframes/initial.png`,
-`semantic.svg`, `semantic_preview.png`, and JSON reports. Dynamic data recovery writes
-`dynamic_data.json`, `dynamic_data.csv`, `final_data_table.csv`,
-`data_change_events.csv`, `data_events.jsonl`, and the review-compatible `chart_data.csv`
-when visual frames or corresponding narration contain verifiable numeric values. Clips
-with at least one reliable numeric fact can be included as partial data; clips without
-recoverable quantitative data are excluded with `no_recoverable_quantitative_data`.
-Geometry-only bar/line interpolation is not treated as data.
+The script can also download clips, but downloaded media is ignored by git.
 
-The Qwen model path is read from `MODEL_PATH`. The implementation prefers BF16 when CUDA reports BF16 support, otherwise FP16. If Qwen chart detection is unavailable, the pipeline records the failure and does not create positive clips from fallback guesses.
+## What Not To Commit
 
-Run tests:
-
-```bash
-PYTHONPATH=src pytest -q
-```
-
-## Older Detection Experiments
-
-These commands are kept for reference only. They target broader data-video candidates, not the current bar-chart-dominant definition:
-
-```bash
-source /path/to/workspace/miniconda3/bin/activate DataVideo
-export PYTHONPATH=/path/to/workspace/projects/data_video_dataset/src
-export MODEL_PATH=/path/to/qwen-vl-model
-python -m datavideo.cli detect --config configs/stage1_bar.yaml --force
-python -m datavideo.cli merge-review --config configs/stage1_bar.yaml --force
-```
-
-Do not continue new experiments from `data/reviewed/bar_001/candidates/` or old generic `merged_clips.jsonl`.
-
-## Next Build Steps
-
-- Use `data/generated/bar_001/final_bar_clips.jsonl` as the source of accepted clips.
-- `bar-assets` now selects a complete static-form keyframe for each accepted bar clip, writes VTracer `semantic.svg`, recovers chart data, and prepares Streamlit review assets.
-- Later: add animation description, Whisper transcription, narration-animation alignment, and Streamlit/manual review for the revised schema.
+Do not commit cookies, model weights, downloaded videos, generated assets,
+review databases, logs, or local cache directories. `.gitignore` already covers
+the standard locations.

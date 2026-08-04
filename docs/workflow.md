@@ -234,14 +234,14 @@ The webpage interval is the visual truth for this dataset.
 Generate context media, context audio, and strict visual clip:
 
 ```bash
-PYTHONPATH=src python -m datavideo.cli multichart-context-v2 \
+PYTHONPATH=src python -m datavideo.cli context \
   --config configs/multichart_assets_v2.yaml
 ```
 
 Single clip:
 
 ```bash
-PYTHONPATH=src python -m datavideo.cli multichart-context-v2 \
+PYTHONPATH=src python -m datavideo.cli context \
   --config configs/multichart_assets_v2.yaml \
   --clip-id bar_1
 ```
@@ -261,7 +261,7 @@ Run ASR only on context audio:
 ```bash
 PYTHONPATH=src \
 WHISPER_MODEL_PATH=/path/to/faster-whisper-model \
-python -m datavideo.cli multichart-asr-v2 \
+python -m datavideo.cli asr \
   --config configs/multichart_assets_v2.yaml
 ```
 
@@ -298,11 +298,11 @@ Generate keyframes, semantic SVG, and chart data from the strict visual clip:
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
 PYTHONPATH=src \
 MODEL_PATH=/path/to/qwen-vl-model \
-python -m datavideo.cli multichart-assets-v2 \
+python -m datavideo.cli assets \
   --config configs/multichart_assets_v2.yaml
 ```
 
-`multichart-assets-v2` reads:
+`assets` reads:
 
 ```text
 data/processed/<clip_id>/visual_clip.mp4
@@ -513,29 +513,24 @@ Final visual dataset entry condition:
 asset_review.decision == "approved"
 ```
 
-The same asset review record stores human-reviewed animation fields under `reviewed_value.animation`, with `overall_description`, `major_actions`, and `confidence`. Machine animation remains in `data/generated_v2/<clip_id>/animation_detection.json`; reviewed animation is written by `multichart-review-v2` to `animation_reviewed.json`.
+The same asset review record stores human-reviewed animation fields under `reviewed_value.animation`, with `overall_description`, `major_actions`, and `confidence`. Machine animation remains in `data/generated_v2/<clip_id>/animation_detection.json`; reviewed animation is written by `reviewed` to `animation_reviewed.json`.
 
 The same asset review record also stores reviewed narration under `reviewed_value.narration`. Reviewers may edit sentence text or clear `keep_in_reviewed` for sentences that should not enter the final dataset. Machine ASR remains copied for audit; reviewed narration is written to `narration_reviewed.json`.
 
-## Deprecated Current-Web Commands
+## Deprecated Boundary Review
 
-These are not part of the canonical workflow for webpage-annotated data:
-
-```text
-multichart-chart-boundary-v2
-multichart-propose-v2
-app/multichart_v2_clip_review_app.py
-multichart_v2_clip_review
-```
-
-They are retained only for compatibility or future unannotated-video experiments. They must not be used to generate current official outputs.
+The clip-boundary review UI is no longer part of the canonical workflow for
+webpage-annotated data. The current authoritative visual boundary is the
+webpage `reference_start/reference_end` interval, so clip-boundary review is
+kept only for older records and should not be used to generate new official
+outputs.
 
 ## 6. Reviewed Dataset
 
 Rebuild reviewed outputs:
 
 ```bash
-PYTHONPATH=src python -m datavideo.cli multichart-review-v2 \
+PYTHONPATH=src python -m datavideo.cli reviewed \
   --config configs/multichart_assets_v2.yaml
 ```
 
@@ -564,7 +559,7 @@ Reviewed narration is written to:
 - ASR model or context audio changes: regenerate narration.
 - Human narration edits: do not rerun ASR.
 - Narration edits: do not regenerate visual assets.
-- Asset review edits: rerun `multichart-review-v2`.
+- Asset review edits: rerun `reviewed`.
 
 ## Later Alignment
 
@@ -588,10 +583,10 @@ Old generated assets may have been based on proposed or reviewed narration-compl
 
 Migration order:
 
-1. Run `multichart-context-v2` to create `context.mp4`, `context_audio_16k_mono.wav`, and strict `visual_clip.mp4`.
-2. Run `multichart-asr-v2` to derive full overlapping narration.
-3. Run `multichart-assets-v2` to regenerate visual assets from `visual_clip.mp4`.
+1. Run `context` to create `context.mp4`, `context_audio_16k_mono.wav`, and strict `visual_clip.mp4`.
+2. Run `asr` to derive full overlapping narration.
+3. Run `assets` to regenerate visual assets from `visual_clip.mp4`.
 4. Review assets in `app/multichart_v2_review_app.py` and save an English `approved` decision for accepted clips.
-5. Run `multichart-review-v2`.
+5. Run `reviewed`.
 
 Do not delete old `review.db` records. Old clip-boundary reviews are ignored by the canonical rebuild. If an old asset review used a non-English decision, re-save it with the English enum before expecting it to enter the final dataset.

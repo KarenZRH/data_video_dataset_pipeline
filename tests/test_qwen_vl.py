@@ -1,31 +1,24 @@
-from datavideo.qwen_vl import QwenVLClient, _normalize_data_video_result
+from datavideo.qwen_vl import QwenVLClient
 
 
-def test_qwen_unavailable_is_not_positive(monkeypatch):
+def test_qwen_semantic_components_unavailable(monkeypatch):
     monkeypatch.delenv("MODEL_PATH", raising=False)
-    client = QwenVLClient({"chart_type": "bar", "model": {"env_var": "MODEL_PATH"}})
-    response = client.classify_frames(["missing.jpg"])
+    client = QwenVLClient({"model": {"env_var": "MODEL_PATH"}})
+
+    response = client.identify_semantic_components("missing.jpg")
+
     assert response["model_status"] == "qwen_unavailable"
-    assert response["result"]["is_chart"] is False
-    assert response["result"]["scene_state"] == "uncertain"
+    assert response["result"]["chart_type"] == "unknown"
+    assert response["result"]["entities"] == []
+    assert response["failure_reason"]
 
 
-def test_data_video_negative_reason_overrides_copied_positive_fields():
-    result = _normalize_data_video_result(
-        {
-            "is_data_video_clip_candidate": True,
-            "contains_data_marks": True,
-            "data_mark_types": ["horizontal_bar"],
-            "chart_types": ["bar"],
-            "chart_readable": False,
-            "chart_completeness": 0.45,
-            "scene_state": "chart_animating",
-            "animation_cue": "bar_growing_left_to_right",
-            "confidence": 0.62,
-            "reason": "画面中没有明显的数据可视化元素，因此不符合数据可视化动画的标准。",
-        }
-    )
-    assert result["is_data_video_clip_candidate"] is False
-    assert result["contains_data_marks"] is False
-    assert result["scene_state"] == "non_chart"
-    assert result["sanitized"] is True
+def test_qwen_quality_review_unavailable(monkeypatch):
+    monkeypatch.setenv("DATAVIDEO_SKIP_QWEN", "1")
+    client = QwenVLClient({"model": {"env_var": "MODEL_PATH"}})
+
+    response = client.review_quality(["missing.jpg"], "review this")
+
+    assert response["model_status"] == "qwen_unavailable"
+    assert response["result"]["needs_review"] is True
+    assert response["result"]["issue_codes"] == ["qc_vlm_unavailable"]

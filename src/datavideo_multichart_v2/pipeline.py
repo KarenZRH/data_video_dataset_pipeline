@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import Any
 
 from datavideo.context import create_context_media
+from .animation import detect_animation
 from datavideo.narration import transcribe_context_audio
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
 
-from .animation import detect_animation
 from .assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
 from .qwen import MultichartQwenClient
 
@@ -34,10 +34,6 @@ def _load_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     if max_clips is not None and not clip_id:
         rows = rows[: int(max_clips)]
     return rows
-
-
-def run_chart_boundary_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    raise RuntimeError("deprecated_for_web_annotated_multichart_v2: webpage reference intervals are authoritative; do not run Qwen chart-boundary detection in the canonical workflow")
 
 
 def _write_candidate_report(
@@ -122,10 +118,6 @@ def run_asr_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]
     return report
 
 
-def run_proposal_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    raise RuntimeError("deprecated_for_web_annotated_multichart_v2: visual clip boundaries must not be expanded for narration completeness")
-
-
 def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
     processed_root = ensure_dir(cfg.get("processed_root", "data/processed"))
     generated_root = ensure_dir(cfg.get("generated_root", "data/generated_v2"))
@@ -145,7 +137,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             intervals = media["intervals"]
             visual_clip = Path(media["visual_clip"])
             if not visual_clip.exists():
-                raise RuntimeError("missing_visual_clip: run multichart-context-v2 first")
+                raise RuntimeError("missing_visual_clip: run `context` first")
             media = {
                 **media,
                 "visual_clip": str(visual_clip),

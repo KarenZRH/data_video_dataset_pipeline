@@ -23,17 +23,14 @@ echo "FFmpeg: $($FFMPEG_BIN -version | head -n 1)"
 from pathlib import Path
 
 required = [
-    "data/raw/videos",
-    "data/keyframes",
-    "data/svg",
-    "data/audio",
-    "data/transcripts",
-    "data/annotations",
+    "data/raw",
     "configs",
     "docs",
-    "notebooks",
     "scripts",
-    "src/data_video_dataset",
+    "src/datavideo",
+    "src/datavideo_multichart_v2",
+    "app",
+    "tests",
 ]
 
 missing = [path for path in required if not Path(path).exists()]

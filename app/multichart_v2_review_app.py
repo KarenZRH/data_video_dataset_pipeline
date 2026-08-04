@@ -56,7 +56,7 @@ def _abs(path: str | Path) -> Path:
 def _load_run_report(generated: Path) -> dict[str, Any]:
     path = generated / "multichart_v2_run_report.json"
     if not path.exists():
-        st.warning("Run multichart-assets-v2 first.")
+        st.warning("Run `assets` first.")
         st.stop()
     return read_json(path)
 
