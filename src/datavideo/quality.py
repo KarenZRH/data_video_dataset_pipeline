@@ -91,7 +91,7 @@ def _rule_check_clip(clip_root: Path) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     required = [
         "clip.mp4",
-        "keyframes/initial.png",
+        "keyframes/selected.png",
         "semantic.svg",
         "dynamic_data.json",
         "chart_data_validation.json",
@@ -230,10 +230,10 @@ def _vlm_check_clip(clip_root: Path, cfg: dict[str, Any]) -> list[dict[str, Any]
 
     images = []
     for rel in [
-        "keyframes/initial.png",
+        "keyframes/selected.png",
         "semantic_preview.png",
-        "keyframes/semantic_inputs/state_001_1990.png",
-        "keyframes/semantic_inputs/state_002_2017.png",
+        "keyframes/states/state_001_1990.png",
+        "keyframes/states/state_002_2017.png",
         "semantic_states/state_001_1990/semantic_preview.png",
         "semantic_states/state_002_2017/semantic_preview.png",
     ]:

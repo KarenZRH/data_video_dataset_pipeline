@@ -142,7 +142,7 @@ def _state_enabled_chart_types(cfg: dict[str, Any]) -> set[str]:
 
 
 def _prefer_late_chart_types(cfg: dict[str, Any]) -> set[str]:
-    values = cfg.get("keyframes", {}).get("prefer_late_chart_types", ["bar"])
+    values = cfg.get("keyframes", {}).get("prefer_late_chart_types", ["bar", "pie", "donut", "combined"])
     return {str(value).lower() for value in _as_list(values)}
 
 
@@ -336,6 +336,30 @@ def _anchor_frame_indices(frame_context: list[dict[str, Any]], cfg: dict[str, An
     return unique[:max_anchor_frames]
 
 
+def _metadata_entities(data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = data.get("rows") if isinstance(data, dict) else []
+    entities: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("value") in (None, ""):
+            continue
+        label = row.get("label") or row.get("series") or row.get("x") or row.get("state")
+        if not label:
+            label = f"entity_{len(entities) + 1}"
+        key = str(label).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(
+            {
+                "label": str(label).strip(),
+                "value": row.get("value"),
+                "unit": row.get("unit"),
+            }
+        )
+    return entities
+
+
 def _write_semantic_state_inputs(
     dynamic: dict[str, Any],
     source_video: str | Path | None,
@@ -346,7 +370,7 @@ def _write_semantic_state_inputs(
 ) -> dict[str, Any]:
     plan = plan_dynamic_state_keyframes(dynamic)
     manifest_path = Path(out_dir) / "semantic_state_input_manifest.json"
-    state_dir = ensure_dir(Path(out_dir) / "keyframes" / "semantic_inputs")
+    state_dir = ensure_dir(Path(out_dir) / "keyframes" / "states")
     if not plan.get("should_save"):
         manifest = {"should_save": False, "reason": plan.get("reason"), "semantic_inputs": []}
         write_json(manifest_path, manifest)
@@ -369,16 +393,49 @@ def _write_semantic_state_inputs(
             asset = out_path
             if source_frame.exists() and (force or not asset.exists()):
                 shutil.copyfile(source_frame, asset)
-        rows.append({**state, "semantic_input": str(asset)})
+        rows.append({**state, "keyframe": str(asset), "semantic_input": str(asset)})
 
     manifest = {
         "should_save": True,
         "reason": plan.get("reason"),
-        "selection_rule": "first_last_complete_evidenced_data_states_for_semantic_svg_conversion",
+        "selection_rule": "first_last_complete_evidenced_data_states_as_state_keyframes",
         "semantic_inputs": rows,
     }
     write_json(manifest_path, manifest)
+    _merge_dynamic_state_keyframes(Path(out_dir), rows)
     return {"manifest": str(manifest_path), "semantic_inputs": rows}
+
+
+def _merge_dynamic_state_keyframes(out_dir: Path, rows: list[dict[str, Any]]) -> None:
+    manifest_path = out_dir / "keyframes" / "keyframe_manifest.json"
+    if not manifest_path.exists():
+        return
+    manifest = read_json(manifest_path)
+    states = []
+    for idx, item in enumerate(rows, start=1):
+        asset = item.get("keyframe") or item.get("semantic_input")
+        if not asset:
+            continue
+        state_id = str(item.get("state_id") or f"state_{idx:03d}")
+        state_label = str(item.get("state_label") or item.get("state_key") or state_id)
+        states.append(
+            {
+                "name": state_id,
+                "state_key": item.get("state_key"),
+                "state_label": state_label,
+                "timestamp": item.get("timestamp"),
+                "asset": asset,
+                "source_frame_id": item.get("source_frame_id"),
+                "source_frame_path": item.get("source_frame_path"),
+                "keyframe_role": "data_state_keyframe",
+                "entity_ids": item.get("entity_ids", []),
+                "signature": item.get("signature", []),
+            }
+        )
+    manifest.setdefault("assets", {})["states"] = [state["asset"] for state in states]
+    manifest["states"] = states
+    manifest["state_keyframe_selection_method"] = "dynamic_data_first_last_state_keyframes"
+    write_json(manifest_path, manifest)
 
 
 def build_semantic_state_svgs(
@@ -408,6 +465,9 @@ def build_semantic_state_svgs(
         state_label = str(item.get("state_label") or item.get("state_key") or state_id)
         safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in state_label).strip("_") or state_id
         state_out_dir = ensure_dir(out_dir / "semantic_states" / f"{state_id}_{safe_label}")
+        parent_metadata = out_dir / "chart_metadata.json"
+        if parent_metadata.exists():
+            shutil.copy2(parent_metadata, state_out_dir / "chart_metadata.json")
         report = build_semantic_svg(image_path, state_out_dir, cfg, force=force, rebuild_components=force)
         rows.append({**item, **report})
 
@@ -569,7 +629,7 @@ def select_keyframe(
     chart_type = str(row.get("chart_type", ""))
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))
     timestamp = _safe_still_timestamp(float(selected["timestamp"]), duration, cfg)
-    asset = str(extract_still(normalized_video, timestamp, out_dir / "initial.png", force=True))
+    asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
     state_rows = _select_state_rows(scored_rows, selected, cfg, chart_type)
     states_dir = ensure_dir(out_dir / "states")
     if force:
@@ -594,8 +654,8 @@ def select_keyframe(
     manifest = {
         "clip_id": clip_id,
         "chart_type": row["chart_type"],
-        "timestamps": {"initial": timestamp},
-        "assets": {"initial": asset, "states": [state["asset"] for state in states]},
+        "timestamps": {"selected": timestamp},
+        "assets": {"selected": asset, "states": [state["asset"] for state in states]},
         "states": states,
         "selection_method": "v2_simple_complete_final_state_keyframe",
         "source_video_role": "visual_clip",
@@ -815,6 +875,7 @@ def recover_clip_data(
         "x_axis": data.get("x_axis"),
         "y_axis": data.get("y_axis"),
         "series": data.get("series", []),
+        "entities": _metadata_entities(data) if isinstance(data, dict) else [],
         "visible_text": data.get("visible_text", []),
         "needs_manual_data": bool(data.get("needs_manual_data")) or bool(manual_rows),
         "model_status": response["model_status"],
@@ -875,4 +936,3 @@ def recover_clip_data(
         "manual_csv_path": validation["manual_csv_path"],
         "events_path": str(events_path),
     }
-

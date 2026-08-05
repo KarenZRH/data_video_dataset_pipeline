@@ -44,6 +44,12 @@ def _clamp01(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _clip_id_for_out_dir(out_dir: Path) -> str:
+    if out_dir.parent.name == "semantic_states" and out_dir.parent.parent.name:
+        return out_dir.parent.parent.name
+    return out_dir.name
+
+
 def _normalize_components(
     raw_result: dict[str, Any],
     image_path: Path,
@@ -192,7 +198,7 @@ def _normalize_components(
         warnings.append(f"dropped dangling group component ids: {', '.join(sorted(set(dangling_ids)))}")
 
     return {
-        "clip_id": out_dir.name,
+        "clip_id": _clip_id_for_out_dir(out_dir),
         "source_keyframe": str(image_path),
         "image_width": width,
         "image_height": height,
@@ -252,6 +258,13 @@ def _render_box_svg(
 
 
 def _render_png(svg_path: Path, png_path: Path) -> bool:
+    try:
+        import cairosvg
+
+        cairosvg.svg2png(url=str(svg_path), write_to=str(png_path))
+        return png_path.exists()
+    except Exception:
+        pass
     try:
         subprocess.run(["rsvg-convert", "-o", str(png_path), str(svg_path)], check=True)
         return png_path.exists()
@@ -320,7 +333,8 @@ def build_semantic_components(
             report["warnings"].extend(annotation.get("warnings", []))
 
         _render_box_svg(image_path, annotation["objects"], components_svg, group_id="semantic-components-inspection")
-        report["success"] = _render_png(components_svg, components_png) and json_path.exists()
+        report["preview_success"] = _render_png(components_svg, components_png)
+        report["success"] = json_path.exists() and bool(annotation.get("objects"))
     except Exception as exc:
         report["failure_reason"] = str(exc)
 

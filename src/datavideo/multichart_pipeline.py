@@ -30,6 +30,23 @@ def _load_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return read_clip_rows(cfg)
 
 
+def _semantic_input_path(keyframes: dict[str, Any], state_inputs: Any) -> str:
+    if isinstance(state_inputs, dict):
+        inputs = state_inputs.get("semantic_inputs")
+        if isinstance(inputs, list) and inputs:
+            asset = inputs[0].get("semantic_input") if isinstance(inputs[0], dict) else None
+            if asset:
+                return str(asset)
+    states = keyframes.get("states") if isinstance(keyframes.get("states"), list) else []
+    for state in states:
+        if isinstance(state, dict) and state.get("asset"):
+            return str(state["asset"])
+    assets = keyframes.get("assets") if isinstance(keyframes.get("assets"), dict) else {}
+    if assets.get("selected"):
+        return str(assets["selected"])
+    raise RuntimeError("No semantic input frame available")
+
+
 def _write_candidate_report(
     clip_root: Path,
     row: dict[str, Any],
@@ -164,8 +181,6 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 client=client,
                 force=asset_force,
             )
-            initial = keyframes["assets"]["initial"]
-            semantic = build_semantic_svg(initial, clip_root, cfg, force=asset_force)
             chart_data = recover_clip_data(
                 cfg,
                 keyframes,
@@ -174,6 +189,9 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 client=client,
                 force=asset_force,
             )
+            state_inputs = chart_data.get("semantic_state_inputs") if isinstance(chart_data, dict) else None
+            semantic_input = _semantic_input_path(keyframes, state_inputs)
+            semantic = build_semantic_svg(semantic_input, clip_root, cfg, force=asset_force)
             semantic_state_svgs = build_semantic_state_svgs(
                 chart_data.get("semantic_state_inputs"),
                 clip_root,

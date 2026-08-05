@@ -78,6 +78,7 @@ Semantic goal:
 - Use readable text when visible; otherwise set text to null and text_status to "unreadable".
 - Group parts that belong to the same entity.
 - Do not output final component ids. The program will compile stable ids later.
+- For bar charts, include one type "bar" object for each visible bar mark. Do not represent bars only through labels or value labels.
 
 Return strict JSON only.
 """
@@ -96,9 +97,71 @@ Do not silently approve if visual evidence, recovered data, semantic roles, or s
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
-    match = re.search(r"\{.*\}", text, re.S)
-    payload = match.group(0) if match else text
-    return json.loads(payload)
+    def _candidate_payloads(value: str) -> list[str]:
+        payloads: list[str] = []
+        text = value.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+            text = re.sub(r"\s*```$", "", text)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            payloads.append(text[start : end + 1])
+        if start >= 0:
+            payloads.append(text[start:])
+        payloads.append(text)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for payload in payloads:
+            payload = payload.strip()
+            if payload and payload not in seen:
+                ordered.append(payload)
+                seen.add(payload)
+        return ordered
+
+    def _repair_payload(payload: str) -> str:
+        repaired = re.sub(r",\s*([}\]])", r"\1", payload.strip())
+        repaired = re.sub(r"}\s*\n\s*{", "},\n{", repaired)
+        repaired = re.sub(r"]\s*\n\s*\"", "],\n\"", repaired)
+        repaired = re.sub(r"}\s*\n\s*\"", "},\n\"", repaired)
+        stack: list[str] = []
+        in_string = False
+        escape = False
+        for char in repaired:
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif char in ("}", "]") and stack and stack[-1] == char:
+                stack.pop()
+        if stack:
+            repaired += "".join(reversed(stack))
+        return repaired
+
+    last_error: Exception | None = None
+    for payload in _candidate_payloads(text):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            try:
+                return json.loads(_repair_payload(payload))
+            except json.JSONDecodeError as repair_exc:
+                last_error = repair_exc
+                continue
+    if last_error:
+        raise last_error
+    return json.loads(text)
 
 
 def _dtype():
@@ -107,6 +170,71 @@ def _dtype():
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float16
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _torch_dtype_from_config(preference: str | None):
+    import torch
+
+    dtype = (preference or "auto").strip().lower()
+    if dtype in {"auto", ""}:
+        return _dtype()
+    if dtype in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if dtype in {"fp16", "float16", "half"}:
+        return torch.float16
+    if dtype in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(f"Unsupported Qwen dtype_preference: {preference}")
+
+
+def _merge_model_variant(model_cfg: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(model_cfg)
+    if model_cfg.get("variant"):
+        merged["selected_variant"] = str(model_cfg["variant"])
+    variant_env = str(model_cfg.get("variant_env") or "QWEN_MODEL_VARIANT")
+    variant = os.environ.get(variant_env)
+    variants = model_cfg.get("variants") if isinstance(model_cfg.get("variants"), dict) else {}
+    if not variant:
+        return merged
+    variant_cfg = variants.get(variant)
+    if not isinstance(variant_cfg, dict):
+        return merged
+    merged = {**merged, **variant_cfg}
+    merged["selected_variant"] = variant
+    return merged
+
+
+def _resolve_model_path(model_cfg: dict[str, Any]) -> tuple[str | None, str | None]:
+    direct_path = model_cfg.get("path")
+    if direct_path:
+        return str(Path(str(direct_path)).expanduser()), "path"
+    env_names: list[str] = []
+    if isinstance(model_cfg.get("env_vars"), list):
+        env_names.extend(str(name) for name in model_cfg["env_vars"] if name)
+    if model_cfg.get("env_var"):
+        env_names.append(str(model_cfg["env_var"]))
+    for env_name in dict.fromkeys(env_names):
+        value = os.environ.get(env_name)
+        if value:
+            return value, env_name
+    return None, env_names[0] if env_names else None
 
 
 def _clamp01(value: Any, default: float = 0.0) -> float:
@@ -225,9 +353,12 @@ def _semantic_layout_quality_error(components: dict[str, Any]) -> str | None:
 
 
 class QwenVLClient:
+    _shared: dict[str, Any] | None = None
+
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
-        self.model_path = os.environ.get(cfg["model"]["env_var"])
+        self.model_cfg = _merge_model_variant(cfg["model"])
+        self.model_path, self.model_path_source = _resolve_model_path(self.model_cfg)
         self.model = None
         self.processor = None
         self.model_version = None
@@ -242,27 +373,65 @@ class QwenVLClient:
     def load(self) -> bool:
         if self.model is not None:
             return True
+        shared = QwenVLClient._shared
+        if shared and self.model_path and Path(self.model_path).resolve() == Path(shared["model_path"]).resolve():
+            self.model = shared["model"]
+            self.processor = shared["processor"]
+            self.model_version = shared["model_version"]
+            return True
         if not self.available():
             if not self.load_error:
-                self.load_error = f"{self.cfg['model']['env_var']} is empty or missing"
+                source = self.model_path_source or "model.path"
+                self.load_error = f"{source} is empty or missing"
             return False
         try:
             import torch
             from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
+            torch_dtype = _torch_dtype_from_config(self.model_cfg.get("dtype_preference"))
+            load_kwargs: dict[str, Any] = {
+                "device_map": self.model_cfg.get("device_map", "auto"),
+                "local_files_only": _as_config_bool(self.model_cfg.get("local_files_only"), True),
+            }
+            load_in_4bit = _as_config_bool(
+                self.model_cfg.get("quantize_4bit", self.model_cfg.get("load_in_4bit")),
+                False,
+            )
+            load_in_4bit_env = self.model_cfg.get("load_in_4bit_env")
+            if load_in_4bit_env and os.environ.get(str(load_in_4bit_env)) is not None:
+                load_in_4bit = _as_config_bool(os.environ.get(str(load_in_4bit_env)), load_in_4bit)
+            if os.environ.get("DATAVIDEO_QUANTIZE_4BIT") is not None:
+                load_in_4bit = _as_config_bool(os.environ.get("DATAVIDEO_QUANTIZE_4BIT"), load_in_4bit)
+            if load_in_4bit:
+                from transformers import BitsAndBytesConfig
+
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch_dtype,
+                    bnb_4bit_quant_type=str(self.model_cfg.get("bnb_4bit_quant_type", "nf4")),
+                    bnb_4bit_use_double_quant=_as_config_bool(self.model_cfg.get("bnb_4bit_use_double_quant"), True),
+                )
+            else:
+                load_kwargs["torch_dtype"] = torch_dtype
+
             self.processor = AutoProcessor.from_pretrained(
                 self.model_path,
-                local_files_only=True,
-                min_pixels=224 * 224,
-                max_pixels=768 * 768,
+                local_files_only=_as_config_bool(self.model_cfg.get("local_files_only"), True),
+                min_pixels=_as_int(self.model_cfg.get("min_pixels"), 224 * 224),
+                max_pixels=_as_int(self.model_cfg.get("max_pixels"), 768 * 768),
             )
             self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_path,
-                torch_dtype=_dtype(),
-                device_map="auto",
-                local_files_only=True,
+                **load_kwargs,
             )
-            self.model_version = Path(self.model_path).name
+            variant = self.model_cfg.get("selected_variant")
+            self.model_version = f"{variant}:{Path(self.model_path).name}" if variant else Path(self.model_path).name
+            QwenVLClient._shared = {
+                "model": self.model,
+                "processor": self.processor,
+                "model_version": self.model_version,
+                "model_path": self.model_path,
+            }
             return True
         except Exception as exc:
             self.load_error = str(exc)
@@ -293,14 +462,17 @@ class QwenVLClient:
             try:
                 prompt = (
                     SEMANTIC_COMPONENT_PROMPT
+                    + "\nOutput JSON schema:\n"
+                    + json.dumps(SEMANTIC_COMPONENT_SCHEMA, ensure_ascii=False, indent=2)
                     + "\nChart metadata, if available:\n"
                     + json.dumps(chart_metadata or {}, ensure_ascii=False, indent=2)
                 )
-                raw = self._generate([image_path], prompt, max_new_tokens=1024)
-                result = _normalize_semantic_components(_json_from_text(raw))
-                quality_error = _semantic_layout_quality_error(result)
-                if quality_error:
-                    raise ValueError(quality_error)
+                raw = self._generate(
+                    [image_path],
+                    prompt,
+                    max_new_tokens=_as_int(self.model_cfg.get("semantic_max_new_tokens"), 2048),
+                )
+                result = _json_from_text(raw)
                 return {"result": result, "raw_response": raw, "model_status": "qwen", "failure_reason": None}
             except Exception as exc:
                 return self._unavailable_semantic_components(f"qwen inference failed: {exc}", raw_response=raw)

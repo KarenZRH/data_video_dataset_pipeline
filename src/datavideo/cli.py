@@ -40,7 +40,7 @@ def main() -> None:
         ],
         help="Pipeline stage to run.",
     )
-    parser.add_argument("--config", default="configs/multichart_assets_v2.yaml")
+    parser.add_argument("--config", default="configs/multichart_assets_base.yaml")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--clip-id", default=None)
     args = parser.parse_args()

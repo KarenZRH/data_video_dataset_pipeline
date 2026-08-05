@@ -6,7 +6,7 @@ web-annotated source videos.
 The repository has been consolidated around one current workflow:
 
 - Main workflow and shared utilities: `src/datavideo/`
-- Main config: `configs/multichart_assets_v2.yaml`
+- Main configs: `configs/multichart_assets_qwen7b.yaml`, `configs/multichart_assets_qwen3b.yaml`
 - Workflow guide: `docs/workflow.md`
 - Review app: `app/multichart_v2_review_app.py`
 
@@ -19,7 +19,8 @@ See `docs/repo_map.md` for the current repository map.
 ```bash
 conda activate DataVideo
 export PYTHONPATH=src
-export MODEL_PATH=/path/to/qwen-vl-model
+export MODEL_7B_PATH=/path/to/qwen2.5-vl-7b
+export MODEL_3B_PATH=/path/to/qwen2.5-vl-3b
 export WHISPER_MODEL_PATH=/path/to/faster-whisper-model
 # Optional, only if your network requires a proxy:
 # export HTTP_PROXY=http://127.0.0.1:<port>
@@ -35,23 +36,25 @@ PYTHONPATH=src pytest -q
 
 ## Current Workflow
 
-Run the canonical web-annotated multichart v2 stages:
+Run the canonical web-annotated multichart v2 stages on 7B:
 
 ```bash
-PYTHONPATH=src python -m datavideo.cli context --config configs/multichart_assets_v2.yaml
-PYTHONPATH=src python -m datavideo.cli asr --config configs/multichart_assets_v2.yaml
-PYTHONPATH=src python -m datavideo.cli assets --config configs/multichart_assets_v2.yaml
-PYTHONPATH=src python -m datavideo.cli quality --config configs/multichart_assets_v2.yaml
-PYTHONPATH=src python -m datavideo.cli reviewed --config configs/multichart_assets_v2.yaml
+PYTHONPATH=src python -m datavideo.cli context --config configs/multichart_assets_qwen7b.yaml
+PYTHONPATH=src python -m datavideo.cli asr --config configs/multichart_assets_qwen7b.yaml
+PYTHONPATH=src python -m datavideo.cli assets --config configs/multichart_assets_qwen7b.yaml
+PYTHONPATH=src python -m datavideo.cli quality --config configs/multichart_assets_qwen7b.yaml
+PYTHONPATH=src python -m datavideo.cli reviewed --config configs/multichart_assets_qwen7b.yaml
 ```
 
 For one clip:
 
 ```bash
 PYTHONPATH=src python -m datavideo.cli assets \
-  --config configs/multichart_assets_v2.yaml \
+  --config configs/multichart_assets_qwen7b.yaml \
   --clip-id bar_1
 ```
+
+For 3B, swap to `configs/multichart_assets_qwen3b.yaml`.
 
 Review UI:
 

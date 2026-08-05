@@ -9,7 +9,7 @@ def _write_base_clip(root: Path, *, include: bool = True, states: list[dict] | N
     clip = root / "bar_1"
     (clip / "keyframes").mkdir(parents=True)
     (clip / "clip.mp4").write_bytes(b"mp4")
-    (clip / "keyframes" / "initial.png").write_bytes(b"png")
+    (clip / "keyframes" / "selected.png").write_bytes(b"png")
     (clip / "semantic.svg").write_text(
         '<svg xmlns="http://www.w3.org/2000/svg"><g id="entity-car" data-role="entity"><rect id="car-bar" data-role="bar"/></g></svg>\n',
         encoding="utf-8",
