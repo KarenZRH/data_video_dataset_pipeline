@@ -31,6 +31,10 @@ model:
   batch_size: 1
   max_frames_per_call: 1
   dtype_preference: bf16
+  device_map: auto
+  local_files_only: true
+  min_pixels: 50176
+  max_pixels: 589824
   allow_heuristic_fallback: false
 
 video_standardization:
@@ -66,8 +70,8 @@ keyframes:
 clip_data:
   coarse_fps: 2
   fine_fps: 8
-  max_frames: 6
-  max_new_tokens: 2048
+  max_frames: 10
+  max_new_tokens: 4096
   motion_change_threshold: 0.08
   min_fine_window_frames: 2
   max_source_fps: 30

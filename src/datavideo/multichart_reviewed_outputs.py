@@ -188,12 +188,14 @@ def _narration_status(processed_root: Path, intervals: dict[str, Any]) -> str:
 def _write_final_keyframe(source_root: Path, clip_root: Path, keyframe_review: dict[str, Any]) -> None:
     asset = keyframe_review.get("asset") or keyframe_review.get("path")
     if not asset:
-        asset = source_root / "keyframes" / "initial.png"
+        asset = source_root / "keyframes" / "selected.png"
     src = Path(asset)
     if not src.is_absolute():
         src = Path.cwd() / src
     if not src.exists():
-        src = source_root / "keyframes" / "initial.png"
+        state_dir = source_root / "keyframes" / "states"
+        state_assets = sorted(state_dir.glob("state_*.png")) if state_dir.exists() else []
+        src = state_assets[0] if state_assets else source_root / "keyframes" / "selected.png"
     dst = ensure_dir(clip_root / "keyframes") / "final.png"
     if src.exists():
         shutil.copy2(src, dst)

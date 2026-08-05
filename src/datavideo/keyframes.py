@@ -159,8 +159,8 @@ def extract_scored_keyframe(
     manifest_path = out_dir / "keyframe_manifest.json"
     if manifest_path.exists() and not force:
         cached = read_json(manifest_path)
-        initial = Path(cached.get("assets", {}).get("initial", ""))
-        if cached.get("clip_id") == clip["clip_id"] and initial.exists():
+        selected = Path(cached.get("assets", {}).get("selected", ""))
+        if cached.get("clip_id") == clip["clip_id"] and selected.exists():
             return cached
     frame_dir = ensure_dir(out_dir / "candidate_frames")
     fps = _sample_fps(cfg)
@@ -203,12 +203,12 @@ def extract_scored_keyframe(
 
     selected = max(scored_rows, key=_selection_rank)
     timestamp = float(selected["timestamp"])
-    asset = str(extract_still(video, timestamp, out_dir / "initial.png", force=force))
+    asset = str(extract_still(video, timestamp, out_dir / "selected.png", force=force))
     manifest = {
         "clip_id": clip["clip_id"],
-        "timestamps": {"initial": timestamp},
-        "assets": {"initial": asset},
-        "selection_method": "sampled_frame_priority_initial_seed_keyframe",
+        "timestamps": {"selected": timestamp},
+        "assets": {"selected": asset},
+        "selection_method": "sampled_frame_priority_selected_keyframe",
         "source_frame_id": selected["frame_id"],
         "sample_fps": fps,
         "chart_identity": identity,
@@ -222,7 +222,7 @@ def extract_scored_keyframe(
             "post_change_state": False,
             "complete_initial_chart": True,
             "all_target_categories_visible": True,
-            "description": "Select an initial seed keyframe before the main data-change animation; motion is only an auxiliary tie-breaker after initial-state completeness.",
+            "description": "Select a representative clip keyframe before the main data-change animation; motion is only an auxiliary tie-breaker after completeness.",
         },
     }
     write_jsonl(out_dir / "keyframe_scores.jsonl", scored_rows)

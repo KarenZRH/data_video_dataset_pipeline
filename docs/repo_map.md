@@ -10,7 +10,7 @@ web-annotated multichart v2 pipeline.
 | CLI entry point | `src/datavideo/cli.py` |
 | Main workflow package | `src/datavideo/` |
 | Shared utilities | `src/datavideo/` |
-| Main config | `configs/multichart_assets_v2.yaml` |
+| Main configs | `configs/multichart_assets_qwen7b.yaml`, `configs/multichart_assets_qwen3b.yaml` |
 | Optional Gemini config | `configs/multichart_assets_gemini.yaml` |
 | Main docs | `docs/workflow.md`, `docs/工作流.md` |
 | Review app | `app/multichart_v2_review_app.py` |
@@ -26,11 +26,13 @@ web-annotated multichart v2 pipeline.
 | `quality` | Run deterministic and optional VLM quality checks. |
 | `reviewed` | Rebuild reviewed outputs from the latest review database records. |
 
-All commands default to:
+The shared baseline config is:
 
 ```text
-configs/multichart_assets_v2.yaml
+configs/multichart_assets_base.yaml
 ```
+
+Use the model-specific configs above for independent 7B and 3B outputs.
 
 ## Shared Utility Modules
 

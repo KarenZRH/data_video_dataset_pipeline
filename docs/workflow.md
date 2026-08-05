@@ -16,7 +16,8 @@ Use local models only:
 ```bash
 conda activate DataVideo
 export PYTHONPATH=src
-export MODEL_PATH=/path/to/qwen-vl-model
+export MODEL_7B_PATH=/path/to/qwen2.5-vl-7b
+export MODEL_3B_PATH=/path/to/qwen2.5-vl-3b
 export WHISPER_MODEL_PATH=/path/to/faster-whisper-model
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # export CUDA_VISIBLE_DEVICES=<gpu-id>
@@ -27,8 +28,10 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 Main config:
 
 ```text
-configs/multichart_assets_v2.yaml
+configs/multichart_assets_qwen7b.yaml
 ```
+
+Use `configs/multichart_assets_qwen3b.yaml` for the 3B run.
 
 Do not commit cookies, models, downloaded videos, generated assets, or reviewed dataset artifacts.
 
@@ -92,7 +95,7 @@ Generated visual assets:
 data/generated/<clip_id>/
   clip.mp4                  # copy/normalized equivalent of processed/<clip_id>/visual_clip.mp4
   keyframes/
-    initial.png
+    selected.png
     states/
     keyframe_manifest.json
     keyframe_scores.jsonl
@@ -172,7 +175,7 @@ State merging is local in time: only consecutive rows with the same entity set a
 After keyframes, data tables, semantic SVGs, animation detection, and narration are generated, run quality control to produce a review queue:
 
 ```bash
-python -m datavideo.cli quality-check --config configs/multichart_assets_v2.yaml
+python -m datavideo.cli quality --config configs/multichart_assets_qwen7b.yaml
 ```
 
 The checker uses three layers:
@@ -239,14 +242,14 @@ Generate context media, context audio, and strict visual clip:
 
 ```bash
 PYTHONPATH=src python -m datavideo.cli context \
-  --config configs/multichart_assets_v2.yaml
+  --config configs/multichart_assets_qwen7b.yaml
 ```
 
 Single clip:
 
 ```bash
 PYTHONPATH=src python -m datavideo.cli context \
-  --config configs/multichart_assets_v2.yaml \
+  --config configs/multichart_assets_qwen7b.yaml \
   --clip-id bar_1
 ```
 
@@ -266,7 +269,7 @@ Run ASR only on context audio:
 PYTHONPATH=src \
 WHISPER_MODEL_PATH=/path/to/faster-whisper-model \
 python -m datavideo.cli asr \
-  --config configs/multichart_assets_v2.yaml
+  --config configs/multichart_assets_qwen7b.yaml
 ```
 
 Input:
@@ -301,10 +304,12 @@ Generate keyframes, semantic SVG, and chart data from the strict visual clip:
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
 PYTHONPATH=src \
-MODEL_PATH=/path/to/qwen-vl-model \
+MODEL_7B_PATH=/path/to/qwen2.5-vl-7b \
 python -m datavideo.cli assets \
-  --config configs/multichart_assets_v2.yaml
+  --config configs/multichart_assets_qwen7b.yaml
 ```
+
+For a 3B run, use `MODEL_3B_PATH` and `configs/multichart_assets_qwen3b.yaml`.
 
 `assets` reads:
 
@@ -316,8 +321,8 @@ It writes `data/generated/<clip_id>/clip.mp4` as the visual clip used for review
 
 - candidate keyframes from visual-clip frames;
 - Qwen keyframe scores;
-- `keyframes/initial.png`;
-- optional `keyframes/states/state_*.png`;
+- `keyframes/selected.png` as the representative selected frame;
+- optional `keyframes/states/state_*.png` as data-state keyframes;
 - a Qwen whole-clip target-chart animation description;
 - optional major target-chart animation actions with evidence timestamps;
 - `semantic.svg` and `semantic_preview.png`;
@@ -535,10 +540,10 @@ Rebuild reviewed outputs:
 
 ```bash
 PYTHONPATH=src python -m datavideo.cli reviewed \
-  --config configs/multichart_assets_v2.yaml
+  --config configs/multichart_assets_qwen7b.yaml
 ```
 
-This reads latest asset reviews from `data/review/review.db` and writes final reviewed artifacts to `data/reviewed/datavideo_multichart_v2`.
+This reads latest asset reviews from the configured review database and writes final reviewed artifacts to the configured reviewed directory.
 
 It does not require or apply old clip-boundary reviews. Final `clip.mp4` is copied from `data/generated/<clip_id>/clip.mp4`, which corresponds to the webpage reference interval.
 Reviewed animation is copied from the approved asset-review value into `animation_reviewed.json`; machine raw reports are copied for audit. `clip.json` and `final_multichart_v2_clips.jsonl` expose `animation_description` for easy filtering and inspection.

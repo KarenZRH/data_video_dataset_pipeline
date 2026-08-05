@@ -44,6 +44,12 @@ def _clamp01(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _clip_id_for_out_dir(out_dir: Path) -> str:
+    if out_dir.parent.name == "semantic_states" and out_dir.parent.parent.name:
+        return out_dir.parent.parent.name
+    return out_dir.name
+
+
 def _normalize_components(
     raw_result: dict[str, Any],
     image_path: Path,
@@ -192,7 +198,7 @@ def _normalize_components(
         warnings.append(f"dropped dangling group component ids: {', '.join(sorted(set(dangling_ids)))}")
 
     return {
-        "clip_id": out_dir.name,
+        "clip_id": _clip_id_for_out_dir(out_dir),
         "source_keyframe": str(image_path),
         "image_width": width,
         "image_height": height,

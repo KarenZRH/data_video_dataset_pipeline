@@ -200,6 +200,22 @@ def _entity_specs(
             {"entity_id": "spaceship", "label": "SPACESHIP", "parts": ["spaceship_icon", "spaceship_label", "spaceship_bar"]},
         ]
     if clip_id == "bar_2":
+        bars = sorted((component for component in components if component.get("type") == "bar"), key=lambda item: item["bbox_px"][0])
+        if bars:
+            ordered_entities = [
+                ("sub-saharan-africa", "Sub-Saharan Africa"),
+                ("latin-america-caribbean", "Latin America & Caribbean"),
+                ("east-asia-pacific", "East Asia & Pacific"),
+                ("european-union", "European Union"),
+            ]
+            return [
+                {
+                    "entity_id": entity_id,
+                    "label": label,
+                    "parts": [bar["id"]],
+                }
+                for (entity_id, label), bar in zip(ordered_entities, bars, strict=False)
+            ]
         return [
             {
                 "entity_id": "sub-saharan-africa",

@@ -21,7 +21,7 @@ def test_apply_latest_reviews_writes_reviewed_narration(tmp_path):
     clip_root = generated / "bar_1"
     (clip_root / "keyframes").mkdir(parents=True)
     (clip_root / "clip.mp4").write_bytes(b"mp4")
-    (clip_root / "keyframes" / "initial.png").write_bytes(b"png")
+    (clip_root / "keyframes" / "selected.png").write_bytes(b"png")
     write_json(clip_root / "svg_report.json", {})
     write_json(clip_root / "chart_metadata.json", {})
     write_json(clip_root / "chart_data_validation.json", {})
@@ -38,7 +38,7 @@ def test_apply_latest_reviews_writes_reviewed_narration(tmp_path):
             "clips": [
                 {
                     "clip": {"clip_id": "bar_1", "start_time": "00:00:01", "end_time": "00:00:03"},
-                    "keyframes": {"assets": {"initial": str(clip_root / "keyframes" / "initial.png")}},
+                    "keyframes": {"assets": {"selected": str(clip_root / "keyframes" / "selected.png")}},
                 }
             ]
         },

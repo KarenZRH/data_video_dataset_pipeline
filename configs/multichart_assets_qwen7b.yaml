@@ -1,0 +1,18 @@
+extends: multichart_assets_base.yaml
+
+sample_id: datavideo_multichart_v2_qwen7b
+processed_root: data/processed/qwen7b
+generated_root: data/generated/qwen7b
+reviewed_dir: data/reviewed/datavideo_multichart_v2_qwen7b
+review_db: data/review/review_qwen7b.db
+
+model:
+  variant: qwen7b
+  env_var: MODEL_7B_PATH
+  prompt_version: qwen_multichart_assets_v2_direct_values
+  dtype_preference: bf16
+  device_map: auto
+  local_files_only: true
+  min_pixels: 50176
+  max_pixels: 589824
+  allow_heuristic_fallback: false

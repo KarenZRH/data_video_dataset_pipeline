@@ -15,7 +15,7 @@ def _write_minimal_png(path: Path) -> None:
 
 
 def test_semantic_svg_builds_role_based_scene_graph(tmp_path):
-    image = tmp_path / "initial.png"
+    image = tmp_path / "selected.png"
     _write_minimal_png(image)
     (tmp_path / "semantic_components.json").write_text(
         """
@@ -59,7 +59,7 @@ def test_semantic_svg_builds_role_based_scene_graph(tmp_path):
     assert car_bar.attrib["data-anchor"] == "left"
 
 def test_semantic_components_accept_direct_model_output(tmp_path, monkeypatch):
-    image = tmp_path / "initial.png"
+    image = tmp_path / "selected.png"
     _write_minimal_png(image)
 
     class FakeDirectClient:
