@@ -389,3 +389,59 @@ def render_dynamic_states(
         report = render_data_driven(clip_id, metadata, sub)
         reports.append({"state_key": key, "state_dir": str(sub), **report})
     return reports
+
+
+def metadata_from_dynamic(dynamic: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a chart metadata dict from dynamic states (frame-corrected values).
+
+    Used after CV alignment/reconciliation so the primary semantic.svg is
+    rendered from the frame-truth numbers instead of the VLM-recovered ones.
+    Prefers the state group with the most entities (usually the keyframe state
+    that CV alignment verified).
+    """
+    states = dynamic.get("states") if isinstance(dynamic, dict) else []
+    if not isinstance(states, list):
+        return None
+    groups: dict[str, list[dict[str, Any]]] = {}
+    unit = "%"
+    metric = "Value"
+    for row in states:
+        if not isinstance(row, dict):
+            continue
+        eid = str(row.get("entity_id") or "")
+        if eid in ("", "unknown"):
+            continue
+        value = _to_float(row.get("value"))
+        if value is None:
+            continue
+        if row.get("unit") not in (None, ""):
+            unit = str(row["unit"])
+        if row.get("metric"):
+            metric = str(row["metric"])
+        key = str(row.get("state_key") or row.get("state_label") or row.get("state_id") or "state")
+        groups.setdefault(key, []).append(
+            {"name": str(row.get("entity") or eid), "values": [value]}
+        )
+    if not groups:
+        return None
+    key = max(groups, key=lambda k: len(groups[k]))
+    series = groups[key]
+    series.sort(key=lambda e: -float(e["values"][0]))
+    title = metric if key == "state" else f"{metric} ({key})"
+    return {
+        "title": title,
+        "chart_type": "bar",
+        "unit": unit,
+        "x_axis": "",
+        "y_axis": metric,
+        "series": series,
+        "entities": [
+            {"label": e["name"], "value": e["values"][0], "unit": unit}
+            for e in series
+        ],
+        "visible_text": [],
+        "needs_manual_data": False,
+        "model_status": "cv_aligned",
+        "failure_reason": None,
+        "skip_reason": None,
+    }

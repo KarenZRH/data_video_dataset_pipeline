@@ -674,6 +674,7 @@ def recover_clip_data(
         validation = read_json(validation_path)
         return {
             "data": raw.get("response", {}).get("data"),
+            "dynamic_data": raw.get("dynamic_data", {}),
             "metadata": raw.get("metadata", {}),
             "validation": validation,
             "csv_path": str(csv_path) if csv_path.exists() else None,

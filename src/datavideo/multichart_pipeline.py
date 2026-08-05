@@ -6,9 +6,14 @@ from typing import Any
 from datavideo.context import create_context_media
 from .animation import detect_animation
 from datavideo.cv_align import run_cv_align
+from datavideo.cv_reconcile import reconcile_dynamic_data
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
-from datavideo.semantic_render import render_data_driven, render_dynamic_states
+from datavideo.semantic_render import (
+    metadata_from_dynamic,
+    render_data_driven,
+    render_dynamic_states,
+)
 from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
 
 from .multichart_assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
@@ -183,7 +188,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             dynamic = chart_data.get("dynamic_data") or {}
             entities: list[dict[str, Any]] = []
             seen: set[str] = set()
-            for state_row in dynamic.get("states") if isinstance(dynamic, dict) else []:
+            for state_row in (dynamic.get("states") or []) if isinstance(dynamic, dict) else []:
                 if not isinstance(state_row, dict):
                     continue
                 eid = str(state_row.get("entity_id") or "")
@@ -199,7 +204,44 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 entities,
                 clip_root,
                 client=client,
+                cfg=cfg,
             )
+            cv_report = semantic["cv_align"] or {}
+            implausible = cv_report.get("implausible_bars") or []
+            reconciled = None
+            if not implausible:
+                reconciled = reconcile_dynamic_data(
+                    dynamic,
+                    cv_report,
+                    clip_id=_clip_id(row),
+                    keyframe_timestamp=keyframes.get("timestamps", {}).get("initial"),
+                    image_path=Path(keyframes["assets"]["initial"]),
+                    out_dir=clip_root,
+                )
+            else:
+                semantic["reconciled"] = {
+                    "updated_bar_count": 0,
+                    "skipped_bar_count": len(implausible),
+                    "skipped_bars": implausible,
+                    "reason": "frame values failed plausibility; kept recovered data table",
+                }
+            if reconciled:
+                dynamic = reconciled["dynamic"]
+                chart_data = {**chart_data, "dynamic_data": dynamic}
+                corrected_metadata = metadata_from_dynamic(dynamic)
+                if corrected_metadata:
+                    write_json(clip_root / "chart_metadata.json", corrected_metadata)
+                    chart_data = {**chart_data, "metadata": corrected_metadata}
+                    semantic = render_data_driven(_clip_id(row), corrected_metadata, clip_root)
+                semantic["state_renders"] = render_dynamic_states(
+                    _clip_id(row), dynamic, clip_root
+                )
+                semantic["cv_align"] = cv_report
+                semantic["reconciled"] = {
+                    "updated_bar_count": reconciled["updated_bar_count"],
+                    "state_key": reconciled["state_key"],
+                    "state_id": reconciled["state_id"],
+                }
             semantic_state_svgs = build_semantic_state_svgs(
                 chart_data.get("semantic_state_inputs"),
                 clip_root,

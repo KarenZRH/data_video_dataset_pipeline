@@ -273,6 +273,7 @@ class QwenVLClient:
                 torch_dtype=_dtype(),
                 device_map="auto",
                 local_files_only=True,
+                low_cpu_mem_usage=True,
             )
             if self._enable_4bit():
                 from transformers import BitsAndBytesConfig
@@ -287,9 +288,17 @@ class QwenVLClient:
                         "torch_dtype": torch.float16,
                     }
                 )
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.model_path, **model_kwargs
-            )
+            # Loading shards and 4-bit quantization on CPU can race with the
+            # full core count on Windows and crash in torch_cpu.dll; limit the
+            # thread pool during load and restore it for inference.
+            previous_threads = torch.get_num_threads()
+            torch.set_num_threads(min(8, previous_threads))
+            try:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    self.model_path, **model_kwargs
+                )
+            finally:
+                torch.set_num_threads(previous_threads)
             self.model_version = Path(self.model_path).name
             QwenVLClient._shared = {
                 "model": self.model,
