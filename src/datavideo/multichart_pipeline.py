@@ -5,9 +5,10 @@ from typing import Any
 
 from datavideo.context import create_context_media
 from .animation import detect_animation
+from datavideo.cv_align import run_cv_align
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
-from datavideo.semantic import build_semantic_svg
+from datavideo.semantic_render import render_data_driven, render_dynamic_states
 from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
 
 from .multichart_assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
@@ -173,7 +174,32 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 client=client,
                 force=asset_force,
             )
-            semantic = build_semantic_svg(initial, clip_root, cfg, force=asset_force)
+            semantic = render_data_driven(_clip_id(row), chart_data.get("metadata") or {}, clip_root)
+            semantic["state_renders"] = render_dynamic_states(
+                _clip_id(row),
+                chart_data.get("dynamic_data") or {},
+                clip_root,
+            )
+            dynamic = chart_data.get("dynamic_data") or {}
+            entities: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for state_row in dynamic.get("states") if isinstance(dynamic, dict) else []:
+                if not isinstance(state_row, dict):
+                    continue
+                eid = str(state_row.get("entity_id") or "")
+                if eid in ("", "unknown") or eid in seen:
+                    continue
+                seen.add(eid)
+                entities.append(
+                    {"id": eid, "label": str(state_row.get("entity") or eid)}
+                )
+            semantic["cv_align"] = run_cv_align(
+                _clip_id(row),
+                Path(keyframes["assets"]["initial"]),
+                entities,
+                clip_root,
+                client=client,
+            )
             semantic_state_svgs = build_semantic_state_svgs(
                 chart_data.get("semantic_state_inputs"),
                 clip_root,
