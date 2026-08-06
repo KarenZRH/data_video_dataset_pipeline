@@ -117,6 +117,15 @@ def detect_animation(
     animation_cfg = cfg.get("animation", {})
     sample_fps = max(0.1, float(animation_cfg.get("sample_fps", 2.0)))
     sampled_frames = _sample_complete_sequence(frames, sample_fps)
+    max_frames = max(2, int(animation_cfg.get("max_frames", 6) or 6))
+    if len(sampled_frames) > max_frames:
+        picks = sorted(
+            {
+                round(index * (len(sampled_frames) - 1) / (max_frames - 1))
+                for index in range(max_frames)
+            }
+        )
+        sampled_frames = [sampled_frames[i] for i in picks]
     image_paths = [frame["path"] for frame in sampled_frames]
     assert_qwen_visual_inputs(image_paths)
 

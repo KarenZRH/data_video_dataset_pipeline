@@ -574,8 +574,8 @@ def select_keyframe(
     clip_id = _clip_id(row)
     if manifest_path.exists() and not force:
         cached = read_json(manifest_path)
-        initial = Path(cached.get("assets", {}).get("initial", ""))
-        if cached.get("clip_id") == clip_id and initial.exists():
+        selected_asset = Path(cached.get("assets", {}).get("selected", ""))
+        if cached.get("clip_id") == clip_id and selected_asset.exists():
             return cached
 
     duration = _duration_seconds(normalized_video)
@@ -707,6 +707,7 @@ def recover_clip_data(
         validation = read_json(validation_path)
         return {
             "data": raw.get("response", {}).get("data"),
+            "dynamic_data": raw.get("dynamic_data", {}),
             "metadata": raw.get("metadata", {}),
             "validation": validation,
             "csv_path": str(csv_path) if csv_path.exists() else None,
@@ -775,10 +776,16 @@ def recover_clip_data(
         for idx, context in enumerate(frame_context, start=1):
             context["image_index"] = idx
     if not image_paths:
-        initial = Path(keyframes.get("assets", {}).get("initial", ""))
-        if initial.exists():
-            image_paths = [str(initial)]
-            frame_context = [{"image_index": 1, "source_frame": keyframes.get("source_frame_id"), "time_seconds": keyframes.get("timestamps", {}).get("initial")}]
+        selected = Path(keyframes.get("assets", {}).get("selected", ""))
+        if selected.exists():
+            image_paths = [str(selected)]
+            frame_context = [
+                {
+                    "image_index": 1,
+                    "source_frame": keyframes.get("source_frame_id"),
+                    "time_seconds": keyframes.get("timestamps", {}).get("selected"),
+                }
+            ]
     if not image_paths:
         raise RuntimeError(f"No frames available for clip-level data recovery for {_clip_id(row)}")
     assert_qwen_visual_inputs(image_paths)

@@ -413,6 +413,7 @@ class QwenVLClient:
                 )
             else:
                 load_kwargs["torch_dtype"] = torch_dtype
+            load_kwargs["low_cpu_mem_usage"] = True
 
             self.processor = AutoProcessor.from_pretrained(
                 self.model_path,
@@ -420,10 +421,15 @@ class QwenVLClient:
                 min_pixels=_as_int(self.model_cfg.get("min_pixels"), 224 * 224),
                 max_pixels=_as_int(self.model_cfg.get("max_pixels"), 768 * 768),
             )
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.model_path,
-                **load_kwargs,
-            )
+            previous_threads = torch.get_num_threads()
+            torch.set_num_threads(min(8, previous_threads))
+            try:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    self.model_path,
+                    **load_kwargs,
+                )
+            finally:
+                torch.set_num_threads(previous_threads)
             variant = self.model_cfg.get("selected_variant")
             self.model_version = f"{variant}:{Path(self.model_path).name}" if variant else Path(self.model_path).name
             QwenVLClient._shared = {

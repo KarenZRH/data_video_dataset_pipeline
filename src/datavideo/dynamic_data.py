@@ -110,9 +110,11 @@ def infer_unit(*values: Any) -> str | None:
 
 
 def entity_id_from_row(row: dict[str, Any]) -> str:
-    for key in ("entity_id", "label", "series", "x"):
+    for key in ("entity_id", "label", "series", "x", "state"):
         value = row.get(key)
         if value not in (None, ""):
+            if key == "state" and re.fullmatch(r"\d{4}", str(value).strip()):
+                continue
             text = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
             return text or "unknown"
     return "unknown"
@@ -199,6 +201,9 @@ def visual_records_from_clip_data(
         value_num = numeric_value(value)
         if value_num is None:
             continue
+        entity_id = entity_id_from_row(row)
+        if entity_id == "unknown":
+            continue
         evidence_text = row.get("evidence_text") or row.get("raw_text") or value
         frame = _frame_for_row(row, frame_context, image_paths)
         time_value = frame.get("time_seconds") if frame else row.get("time_seconds")
@@ -208,8 +213,10 @@ def visual_records_from_clip_data(
                 "state_id": None,
                 "state_key": state_key_from_row(row),
                 "state_label": _state_label_from_row(row),
-                "entity_id": entity_id_from_row(row),
-                "entity": _display_entity(str(row.get("label") or row.get("series") or row.get("x") or entity_id_from_row(row))),
+                "entity_id": entity_id,
+                "entity": _display_entity(
+                    str(row.get("label") or row.get("series") or row.get("x") or row.get("state") or entity_id)
+                ),
                 "metric": metric_from_row(row, data.get("y_axis") or data.get("title")),
                 "value": value_num,
                 "unit": row.get("unit") or infer_unit(value, evidence_text, data.get("unit")),

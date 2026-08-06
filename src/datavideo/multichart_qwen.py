@@ -74,6 +74,7 @@ Rules:
 - If a printed value appears in multiple frames, deduplicate it.
 - If the clip shows changing years/states, keep the year/state in every row when visible. For bar charts with a changing time state, extract every distinct printed year/state that is visible enough to read, including at least the first and last states.
 - For each distinct printed year/state, return a complete set of rows for all visible entities in that state. Do not split one year/state into several states just because bars appear one after another.
+- Include every visible entity/category in each state. Do not drop categories whose labels are visible, even when their bar is very short or its printed value is small (e.g. 1%).
 - If the same chart changes from one printed year/state to another, preserve rows for both years/states even when labels are identical.
 - If labels are visible but values require visual estimation or counting, set needs_manual_data=true and create manual_stub_rows.
 - Preserve units exactly as shown when visible.

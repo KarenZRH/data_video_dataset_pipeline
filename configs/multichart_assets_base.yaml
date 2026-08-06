@@ -53,7 +53,7 @@ sampling:
 
 keyframes:
   names:
-    - initial
+    - selected
   sample_fps: 4
   max_state_keyframes: 3
   state_enabled_chart_types:

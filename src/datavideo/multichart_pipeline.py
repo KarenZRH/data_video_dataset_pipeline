@@ -5,9 +5,16 @@ from typing import Any
 
 from datavideo.context import create_context_media
 from .animation import detect_animation
+from datavideo.cv_align import run_cv_align
+from datavideo.cv_reconcile import reconcile_dynamic_data
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
 from datavideo.semantic import build_semantic_svg
+from datavideo.semantic_render import (
+    metadata_from_dynamic,
+    render_data_driven,
+    render_dynamic_states,
+)
 from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
 
 from .multichart_assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
@@ -45,6 +52,30 @@ def _semantic_input_path(keyframes: dict[str, Any], state_inputs: Any) -> str:
     if assets.get("selected"):
         return str(assets["selected"])
     raise RuntimeError("No semantic input frame available")
+
+
+def _selected_keyframe_path(keyframes: dict[str, Any]) -> Path | None:
+    assets = keyframes.get("assets") if isinstance(keyframes.get("assets"), dict) else {}
+    selected = assets.get("selected")
+    if selected:
+        path = Path(selected)
+        if path.exists():
+            return path
+    states = keyframes.get("states") if isinstance(keyframes.get("states"), list) else []
+    for state in states:
+        if isinstance(state, dict) and state.get("asset"):
+            path = Path(state["asset"])
+            if path.exists():
+                return path
+    return None
+
+
+def _cv_align_enabled(row: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    align_cfg = cfg.get("cv_align") if isinstance(cfg.get("cv_align"), dict) else {}
+    if align_cfg.get("enabled") is False:
+        return False
+    chart_type = str(row.get("chart_type") or "").lower()
+    return "bar" in chart_type
 
 
 def _write_candidate_report(
@@ -191,7 +222,77 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             )
             state_inputs = chart_data.get("semantic_state_inputs") if isinstance(chart_data, dict) else None
             semantic_input = _semantic_input_path(keyframes, state_inputs)
-            semantic = build_semantic_svg(semantic_input, clip_root, cfg, force=asset_force)
+            qwen_semantic = build_semantic_svg(
+                semantic_input,
+                ensure_dir(clip_root / "qwen_semantic"),
+                cfg,
+                force=asset_force,
+            )
+            semantic = render_data_driven(_clip_id(row), chart_data.get("metadata") or {}, clip_root)
+            semantic["qwen_semantic_svg"] = qwen_semantic.get("semantic_svg")
+            dynamic = chart_data.get("dynamic_data") or {}
+            semantic["state_renders"] = render_dynamic_states(
+                _clip_id(row),
+                dynamic,
+                clip_root,
+            )
+            if _cv_align_enabled(row, cfg):
+                selected_keyframe = _selected_keyframe_path(keyframes)
+                entities: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for state_row in (dynamic.get("states") or []) if isinstance(dynamic, dict) else []:
+                    if not isinstance(state_row, dict):
+                        continue
+                    eid = str(state_row.get("entity_id") or "")
+                    if eid in ("", "unknown") or eid in seen:
+                        continue
+                    seen.add(eid)
+                    entities.append({"id": eid, "label": str(state_row.get("entity") or eid)})
+                if selected_keyframe is not None and entities:
+                    cv_report = run_cv_align(
+                        _clip_id(row),
+                        selected_keyframe,
+                        entities,
+                        clip_root,
+                        client=client,
+                        cfg=cfg,
+                    )
+                    semantic["cv_align"] = cv_report
+                    implausible = cv_report.get("implausible_bars") or []
+                    reconciled = None
+                    if not implausible:
+                        reconciled = reconcile_dynamic_data(
+                            dynamic,
+                            cv_report,
+                            clip_id=_clip_id(row),
+                            keyframe_timestamp=keyframes.get("timestamps", {}).get("selected"),
+                            image_path=selected_keyframe,
+                            out_dir=clip_root,
+                        )
+                    else:
+                        semantic["reconciled"] = {
+                            "updated_bar_count": 0,
+                            "skipped_bar_count": len(implausible),
+                            "skipped_bars": implausible,
+                            "reason": "frame values failed plausibility; kept recovered data table",
+                        }
+                    if reconciled:
+                        dynamic = reconciled["dynamic"]
+                        chart_data = {**chart_data, "dynamic_data": dynamic}
+                        corrected_metadata = metadata_from_dynamic(dynamic)
+                        if corrected_metadata:
+                            write_json(clip_root / "chart_metadata.json", corrected_metadata)
+                            chart_data = {**chart_data, "metadata": corrected_metadata}
+                            semantic = render_data_driven(_clip_id(row), corrected_metadata, clip_root)
+                            semantic["qwen_semantic_svg"] = qwen_semantic.get("semantic_svg")
+                        semantic["state_renders"] = render_dynamic_states(_clip_id(row), dynamic, clip_root)
+                        semantic["cv_align"] = cv_report
+                        semantic["reconciled"] = {
+                            "updated_bar_count": reconciled["updated_bar_count"],
+                            "skipped_bar_count": reconciled["skipped_bar_count"],
+                            "state_key": reconciled["state_key"],
+                            "state_id": reconciled["state_id"],
+                        }
             semantic_state_svgs = build_semantic_state_svgs(
                 chart_data.get("semantic_state_inputs"),
                 clip_root,
