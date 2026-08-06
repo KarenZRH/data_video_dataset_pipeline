@@ -225,14 +225,52 @@ def visual_records_from_clip_data(
                 "source_type": "visual",
                 "evidence_frames": [frame] if frame else [],
                 "evidence_sentence_id": None,
-                "confidence": float(row.get("confidence", 0.8) or 0.8),
+                "confidence": _as_float(row.get("confidence")) or 0.8,
                 "review_status": "machine",
                 "raw_text": row.get("raw_text"),
                 "evidence_text": evidence_text,
                 "value_type": "exact",
             }
         )
-    return records
+    return filter_axis_tick_records(records)
+
+
+def axis_tick_keys(rows: list[dict[str, Any]]) -> set[tuple[Any, str]]:
+    """Return (timestamp, entity_id) keys whose rows are axis tick labels.
+
+    When several entities at the same timestamp each report the *same*
+    multi-value set (e.g. every bar gets 0/50/100), those values are almost
+    certainly axis ticks recovered as data, not per-entity values.
+    """
+    by_ts: dict[Any, dict[str, set[float]]] = {}
+    for row in rows:
+        ts = row.get("state_start", row.get("time_seconds"))
+        eid = str(row.get("entity_id") or "")
+        value = numeric_value(row.get("value"))
+        if not eid or value is None:
+            continue
+        by_ts.setdefault(ts, {}).setdefault(eid, set()).add(value)
+    keys: set[tuple[Any, str]] = set()
+    for ts, entities in by_ts.items():
+        if len(entities) < 2:
+            continue
+        sets = list(entities.values())
+        for eid, values in entities.items():
+            if len(values) >= 2 and any(other is not values and values == other for other in sets):
+                keys.add((ts, eid))
+    return keys
+
+
+def filter_axis_tick_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop records that are axis tick labels (see ``axis_tick_keys``)."""
+    keys = axis_tick_keys(records)
+    if not keys:
+        return records
+    return [
+        r
+        for r in records
+        if (r.get("state_start"), str(r.get("entity_id") or "")) not in keys
+    ]
 
 
 def _sentence_id(row: dict[str, Any], fallback: int) -> str:
@@ -446,7 +484,7 @@ def narration_records_from_sentences(
                         source_type="narration",
                         evidence_frames=evidence_frames,
                         evidence_sentence_id=_sentence_id(sentence, idx),
-                        confidence=float(sentence.get("confidence", 0.65) or 0.65),
+                        confidence=_as_float(sentence.get("confidence")) or 0.65,
                         raw_text=value_text,
                         evidence_text=text,
                         value_type="exact",
@@ -465,7 +503,7 @@ def narration_records_from_sentences(
                         source_type="narration",
                         evidence_frames=evidence_frames,
                         evidence_sentence_id=_sentence_id(sentence, idx),
-                        confidence=float(sentence.get("confidence", 0.65) or 0.65),
+                        confidence=_as_float(sentence.get("confidence")) or 0.65,
                         raw_text="a lot of time",
                         evidence_text=text,
                         value_type='qualitative: "a lot of time"',
@@ -500,7 +538,10 @@ def fuse_visual_and_narration_records(visual: list[dict[str, Any]], narration: l
             if _value_key(record) == _value_key(narration_record):
                 record["source_type"] = "both" if record.get("source_type") == "visual" else record.get("source_type")
                 record["evidence_sentence_id"] = narration_record.get("evidence_sentence_id")
-                record["confidence"] = max(float(record.get("confidence") or 0.0), float(narration_record.get("confidence") or 0.0))
+                record["confidence"] = max(
+                    _as_float(record.get("confidence")) or 0.0,
+                    _as_float(narration_record.get("confidence")) or 0.0,
+                )
                 record["review_status"] = "machine"
             else:
                 conflict = True
@@ -550,7 +591,10 @@ def merge_consecutive_states(records: list[dict[str, Any]]) -> list[dict[str, An
                 prev["evidence_frames"] = [*prev.get("evidence_frames", []), *current.get("evidence_frames", [])]
                 if not prev.get("evidence_sentence_id"):
                     prev["evidence_sentence_id"] = current.get("evidence_sentence_id")
-                prev["confidence"] = max(float(prev.get("confidence") or 0.0), float(current.get("confidence") or 0.0))
+                prev["confidence"] = max(
+                    _as_float(prev.get("confidence")) or 0.0,
+                    _as_float(current.get("confidence")) or 0.0,
+                )
                 if prev.get("source_type") != current.get("source_type"):
                     prev["source_type"] = "both" if {prev.get("source_type"), current.get("source_type")} <= {"visual", "narration", "both"} else prev.get("source_type")
                 continue

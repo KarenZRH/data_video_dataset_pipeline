@@ -25,6 +25,29 @@ def _clip_id(row: dict[str, Any]) -> str:
     return str(row.get("output_stem") or f"{row['chart_type']}_{row['chart_index']}")
 
 
+def _keyframe_asset(keyframes: dict[str, Any]) -> Path:
+    """Resolve the primary keyframe asset (upstream uses ``selected``, older
+    manifests used ``initial``)."""
+    assets = keyframes.get("assets") if isinstance(keyframes.get("assets"), dict) else {}
+    for name in ("selected", "initial"):
+        value = assets.get(name)
+        if value:
+            return Path(str(value))
+    return Path("")
+
+
+def _keyframe_timestamp(keyframes: dict[str, Any]) -> float | None:
+    timestamps = keyframes.get("timestamps") if isinstance(keyframes.get("timestamps"), dict) else {}
+    for name in ("selected", "initial"):
+        value = timestamps.get(name)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _duration_seconds(video: str | Path) -> float:
     return float(ffprobe(video)["format"]["duration"])
 
@@ -574,8 +597,8 @@ def select_keyframe(
     clip_id = _clip_id(row)
     if manifest_path.exists() and not force:
         cached = read_json(manifest_path)
-        initial = Path(cached.get("assets", {}).get("initial", ""))
-        if cached.get("clip_id") == clip_id and initial.exists():
+        selected = _keyframe_asset(cached)
+        if cached.get("clip_id") == clip_id and selected.exists():
             return cached
 
     duration = _duration_seconds(normalized_video)
@@ -776,10 +799,16 @@ def recover_clip_data(
         for idx, context in enumerate(frame_context, start=1):
             context["image_index"] = idx
     if not image_paths:
-        initial = Path(keyframes.get("assets", {}).get("initial", ""))
+        initial = _keyframe_asset(keyframes)
         if initial.exists():
             image_paths = [str(initial)]
-            frame_context = [{"image_index": 1, "source_frame": keyframes.get("source_frame_id"), "time_seconds": keyframes.get("timestamps", {}).get("initial")}]
+            frame_context = [
+                {
+                    "image_index": 1,
+                    "source_frame": keyframes.get("source_frame_id"),
+                    "time_seconds": _keyframe_timestamp(keyframes),
+                }
+            ]
     if not image_paths:
         raise RuntimeError(f"No frames available for clip-level data recovery for {_clip_id(row)}")
     assert_qwen_visual_inputs(image_paths)

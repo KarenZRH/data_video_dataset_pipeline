@@ -1,0 +1,77 @@
+from datavideo.semantic_render import (
+    _timestamp_evidenced,
+    metadata_from_dynamic,
+    render_data_driven,
+    resolve_render_title,
+)
+
+
+def _metadata() -> dict:
+    return {
+        "title": "Illiteracy Rate (2017)",
+        "unit": "%",
+        "series": [
+            {"name": "Sub-Saharan Africa", "values": [36.1]},
+            {"name": "European Union", "values": [1]},
+        ],
+    }
+
+
+def test_components_svg_has_value_and_category_boxes(tmp_path):
+    report = render_data_driven("clip_x", _metadata(), tmp_path)
+    svg = (tmp_path / "semantic_components.svg").read_text(encoding="utf-8")
+    assert 'data-role="title-box"' in svg
+    assert 'data-role="value-box"' in svg
+    assert 'data-role="category-box"' in svg
+    assert "36.1%" in svg
+    assert "Sub-Saharan Africa" in svg
+    assert 'stroke="#d62728"' in svg  # red-bordered bars
+    assert (tmp_path / "semantic_components_preview.png").exists()
+    assert report["semantic_components_svg"] == str(tmp_path / "semantic_components.svg")
+    assert report["components_preview_success"] is True
+
+
+def test_timestamp_evidenced_requires_visible_year():
+    assert _timestamp_evidenced("2017", ["Illiteracy Rate 2017", "Sub-Saharan Africa"]) is True
+    assert _timestamp_evidenced("1990", ["Illiteracy Rate 1990"]) is True
+    assert _timestamp_evidenced("2019", ["compliance with traffic laws", "88%", "cyclists", "drivers"]) is False
+    assert _timestamp_evidenced("cyclists", ["cyclists", "drivers"]) is False
+
+
+def test_resolve_render_title_keeps_original_unless_year_conflicts():
+    assert resolve_render_title("compliance with traffic laws", "Value") == "compliance with traffic laws"
+    assert resolve_render_title("Illiteracy Rate 1990", "Illiteracy Rate (2017)") == "Illiteracy Rate (2017)"
+    assert resolve_render_title("Illiteracy Rate 2017", "Illiteracy Rate (2017)") == "Illiteracy Rate 2017"
+    assert resolve_render_title("", "Value") == "Value"
+
+
+def test_metadata_from_dynamic_prefers_cv_aligned_state():
+    dynamic = {
+        "states": [
+            {"entity_id": "ssa", "entity": "Sub-Saharan Africa", "metric": "Illiteracy Rate", "value": 48.0, "unit": "%", "state_key": "1990", "state_start": 0.0, "source_type": "visual", "confidence": 0.8},
+            {"entity_id": "lac", "entity": "Latin America & Caribbean", "metric": "Illiteracy Rate", "value": 15.5, "unit": "%", "state_key": "1990", "state_start": 0.0, "source_type": "visual", "confidence": 0.8},
+            {"entity_id": "ssa", "entity": "Sub-Saharan Africa", "metric": "Illiteracy Rate", "value": 36.1, "unit": "%", "state_key": "2017", "state_start": 3.75, "source_type": "visual_frame_align", "confidence": 0.85},
+            {"entity_id": "lac", "entity": "Latin America & Caribbean", "metric": "Illiteracy Rate", "value": 6.9, "unit": "%", "state_key": "2017", "state_start": 3.75, "source_type": "visual_frame_align", "confidence": 0.85},
+        ]
+    }
+    meta = metadata_from_dynamic(dynamic, visible_text=["Illiteracy Rate 2017", "Sub-Saharan Africa"])
+    assert meta is not None
+    assert meta["title"] == "Illiteracy Rate (2017)"
+    assert [e["label"] for e in meta["entities"]] == ["Sub-Saharan Africa", "Latin America & Caribbean"]
+    assert [e["value"] for e in meta["entities"]] == [36.1, 6.9]
+
+
+def test_metadata_from_dynamic_drops_hallucinated_entity_and_unseen_year():
+    dynamic = {
+        "states": [
+            {"entity_id": "cycling", "entity": "cycling", "metric": "drivers", "value": 88.0, "unit": "%", "state_key": "2019", "state_start": 3.75, "source_type": "visual", "confidence": 0.8},
+            {"entity_id": "cycling", "entity": "cycling", "metric": "drivers", "value": 85.0, "unit": "%", "state_key": "2019", "state_start": 3.75, "source_type": "visual", "confidence": 0.8},
+            {"entity_id": "cyclists", "entity": "cyclists", "metric": "drivers", "value": 88.0, "unit": "%", "state_key": "2019", "state_start": 3.75, "source_type": "visual_frame_align", "confidence": 0.85},
+            {"entity_id": "drivers", "entity": "drivers", "metric": "drivers", "value": 85.0, "unit": "%", "state_key": "2019", "state_start": 3.75, "source_type": "visual_frame_align", "confidence": 0.85},
+        ]
+    }
+    meta = metadata_from_dynamic(dynamic, visible_text=["compliance with traffic laws", "88%", "cyclists", "drivers"])
+    assert meta is not None
+    assert "(2019)" not in meta["title"]
+    assert [e["label"] for e in meta["entities"]] == ["cyclists", "drivers"]
+    assert [e["value"] for e in meta["entities"]] == [88.0, 85.0]

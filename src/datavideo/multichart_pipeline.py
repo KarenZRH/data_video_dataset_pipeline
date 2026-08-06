@@ -14,10 +14,17 @@ from datavideo.semantic_render import (
     metadata_from_dynamic,
     render_data_driven,
     render_dynamic_states,
+    resolve_render_title,
 )
 from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
 
-from .multichart_assets import build_semantic_state_svgs, recover_clip_data, select_keyframe
+from .multichart_assets import (
+    _keyframe_asset,
+    _keyframe_timestamp,
+    build_semantic_state_svgs,
+    recover_clip_data,
+    select_keyframe,
+)
 from .multichart_qwen import MultichartQwenClient
 
 
@@ -200,11 +207,11 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             try:
                 semantic_input = _semantic_input_path(keyframes, state_inputs)
             except Exception:
-                semantic_input = keyframes.get("assets", {}).get("initial")
+                semantic_input = _keyframe_asset(keyframes)
             qwen_semantic = None
-            if semantic_input:
+            if semantic_input and Path(semantic_input).exists():
                 qwen_semantic = build_semantic_svg(
-                    semantic_input,
+                    Path(semantic_input),
                     ensure_dir(clip_root / "qwen_semantic"),
                     cfg,
                     force=asset_force,
@@ -231,7 +238,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 )
             semantic["cv_align"] = run_cv_align(
                 _clip_id(row),
-                Path(keyframes["assets"]["initial"]),
+                _keyframe_asset(keyframes),
                 entities,
                 clip_root,
                 client=client,
@@ -245,8 +252,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                     dynamic,
                     cv_report,
                     clip_id=_clip_id(row),
-                    keyframe_timestamp=keyframes.get("timestamps", {}).get("initial"),
-                    image_path=Path(keyframes["assets"]["initial"]),
+                    keyframe_timestamp=_keyframe_timestamp(keyframes),
+                    image_path=_keyframe_asset(keyframes),
                     out_dir=clip_root,
                 )
             else:
@@ -259,13 +266,25 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             if reconciled:
                 dynamic = reconciled["dynamic"]
                 chart_data = {**chart_data, "dynamic_data": dynamic}
-                corrected_metadata = metadata_from_dynamic(dynamic)
+                corrected_metadata = metadata_from_dynamic(
+                    dynamic,
+                    visible_text=(chart_data.get("metadata") or {}).get("visible_text"),
+                )
                 if corrected_metadata:
+                    original_title = (chart_data.get("metadata") or {}).get("title")
+                    if original_title:
+                        corrected_metadata["title"] = resolve_render_title(
+                            original_title,
+                            corrected_metadata.get("title"),
+                        )
                     write_json(clip_root / "chart_metadata.json", corrected_metadata)
                     chart_data = {**chart_data, "metadata": corrected_metadata}
                     semantic = render_data_driven(_clip_id(row), corrected_metadata, clip_root)
                 semantic["state_renders"] = render_dynamic_states(
-                    _clip_id(row), dynamic, clip_root
+                    _clip_id(row),
+                    dynamic,
+                    clip_root,
+                    visible_text=(chart_data.get("metadata") or {}).get("visible_text"),
                 )
                 semantic["cv_align"] = cv_report
                 semantic["reconciled"] = {

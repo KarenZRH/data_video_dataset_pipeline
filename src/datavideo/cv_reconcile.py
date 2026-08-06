@@ -11,10 +11,12 @@ final_data_table.csv, data_change_events.csv, data_events.jsonl).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from .dynamic_data import (
+    axis_tick_keys,
     build_data_change_events,
     build_final_data_table,
     write_dynamic_outputs,
@@ -26,6 +28,94 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_label(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def _state_group_key(row: dict[str, Any]) -> str:
+    return str(row.get("state_key") or row.get("state_label") or row.get("state_id") or "state")
+
+
+def _row_rank(row: dict[str, Any], aligned_ids: set[str]) -> tuple[int, float]:
+    """Higher is better: CV-aligned rows first, then CV-confirmed entities,
+    then recovery confidence."""
+    score = 0
+    if str(row.get("source_type")) == "visual_frame_align":
+        score += 2
+    if str(row.get("entity_id") or "") in aligned_ids:
+        score += 1
+    return (score, float(row.get("confidence") or 0.0))
+
+
+def clean_states(
+    states: list[dict[str, Any]],
+    aligned_bars: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove garbage rows from recovered dynamic states after CV alignment.
+
+    The VLM recovery occasionally emits axis tick labels (0/50/100) as data
+    values or hallucinated entities (e.g. "cycling" when the frame only has
+    cyclists/drivers). CV-aligned bars are the ground truth for the keyframe
+    state, so after alignment we deterministically drop:
+      * values that every entity in a state shares (axis ticks);
+      * duplicate labels inside one state (one entity, one value per state);
+      * rows whose metric is another entity's label while the entity was not
+        confirmed by CV alignment (metric/entity confusion).
+    """
+    if not states:
+        return states
+    aligned_ids = {
+        str(b.get("entity_id") or "")
+        for b in (aligned_bars or [])
+        if b.get("entity_id")
+    }
+    # Axis ticks first, across the whole table: entities that share an
+    # identical multi-value set at the same timestamp (e.g. every bar got
+    # 0/50/100) are axis labels, even when the rows sit in different states.
+    tick_keys = axis_tick_keys(states)
+    if tick_keys:
+        states = [
+            r
+            for r in states
+            if (r.get("state_start"), str(r.get("entity_id") or "")) not in tick_keys
+        ]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in states:
+        groups.setdefault(_state_group_key(row), []).append(row)
+
+    cleaned: list[dict[str, Any]] = []
+    for rows in groups.values():
+        entity_labels = {
+            _normalize_label(r.get("entity") or r.get("entity_id"))
+            for r in rows
+            if r.get("entity") or r.get("entity_id")
+        }
+
+        # One value per entity label inside a state; prefer the CV-aligned row.
+        best_by_label: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            eid = str(r.get("entity_id") or "")
+            label = _normalize_label(r.get("entity") or eid)
+            if not label or label == "unknown":
+                continue
+            cur = best_by_label.get(label)
+            if cur is None or _row_rank(r, aligned_ids) > _row_rank(cur, aligned_ids):
+                best_by_label[label] = r
+        rows = list(best_by_label.values())
+
+        # Metric/entity confusion: a row whose metric is another entity's
+        # label while the entity itself was not confirmed by CV is a
+        # hallucination (e.g. entity "cycling" with metric "drivers").
+        rows = [
+            r
+            for r in rows
+            if _normalize_label(r.get("metric")) not in entity_labels
+            or str(r.get("entity_id") or "") in aligned_ids
+        ]
+        cleaned.extend(rows)
+    return cleaned
 
 
 def _state_covers(row: dict[str, Any], ts: float) -> bool:
@@ -131,6 +221,7 @@ def reconcile_dynamic_data(
     if not changed:
         return None
 
+    states = clean_states(states, bars)
     final_table = build_final_data_table(states)
     change_events = build_data_change_events(states)
     numeric_fact_count = sum(1 for row in states if row.get("value") is not None)

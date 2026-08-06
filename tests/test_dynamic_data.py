@@ -2,6 +2,7 @@ from pathlib import Path
 
 from datavideo.dynamic_data import (
     NO_RECOVERABLE_QUANTITATIVE_DATA,
+    visual_records_from_clip_data,
     build_dynamic_records,
     build_data_change_events,
     merge_consecutive_states,
@@ -46,6 +47,33 @@ def test_visual_only_values_are_included():
     assert result["states"][0]["source_type"] == "visual"
     assert result["states"][0]["entity_id"] == "car"
     assert result["states"][0]["value"] == 20.0
+
+
+def test_visual_records_drop_axis_ticks_shared_by_all_entities():
+    """0/50/100 recovered for every entity at the same timestamp are axis
+    ticks, not data, and must not become dynamic records."""
+    data = _visual_data(
+        [
+            {"label": "cyclists", "value": "0", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+            {"label": "cyclists", "value": "50", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+            {"label": "cyclists", "value": "100", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+            {"label": "drivers", "value": "0", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+            {"label": "drivers", "value": "50", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+            {"label": "drivers", "value": "100", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+            {"label": "cyclists", "value": "88%", "unit": "%", "source_frame": "frame_002", "time_seconds": 1.0},
+            {"label": "drivers", "value": "85%", "unit": "%", "source_frame": "frame_002", "time_seconds": 1.0},
+        ]
+    )
+    records = visual_records_from_clip_data(
+        data,
+        _frame_context(),
+        ["visual_frames/frame_000.jpg", "visual_frames/frame_001.jpg", "visual_frames/frame_002.jpg"],
+        "combined_2",
+    )
+    by_key = {(r["entity_id"], r["state_start"]): r["value"] for r in records}
+    assert set(by_key) == {("cyclists", 1.0), ("drivers", 1.0)}
+    assert by_key[("cyclists", 1.0)] == 88.0
+    assert by_key[("drivers", 1.0)] == 85.0
 
 
 def test_narration_only_values_are_included():

@@ -5,9 +5,13 @@ import numpy as np
 
 from datavideo.cv_align import (
     _clean_vision_label,
+    _contrast_outline_color,
     _ratio_consistency,
+    _render_aligned_svg,
+    _render_overlay,
     _value_plausibility,
     detect_bars,
+    locate_text_boxes,
     match_entities,
 )
 
@@ -54,6 +58,28 @@ def test_detect_bars_rejects_label_text(tmp_path):
     boxes = detect_bars(path)
     assert len(boxes) == 1
     assert abs(boxes[0]["h"] - 266) <= 2
+
+
+def test_detect_bars_on_light_background(tmp_path):
+    """Light-gray background with colored bars (news-graphic style) must not be
+    mistaken for a saturated background that erases the bars."""
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    salmon = (95, 112, 249)  # BGR
+    cv2.rectangle(img, (272, 260), (606, 645), salmon, -1)
+    cv2.rectangle(img, (666, 300), (1006, 645), salmon, -1)
+    # value circles above the bars, plus category labels below
+    cv2.circle(img, (439, 220), 34, (0, 215, 255), -1)
+    cv2.circle(img, (836, 260), 34, (0, 215, 255), -1)
+    cv2.putText(img, "cyclists", (320, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 60), 2)
+    cv2.putText(img, "drivers", (740, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 60), 2)
+    path = tmp_path / "light_bg.png"
+    cv2.imwrite(str(path), img)
+
+    boxes = detect_bars(path)
+    assert len(boxes) == 2
+    assert [b["x"] for b in boxes] == [272, 666]
+    assert abs(boxes[0]["h"] - 385) <= 5
+    assert abs(boxes[1]["h"] - 345) <= 5
 
 
 def test_match_entities_uses_vision_order_and_creates_frame_entity():
@@ -135,6 +161,124 @@ def test_clean_vision_label():
     assert _clean_vision_label("1. Sub-Saharan Africa") == "Sub-Saharan Africa"
     assert _clean_vision_label("2) EU") == "EU"
     assert _clean_vision_label("  Latin America & Caribbean  ") == "Latin America & Caribbean"
+
+
+def test_render_aligned_svg_has_value_and_category_boxes(tmp_path):
+    aligned = [
+        {"x": 172, "y": 330, "w": 158, "h": 236, "entity_id": "ssa", "label": "Sub-Saharan Africa", "value_text": "36.1%"},
+        {"x": 953, "y": 560, "w": 157, "h": 6, "entity_id": "eu", "label": "European Union", "value_text": "1%"},
+    ]
+    out = tmp_path / "aligned.svg"
+    assert _render_aligned_svg(aligned, out)
+    svg = out.read_text(encoding="utf-8")
+    assert 'data-role="value-box"' in svg
+    assert 'data-role="category-box"' in svg
+    assert "36.1%" in svg
+    assert "European Union" in svg
+
+
+def test_render_overlay_renders_with_boxes(tmp_path):
+    img = np.full((720, 1280, 3), BG, dtype=np.uint8)
+    frame = tmp_path / "frame.png"
+    cv2.imwrite(str(frame), img)
+    aligned = [
+        {
+            "x": 172,
+            "y": 330,
+            "w": 158,
+            "h": 236,
+            "entity_id": "ssa",
+            "label": "Sub-Saharan Africa",
+            "value_text": "36.1%",
+        }
+    ]
+    out = tmp_path / "overlay.png"
+    assert _render_overlay(frame, aligned, out)
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_render_overlay_boxes_original_text_positions(tmp_path):
+    img = np.full((720, 1280, 3), BG, dtype=np.uint8)
+    frame = tmp_path / "frame.png"
+    cv2.imwrite(str(frame), img)
+    aligned = [
+        {
+            "x": 172,
+            "y": 330,
+            "w": 158,
+            "h": 236,
+            "entity_id": "ssa",
+            "label": "Sub-Saharan Africa",
+            "value_text": "36.1%",
+        }
+    ]
+    text_boxes = {
+        "ssa": {"value_box": [180, 200, 320, 240], "label_box": [180, 600, 400, 640]}
+    }
+    out = tmp_path / "overlay.png"
+    assert _render_overlay(frame, aligned, out, text_boxes)
+    from PIL import Image
+
+    rendered = Image.open(out).convert("RGB")
+    # transparent outline (white on the purple background) around the original
+    # text positions, and the bar box in red
+    assert rendered.getpixel((181, 220)) == (255, 255, 255)
+    assert rendered.getpixel((181, 620)) == (255, 255, 255)
+    assert rendered.getpixel((173, 400)) == (230, 25, 75)
+
+
+def test_contrast_outline_color_adapts_to_background():
+    dark = np.full((720, 1280, 3), BG, dtype=np.uint8)  # BGR purple
+    light = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)  # BGR gray
+    assert _contrast_outline_color(dark, [100, 100, 200, 140]) == (255, 255, 255)
+    assert _contrast_outline_color(light, [100, 100, 200, 140]) == (20, 20, 20)
+
+
+def test_locate_text_boxes_cv_fallback(tmp_path):
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    cv2.rectangle(img, (272, 260), (606, 645), (95, 112, 249), -1)
+    cv2.putText(img, "88%", (420, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+    cv2.putText(img, "cyclists", (330, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 3)
+    path = tmp_path / "frame.png"
+    cv2.imwrite(str(path), img)
+    aligned = [
+        {"entity_id": "cyclists", "label": "cyclists", "x": 272, "y": 260, "w": 334, "h": 385}
+    ]
+
+    boxes = locate_text_boxes(path, aligned)
+    value_box = boxes["cyclists"].get("value_box")
+    label_box = boxes["cyclists"].get("label_box")
+    assert value_box is not None and value_box[3] <= 270
+    assert label_box is not None and label_box[1] >= 645
+
+
+def test_locate_text_boxes_geometry_selection(tmp_path):
+    """The value box must be the text line just above the bar and the label
+    box the line just below the baseline, selected purely by geometry."""
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    cv2.rectangle(img, (272, 260), (606, 645), (95, 112, 249), -1)
+    cv2.putText(img, "88%", (400, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+    cv2.putText(img, "cyclists", (330, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 3)
+    path = tmp_path / "frame.png"
+    cv2.imwrite(str(path), img)
+    aligned = [
+        {
+            "entity_id": "cyclists",
+            "label": "cyclists",
+            "x": 272,
+            "y": 260,
+            "w": 334,
+            "h": 385,
+            "value_text": "88%",
+        }
+    ]
+
+    boxes = locate_text_boxes(path, aligned)
+    value_box = boxes["cyclists"]["value_box"]
+    label_box = boxes["cyclists"]["label_box"]
+    assert value_box[3] < 260
+    assert label_box is not None and label_box[1] >= 600
 
 
 def test_value_plausibility_filters_outliers():

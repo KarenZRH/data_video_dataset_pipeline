@@ -151,3 +151,67 @@ def test_reconcile_skips_implausible_values(tmp_path):
     assert result["updated_bar_count"] == 1
     assert result["skipped_bar_count"] == 1
     assert result["skipped_bars"][0]["entity_id"] == "european-union"
+
+
+def _garbage_dynamic():
+    rows = []
+    for entity in ("cyclists", "drivers"):
+        for value in (0.0, 50.0, 100.0):
+            rows.append(
+                {
+                    "entity_id": entity,
+                    "entity": entity,
+                    "metric": "drivers",
+                    "value": value,
+                    "unit": "%",
+                    "state_key": entity,
+                    "state_start": 0.0,
+                    "state_end": 0.0,
+                    "source_type": "visual",
+                    "confidence": 0.8,
+                }
+            )
+    for value in (88.0, 85.0):
+        rows.append(
+            {
+                "entity_id": "cycling",
+                "entity": "cycling",
+                "metric": "drivers",
+                "value": value,
+                "unit": "%",
+                "state_key": "2019",
+                "state_start": 3.75,
+                "state_end": 3.75,
+                "source_type": "visual",
+                "confidence": 0.8,
+            }
+        )
+    return {"clip_id": "combined_2", "states": rows}
+
+
+def test_reconcile_cleans_axis_ticks_and_hallucinated_entities(tmp_path):
+    """Axis ticks (0/50/100) and the hallucinated "cycling" entity must not
+    survive reconciliation; only the CV-confirmed bars remain."""
+    cv_report = {
+        "detected_bar_count": 2,
+        "bars": [
+            {"entity_id": "cyclists", "label": "cyclists", "value": 88.0, "value_text": "88%", "value_plausible": True},
+            {"entity_id": "drivers", "label": "drivers", "value": 85.0, "value_text": "85%", "value_plausible": True},
+        ],
+    }
+    result = reconcile_dynamic_data(
+        _garbage_dynamic(),
+        cv_report,
+        clip_id="combined_2",
+        keyframe_timestamp=3.75,
+        image_path="keyframes/selected.png",
+        out_dir=tmp_path,
+    )
+    assert result is not None
+    states = result["dynamic"]["states"]
+    by_id = {r["entity_id"]: r for r in states}
+    assert set(by_id) == {"cyclists", "drivers"}
+    assert by_id["cyclists"]["value"] == 88.0
+    assert by_id["drivers"]["value"] == 85.0
+    assert all(r["source_type"] == "visual_frame_align" for r in states)
+    assert len(result["dynamic"]["final_data_table"]) == 2
