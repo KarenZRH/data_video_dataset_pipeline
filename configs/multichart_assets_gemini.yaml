@@ -32,7 +32,7 @@ sampling:
 
 keyframes:
   names:
-    - initial
+    - selected
   sample_fps: 4
   purpose: representative static data-visualization frame for semantic component extraction
 

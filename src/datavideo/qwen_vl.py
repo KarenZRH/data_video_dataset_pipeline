@@ -421,14 +421,12 @@ class QwenVLClient:
                 min_pixels=_as_int(self.model_cfg.get("min_pixels"), 224 * 224),
                 max_pixels=_as_int(self.model_cfg.get("max_pixels"), 768 * 768),
             )
-            # Loading shards and 4-bit quantization on CPU can race with the
-            # full core count on Windows and crash in torch_cpu.dll; limit the
-            # thread pool during load and restore it for inference.
             previous_threads = torch.get_num_threads()
             torch.set_num_threads(min(8, previous_threads))
             try:
                 self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    self.model_path, **load_kwargs
+                    self.model_path,
+                    **load_kwargs,
                 )
             finally:
                 torch.set_num_threads(previous_threads)

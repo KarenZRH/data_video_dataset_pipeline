@@ -78,7 +78,7 @@ def test_reconcile_adds_missing_entity_and_updates_values(tmp_path):
         _cv_report(),
         clip_id="combined_1",
         keyframe_timestamp=3.75,
-        image_path="keyframes/initial.png",
+        image_path="keyframes/selected.png",
         out_dir=tmp_path,
     )
     assert result is not None
@@ -103,7 +103,7 @@ def test_reconcile_returns_none_when_no_frame_values(tmp_path):
             report,
             clip_id="combined_1",
             keyframe_timestamp=3.75,
-            image_path="keyframes/initial.png",
+            image_path="keyframes/selected.png",
             out_dir=tmp_path,
         )
         is None
@@ -141,7 +141,7 @@ def test_reconcile_skips_implausible_values(tmp_path):
         report,
         clip_id="combined_1",
         keyframe_timestamp=3.75,
-        image_path="keyframes/initial.png",
+        image_path="keyframes/selected.png",
         out_dir=tmp_path,
     )
     assert result is not None

@@ -27,8 +27,8 @@ from .schemas import ensure_dir, write_json
 
 
 VISION_DEFAULTS = {
-    "node_path": r"D:\node.exe",
-    "script": r"C:\Users\ly200\.codex\skills\claude-vision-skill\vision.js",
+    "node_path": os.environ.get("DATAVIDEO_VISION_NODE", "node"),
+    "script": os.environ.get("DATAVIDEO_VISION_SCRIPT", "vision.js"),
     "proxy": None,
 }
 
@@ -53,9 +53,11 @@ def _call_vision(
         attempts.append(v["proxy"])
     last_error = "vision call failed"
     for proxy in attempts:
+        node_parent = str(Path(v["node_path"]).parent)
+        path_prefix = "" if node_parent == "." else node_parent + os.pathsep
         env = {
             **os.environ,
-            "PATH": str(Path(v["node_path"]).parent) + ";" + os.environ.get("PATH", ""),
+            "PATH": path_prefix + os.environ.get("PATH", ""),
         }
         if proxy:
             env["HTTPS_PROXY"] = proxy
@@ -205,7 +207,14 @@ def _clean_vision_label(part: str) -> str:
 
 
 def _normalize_label(text: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+    normalized = re.sub(r"[^a-z0-9]+", "", str(text).lower())
+    aliases = {
+        "eu": "europeanunion",
+        "usa": "unitedstates",
+        "us": "unitedstates",
+        "uk": "unitedkingdom",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _labeled_value_pairs(text: str) -> list[tuple[str, str]]:

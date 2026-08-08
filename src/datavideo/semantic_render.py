@@ -139,6 +139,8 @@ def _sanitize_unit(unit: Any, metadata: dict[str, Any]) -> str:
 
 
 def _layout(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not entities:
+        return []
     maxv = max(e["value"] for e in entities) or 1.0
     slot = (RIGHT - LEFT) / len(entities)
     bar_w = slot * 0.52
@@ -270,7 +272,7 @@ def _build_svg(layout: list[dict[str, Any]], title: str, unit: str) -> str:
         f'<line data-role="axis" x1="{LEFT}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
         f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
     ]
-    maxv = max(e["value"] for e in layout) or 1.0
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
         ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
         lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
@@ -456,7 +458,7 @@ def _render_preview(layout: list[dict[str, Any]], title: str, unit: str, out: Pa
     d.text((W / 2 - d.textlength(title, font=font_t) / 2, 30), title, fill=(30, 30, 30), font=font_t)
     d.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
     d.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
-    maxv = max(e["value"] for e in layout) or 1.0
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
         ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
         d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
