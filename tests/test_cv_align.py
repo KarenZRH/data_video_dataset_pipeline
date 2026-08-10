@@ -6,11 +6,14 @@ import numpy as np
 from datavideo.cv_align import (
     _clean_vision_label,
     _contrast_outline_color,
+    _labeled_value_pairs,
+    _parse_label_json,
     _ratio_consistency,
     _render_aligned_svg,
     _render_overlay,
     _value_plausibility,
     detect_bars,
+    estimate_unlabeled_values,
     locate_text_boxes,
     match_entities,
 )
@@ -178,6 +181,27 @@ def test_clean_vision_label():
     assert _clean_vision_label("1. Sub-Saharan Africa") == "Sub-Saharan Africa"
     assert _clean_vision_label("2) EU") == "EU"
     assert _clean_vision_label("  Latin America & Caribbean  ") == "Latin America & Caribbean"
+
+
+def test_labeled_value_pairs_supports_dollar_and_comma_labels():
+    text = "Less than $20,000: 890, More than $200,000: 1150"
+    pairs = _labeled_value_pairs(text)
+    assert ("Less than $20,000", "890") in pairs
+    assert ("More than $200,000", "1150") in pairs
+
+
+def test_parse_label_json_keeps_comma_labels_intact():
+    text = (
+        '```json\n'
+        '[{"label": "Less than $20,000"}, {"label": "$40,000"},'
+        ' {"label": "More than $200,000"}]\n'
+        '```'
+    )
+    assert _parse_label_json(text) == [
+        "Less than $20,000",
+        "$40,000",
+        "More than $200,000",
+    ]
 
 
 def test_render_aligned_svg_has_value_and_category_boxes(tmp_path):
@@ -367,3 +391,39 @@ def test_value_plausibility_filters_outliers():
     ok, message = _value_plausibility(wrong, aligned)
     assert not ok
     assert "ratio" in message
+
+    # Directly printed (majority-verified) values are trusted even when the
+    # measured bar length disagrees slightly with the scale.
+    printed = {"label": "SSA", "h": 456, "value": 890.0, "value_text": "890", "value_read_verified": True}
+    ok, _ = _value_plausibility(printed, aligned)
+    assert ok
+
+
+def test_estimate_unlabeled_values_linear_scale_vertical():
+    aligned = [
+        {"label": "A", "h": 200, "w": 20, "value": 100.0, "value_text": "100"},
+        {"label": "B", "h": 150, "w": 20, "value": None, "value_text": None},
+        {"label": "C", "h": 50, "w": 20, "value": None, "value_text": None},
+        {"label": "E", "h": 100, "w": 20, "value": 50.0, "value_text": "50"},
+    ]
+    count = estimate_unlabeled_values(aligned)
+    assert count == 2
+    by_label = {a["label"]: a for a in aligned}
+    assert by_label["B"]["value_estimated"] is True
+    assert by_label["B"]["value_type"] == "estimated"
+    assert abs(by_label["B"]["value"] - 75.0) < 1.0
+    assert abs(by_label["C"]["value"] - 25.0) < 1.0
+
+
+def test_estimate_unlabeled_values_linear_scale_horizontal():
+    aligned = [
+        {"label": "A", "w": 400, "h": 30, "value": 1150.0, "value_text": "1150", "orientation": "horizontal"},
+        {"label": "B", "w": 320, "h": 30, "value": None, "value_text": None, "orientation": "horizontal"},
+        {"label": "D", "w": 300, "h": 30, "value": 890.0, "value_text": "890", "orientation": "horizontal"},
+    ]
+    count = estimate_unlabeled_values(aligned)
+    assert count == 1
+    by_label = {a["label"]: a for a in aligned}
+    assert by_label["B"]["value_estimated"] is True
+    # linear through (400,1150) and (300,890): slope = 2.6, intercept = 110
+    assert abs(by_label["B"]["value"] - (110 + 2.6 * 320)) < 2.0

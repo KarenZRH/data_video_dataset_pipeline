@@ -212,6 +212,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 {**cfg, "processed_root": str(processed_root)},
                 client=client,
                 force=asset_force,
+                context_video=media.get("context_video"),
+                context_visual_end=(media.get("intervals") or {}).get("visual_clip_context", {}).get("end"),
             )
             animation = detect_animation(
                 {**cfg, "processed_root": str(processed_root)},

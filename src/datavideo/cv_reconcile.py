@@ -201,10 +201,13 @@ def reconcile_dynamic_data(
             )
             states.append(row)
         row["value"] = value
-        row["value_type"] = "exact"
+        row["value_type"] = str(bar.get("value_type") or "exact")
         row["source_type"] = "visual_frame_align"
-        row["confidence"] = max(float(row.get("confidence") or 0.0), 0.85)
+        base_confidence = 0.7 if bar.get("value_estimated") else 0.85
+        row["confidence"] = max(float(row.get("confidence") or 0.0), base_confidence)
         row["review_status"] = "machine"
+        if bar.get("value_estimated"):
+            row["needs_review"] = True
         row["raw_text"] = value_text
         row["evidence_text"] = value_text or f"{value:g}"
         row["evidence_frames"] = [

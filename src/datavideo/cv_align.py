@@ -292,12 +292,33 @@ def _normalize_label(text: Any) -> str:
 def _labeled_value_pairs(text: str) -> list[tuple[str, str]]:
     """Extract ``Label: value`` pairs from a vision response."""
     pairs: list[tuple[str, str]] = []
-    for match in re.finditer(r"([A-Za-z][A-Za-z &'\-\.]*?):\s*(-?\d+(?:\.\d+)?\s*%?)", text):
+    for match in re.finditer(r"([A-Za-z][A-Za-z0-9 $&'\-\.\,]*?):\s*(-?\d+(?:\.\d+)?\s*%?)", text):
         label = _clean_vision_label(match.group(1))
         value_match = re.search(r"-?\d+(?:\.\d+)?\s*%?", match.group(2))
         if label and value_match:
             pairs.append((label, value_match.group(0).strip()))
     return pairs
+
+
+def _parse_label_json(text: str) -> list[str]:
+    """Extract a JSON array of label strings (or {"label": ...} objects) from
+    a vision response, tolerating ```json fences and prose."""
+    cleaned = re.sub(r"```(?:json)?", "", text)
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+    except Exception:
+        return []
+    labels: list[str] = []
+    for item in parsed if isinstance(parsed, list) else []:
+        if isinstance(item, str):
+            labels.append(item)
+        elif isinstance(item, dict) and item.get("label"):
+            labels.append(str(item["label"]))
+    return [str(label).strip() for label in labels if str(label).strip()]
 
 
 def match_entities(
@@ -350,14 +371,35 @@ def match_entities(
     return aligned, warnings
 
 
-def read_entity_order(image_path: str | Path, cfg: dict[str, Any] | None = None) -> list[str]:
-    """Ask the vision model for the left-to-right category labels of the bars."""
+def read_entity_order(
+    image_path: str | Path,
+    cfg: dict[str, Any] | None = None,
+    orientation: str = "vertical",
+) -> list[str]:
+    """Ask the vision model for the category labels of the bars, ordered along
+    the categorical axis (left-to-right for vertical bars, top-to-bottom for
+    horizontal bars)."""
+    if orientation == "horizontal":
+        prompt = (
+            "这是横向条形图的一帧。请从上到下依次列出每根条形左侧的类别名称。"
+            '只返回 JSON 数组，格式 [{"label":"类别名"}, ...]，'
+            '类别名必须保持完整（例如 "Less than $20,000"，里面的逗号是数字分隔符，绝不能拆分），不要额外解释。'
+        )
+    else:
+        prompt = (
+            "这是柱状图的一帧。请从左到右依次列出每根柱子底部的类别标签，"
+            "只要名字本身，用逗号分隔，不要额外解释。"
+        )
     text = _call_vision(
         image_path,
-        "这是柱状图的一帧。请从左到右依次列出每根柱子底部的类别标签，只要名字本身，用逗号分隔，不要额外解释。",
+        prompt,
         cfg,
         temperature=0.0,
     )
+    if orientation == "horizontal":
+        json_labels = _parse_label_json(text)
+        if json_labels:
+            return [_clean_vision_label(label) for label in json_labels]
     labels = []
     skip = {"从左到右", "依次为", "第一根", "第二根", "第三根", "第四根", "柱子", "类别", "标签"}
     for part in re.split(r"[,，\n;；、]", text):
@@ -398,6 +440,7 @@ def read_bar_values(
     image_path: str | Path,
     aligned: list[dict[str, Any]],
     cfg: dict[str, Any] | None = None,
+    orientation: str = "vertical",
 ) -> list[dict[str, Any]]:
     """Read each bar's printed value via one full-frame vision call.
 
@@ -406,10 +449,18 @@ def read_bar_values(
     Bars with no value from the full-frame call fall back to a focused crop.
     """
     values: list[str | None] = [None] * len(aligned)
-    value_prompt = (
-        "这是一个柱状图。请按从左到右的顺序，用「标签: 数值」的格式列出每根柱子的"
-        "底部标签和顶部数值，例如 Sub-Saharan Africa: 36.1%。不要解释。"
-    )
+    if orientation == "horizontal":
+        value_prompt = (
+            "这是横向条形图。请找出画面中**实际印刷了数值**的条形，用「标签: 数值」的格式"
+            "列出它们的左侧完整名称和右端数值（例如 Less than $20,000: 890）。"
+            "没有印刷数值的条形**绝对不能写数值、绝对不能编造**，只列有数值的条形即可；"
+            "宁可少报，不要瞎编。不要解释。"
+        )
+    else:
+        value_prompt = (
+            "这是一个柱状图。请按从左到右的顺序，用「标签: 数值」的格式列出每根柱子的"
+            "底部标签和顶部数值，例如 Sub-Saharan Africa: 36.1%。不要解释。"
+        )
     attempts: list[str] = []
     for _ in range(3):
         try:
@@ -433,7 +484,7 @@ def read_bar_values(
                     per_bar[idx].append(value)
                     assigned.add(idx)
                     break
-        if not assigned:
+        if not assigned and orientation != "horizontal":
             tokens = re.findall(r"-?\d+(?:\.\d+)?\s*%?", text)
             percentages = [token for token in tokens if "%" in token]
             sequence = percentages if len(percentages) >= len(aligned) else tokens
@@ -444,7 +495,16 @@ def read_bar_values(
 
     for idx, candidates in enumerate(per_bar):
         if candidates:
-            values[idx] = max(set(candidates), key=candidates.count)
+            majority = max(set(candidates), key=candidates.count)
+            count = candidates.count(majority)
+            # Only trust a value when at least two of three attempts agree;
+            # a value seen once is likely a hallucination (e.g. an unlabeled
+            # bar given a neighbour's number) and should be left for the
+            # scale estimation instead.
+            if len(attempts) >= 2 and count < 2:
+                values[idx] = None
+            else:
+                values[idx] = majority
 
     img = cv2.imread(str(image_path))
     out: list[dict[str, Any]] = []
@@ -479,6 +539,11 @@ def _value_plausibility(item: dict[str, Any], aligned: list[dict[str, Any]]) -> 
         return False, f"value {value:g} is negative"
     if "%" in value_text and value > 100:
         return False, f"value {value:g} outside plausible 0-100 range for percentages"
+    if item.get("value_read_verified"):
+        # Directly printed values are trusted over noisy bar-length geometry
+        # (detection can under/over-measure a bar by several percent), so the
+        # ratio check is skipped for them.
+        return True, "ok"
     lengths = [_bar_length(a) for a in aligned if _bar_length(a) > 0]
     values = [
         float(a["value"])
@@ -534,6 +599,60 @@ def _bar_length(item: dict[str, Any]) -> float:
     if str(item.get("orientation")) == "horizontal":
         return float(item.get("w") or 0.0)
     return float(item.get("h") or 0.0)
+
+
+def estimate_unlabeled_values(
+    aligned: list[dict[str, Any]],
+    chart_type: str = "bar",
+) -> int:
+    """Estimate values for marks without printed values from the linear scale
+    implied by the marks that do have printed values.
+
+    The general rule: whatever geometric dimension encodes the value (bar
+    length/height, line/point position along the value axis, pie arc angle),
+    a linear calibration over the labeled marks maps that dimension back to
+    values for the unlabeled ones.
+
+    Currently implemented:
+      * bar (vertical and horizontal): value ~ bar length (height or width).
+    Estimated marks are flagged with ``value_estimated`` / ``value_type`` and
+    carry a lower confidence + ``needs_review`` when reconciled.
+    """
+    if chart_type not in ("bar", "combined"):
+        return 0
+    labeled: list[tuple[float, float]] = []
+    for item in aligned:
+        value = item.get("value")
+        length = _bar_length(item)
+        if length > 0 and isinstance(value, (int, float)) and item.get("value_text"):
+            labeled.append((length, float(value)))
+    if len(labeled) < 2:
+        return 0
+    xs = np.array([x for x, _ in labeled], dtype=float)
+    ys = np.array([y for _, y in labeled], dtype=float)
+    try:
+        slope, intercept = np.polyfit(xs, ys, 1)
+    except Exception:
+        return 0
+    if not (np.isfinite(slope) and np.isfinite(intercept)):
+        return 0
+    count = 0
+    for item in aligned:
+        if item.get("value") is not None:
+            continue
+        length = _bar_length(item)
+        if length <= 0:
+            continue
+        est = float(intercept + slope * length)
+        if est < 0 or not np.isfinite(est):
+            est = 0.0
+        item["value"] = est
+        item["value_text"] = f"{est:.0f}"
+        item["value_estimated"] = True
+        item["value_type"] = "estimated"
+        item["plausibility_message"] = "estimated from labeled-bar scale"
+        count += 1
+    return count
 
 
 def _text_width_estimate(text: str, font_size: float) -> float:
@@ -864,12 +983,13 @@ def run_cv_align(
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
     boxes = detect_bars(image_path)
+    orientation = boxes[0].get("orientation") if boxes else "vertical"
     try:
-        vision_order = read_entity_order(image_path, cfg)
+        vision_order = read_entity_order(image_path, cfg, orientation)
     except Exception:
         vision_order = None
     aligned, warnings = match_entities(boxes, entities, vision_order)
-    values = read_bar_values(image_path, aligned, cfg)
+    values = read_bar_values(image_path, aligned, cfg, orientation)
     for item in values:
         if item.get("value_text"):
             try:
@@ -878,6 +998,19 @@ def run_cv_align(
                 item["value"] = None
         else:
             item["value"] = None
+    # A zero read on a visible bar is almost always a misread of an unlabeled
+    # bar (or an axis tick), not a genuine zero; let the scale estimation
+    # fill it in instead.
+    for item in values:
+        if item.get("value") == 0 and _bar_length(item) > 5 and str(item.get("value_text") or "") not in ("0%", "0 %"):
+            item["value"] = None
+            item["value_text"] = None
+    # Values that survived the majority vote are treated as directly printed
+    # (trusted); the scale estimation fills in whatever is still unlabeled.
+    for item in values:
+        if item.get("value_text"):
+            item["value_read_verified"] = True
+    estimated_count = estimate_unlabeled_values(values)
     for item in values:
         item["value_plausible"], item["plausibility_message"] = _value_plausibility(item, values)
     implausible = [
@@ -909,6 +1042,7 @@ def run_cv_align(
         "clip_id": clip_id,
         "detected_bar_count": len(boxes),
         "matched_count": len(values),
+        "estimated_value_count": estimated_count,
         "orientation": (
             (values[0].get("orientation") if values else None)
             or (boxes[0].get("orientation") if boxes else None)

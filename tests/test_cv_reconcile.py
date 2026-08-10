@@ -215,3 +215,50 @@ def test_reconcile_cleans_axis_ticks_and_hallucinated_entities(tmp_path):
     assert by_id["drivers"]["value"] == 85.0
     assert all(r["source_type"] == "visual_frame_align" for r in states)
     assert len(result["dynamic"]["final_data_table"]) == 2
+
+
+def test_reconcile_marks_estimated_values(tmp_path):
+    dynamic = {
+        "clip_id": "bar_27",
+        "states": [
+            {
+                "entity_id": "a",
+                "entity": "A",
+                "metric": "SAT score",
+                "value": 100.0,
+                "unit": "",
+                "state_key": "state",
+                "state_start": 3.75,
+                "state_end": 3.75,
+                "source_type": "visual",
+                "confidence": 0.8,
+            }
+        ],
+    }
+    cv_report = {
+        "detected_bar_count": 2,
+        "bars": [
+            {"entity_id": "a", "label": "A", "value": 100.0, "value_text": "100"},
+            {
+                "entity_id": "b",
+                "label": "B",
+                "value": 75.0,
+                "value_text": "75",
+                "value_estimated": True,
+                "value_type": "estimated",
+            },
+        ],
+    }
+    result = reconcile_dynamic_data(
+        dynamic,
+        cv_report,
+        clip_id="bar_27",
+        keyframe_timestamp=3.75,
+        image_path="keyframes/selected.png",
+        out_dir=tmp_path,
+    )
+    assert result is not None
+    by_id = {r["entity_id"]: r for r in result["dynamic"]["states"]}
+    assert by_id["b"]["value_type"] == "estimated"
+    assert by_id["b"]["needs_review"] is True
+    assert by_id["b"]["confidence"] >= 0.7
