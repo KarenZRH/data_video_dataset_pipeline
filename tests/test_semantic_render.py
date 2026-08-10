@@ -75,3 +75,23 @@ def test_metadata_from_dynamic_drops_hallucinated_entity_and_unseen_year():
     assert "(2019)" not in meta["title"]
     assert [e["label"] for e in meta["entities"]] == ["cyclists", "drivers"]
     assert [e["value"] for e in meta["entities"]] == [88.0, 85.0]
+
+
+def test_render_data_driven_horizontal_layout(tmp_path):
+    metadata = {
+        "title": "Horizontal Test",
+        "unit": "km",
+        "orientation": "horizontal",
+        "series": [
+            {"name": "A", "values": [300.0]},
+            {"name": "B", "values": [200.0]},
+            {"name": "C", "values": [100.0]},
+        ],
+    }
+    report = render_data_driven("clip_h", metadata, tmp_path)
+    svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+    assert 'data-orientation="horizontal"' in svg
+    assert 'data-animation-property="width"' in svg
+    assert 'data-anchor="left"' in svg
+    assert report["entity_count"] == 3
+    assert (tmp_path / "semantic_preview.png").exists()

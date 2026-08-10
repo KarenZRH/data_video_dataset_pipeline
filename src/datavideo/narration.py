@@ -193,7 +193,7 @@ def transcribe_context_audio(
 
     asr_cfg = _asr_cfg(cfg)
     model_env = asr_cfg.get("model_path_env", "WHISPER_MODEL_PATH")
-    model_path = os.environ.get(model_env)
+    model_path = os.environ.get(model_env) or asr_cfg.get("model_path")
     if not model_path:
         raise RuntimeError(f"Missing ASR model path in environment variable {model_env}")
 

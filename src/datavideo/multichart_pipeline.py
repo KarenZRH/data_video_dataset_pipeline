@@ -304,6 +304,9 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                                     original_title,
                                     corrected_metadata.get("title"),
                                 )
+                            cv_orientation = (cv_report or {}).get("orientation")
+                            if cv_orientation:
+                                corrected_metadata["orientation"] = cv_orientation
                             write_json(clip_root / "chart_metadata.json", corrected_metadata)
                             chart_data = {**chart_data, "metadata": corrected_metadata}
                             semantic = render_data_driven(_clip_id(row), corrected_metadata, clip_root)

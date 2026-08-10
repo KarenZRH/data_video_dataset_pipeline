@@ -138,10 +138,23 @@ def _sanitize_unit(unit: Any, metadata: dict[str, Any]) -> str:
     return ""
 
 
-def _layout(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _layout(
+    entities: list[dict[str, Any]],
+    orientation: str = "vertical",
+) -> list[dict[str, Any]]:
     if not entities:
         return []
     maxv = max(e["value"] for e in entities) or 1.0
+    if orientation == "horizontal":
+        slot = (BOTTOM - TOP) / len(entities)
+        bar_h = max(14.0, slot * 0.52)
+        plot_w = RIGHT - LEFT
+        out = []
+        for i, e in enumerate(entities):
+            wgt = max(0.0, e["value"] / maxv * plot_w)
+            cy = TOP + slot * (i + 0.5)
+            out.append({**e, "x": float(LEFT), "y": cy - bar_h / 2, "w": wgt, "h": bar_h})
+        return out
     slot = (RIGHT - LEFT) / len(entities)
     bar_w = slot * 0.52
     plot_h = BOTTOM - TOP
@@ -165,9 +178,11 @@ def _build_components(
     layout: list[dict[str, Any]],
     title: str,
     unit: str,
+    orientation: str = "vertical",
 ) -> dict[str, Any]:
     objects = []
     groups = []
+    horizontal = orientation == "horizontal"
     for i, e in enumerate(layout):
         eid = _slug(e["label"])
         x, y, w, hgt = e["x"], e["y"], e["w"], e["h"]
@@ -183,9 +198,19 @@ def _build_components(
                 "dominant_color": _color(i),
                 "confidence": 1.0,
                 "reason": "data-driven",
-                "animation_axis": "y",
-                "anchor": "bottom",
+                "animation_axis": "x" if horizontal else "y",
+                "anchor": "left" if horizontal else "bottom",
             }
+        )
+        value_label_bbox = (
+            [round(x + w + 4), round(y + hgt / 2 - 14), round(x + w + 4 + max(60.0, len(str(e["value"])) * 14)), round(y + hgt / 2 + 14)]
+            if horizontal
+            else [round(x), round(y - 34), round(x + w), round(y - 4)]
+        )
+        category_label_bbox = (
+            [round(x), round(y - 34), round(x + w), round(y - 4)]
+            if horizontal
+            else [round(x), round(BOTTOM + 6), round(x + w), round(BOTTOM + 36)]
         )
         objects.append(
             {
@@ -195,7 +220,7 @@ def _build_components(
                 "label": f"{e['value']:g}{unit}",
                 "text": f"{e['value']:g}{unit}",
                 "text_status": "readable",
-                "bbox_px": [round(x), round(y - 34), round(x + w), round(y - 4)],
+                "bbox_px": value_label_bbox,
                 "dominant_color": _color(i),
                 "confidence": 1.0,
                 "reason": "data-driven",
@@ -211,7 +236,7 @@ def _build_components(
                 "label": e["label"],
                 "text": e["label"],
                 "text_status": "readable",
-                "bbox_px": [round(x), round(BOTTOM + 6), round(x + w), round(BOTTOM + 36)],
+                "bbox_px": category_label_bbox,
                 "dominant_color": _color(i),
                 "confidence": 1.0,
                 "reason": "data-driven",
@@ -262,7 +287,13 @@ def _build_components(
     }
 
 
-def _build_svg(layout: list[dict[str, Any]], title: str, unit: str) -> str:
+def _build_svg(
+    layout: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    orientation: str = "vertical",
+) -> str:
+    horizontal = orientation == "horizontal"
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
@@ -274,9 +305,14 @@ def _build_svg(layout: list[dict[str, Any]], title: str, unit: str) -> str:
     ]
     maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
-        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
-        lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
-        lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>')
+        if horizontal:
+            tx = LEFT + tv / maxv * (RIGHT - LEFT)
+            lines.append(f'<line data-role="tick" x1="{tx:.1f}" y1="{BOTTOM}" x2="{tx:.1f}" y2="{BOTTOM + 8}" stroke="#666666" stroke-width="2"/>')
+            lines.append(f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>')
+        else:
+            ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+            lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
+            lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>')
     for i, e in enumerate(layout):
         eid = _slug(e["label"])
         color = _color(i)
@@ -284,15 +320,21 @@ def _build_svg(layout: list[dict[str, Any]], title: str, unit: str) -> str:
         lines.append(
             f'<rect id="{eid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{e["value"]:g}" '
             f'x="{e["x"]:.1f}" y="{e["y"]:.1f}" width="{e["w"]:.1f}" height="{e["h"]:.1f}" fill="{color}" '
-            'data-animation-property="height" data-anchor="bottom" data-animation-axis="y"/>'
+            f'data-animation-property="{"width" if horizontal else "height"}" data-anchor="{"left" if horizontal else "bottom"}" data-animation-axis="{"x" if horizontal else "y"}" data-orientation="{orientation}"/>'
         )
+        value_label_x = (e["x"] + e["w"] + 14) if horizontal else (e["x"] + e["w"] / 2)
+        value_label_y = (e["y"] + e["h"] / 2 + 8) if horizontal else (e["y"] - 14)
+        value_anchor = "start" if horizontal else "middle"
+        category_label_x = (e["x"] + 2) if horizontal else (e["x"] + e["w"] / 2)
+        category_label_y = (e["y"] - 14) if horizontal else (BOTTOM + 30)
+        category_anchor = "start" if horizontal else "middle"
         lines.append(
             f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
-            f'x="{e["x"] + e["w"] / 2:.1f}" y="{e["y"] - 14:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{e["value"]:g}{html.escape(unit)}</text>'
+            f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{e["value"]:g}{html.escape(unit)}</text>'
         )
         lines.append(
             f'<text id="{eid}-label" data-role="category-label" data-entity-id="{eid}" '
-            f'x="{e["x"] + e["w"] / 2:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" fill="#333333">{html.escape(e["label"])}</text>'
+            f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="20" fill="#333333">{html.escape(e["label"])}</text>'
         )
         lines.append("</g>")
     lines.append("</g>")
@@ -305,12 +347,18 @@ def _estimate_text_width(text: str, font_size: float) -> float:
     return max(10.0, len(str(text)) * 0.55 * font_size)
 
 
-def _build_components_svg(layout: list[dict[str, Any]], title: str, unit: str) -> str:
+def _build_components_svg(
+    layout: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    orientation: str = "vertical",
+) -> str:
     """Data-driven boxed component diagram (semantic_components.svg).
 
     Mirrors the annotation style used for review: white boxes around the title,
     each printed value and each category name, plus red-bordered bars.
     """
+    horizontal = orientation == "horizontal"
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-components" data-generator="datavideo.semantic_render_v1">',
@@ -335,14 +383,24 @@ def _build_components_svg(layout: list[dict[str, Any]], title: str, unit: str) -
     )
     maxv = max(e["value"] for e in layout) or 1.0
     for tv in _nice_ticks(maxv):
-        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
-        lines.append(
-            f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>'
-        )
-        lines.append(
-            f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" '
-            f'font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>'
-        )
+        if horizontal:
+            tx = LEFT + tv / maxv * (RIGHT - LEFT)
+            lines.append(
+                f'<line data-role="tick" x1="{tx:.1f}" y1="{BOTTOM}" x2="{tx:.1f}" y2="{BOTTOM + 8}" stroke="#666666" stroke-width="2"/>'
+            )
+            lines.append(
+                f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" '
+                f'font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>'
+            )
+        else:
+            ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+            lines.append(
+                f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>'
+            )
+            lines.append(
+                f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" '
+                f'font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>'
+            )
     for i, e in enumerate(layout):
         eid = _slug(e["label"])
         color = _color(i)
@@ -350,13 +408,21 @@ def _build_components_svg(layout: list[dict[str, Any]], title: str, unit: str) -
         lines.append(
             f'<rect id="{eid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{e["value"]:g}" '
             f'x="{e["x"]:.1f}" y="{e["y"]:.1f}" width="{e["w"]:.1f}" height="{e["h"]:.1f}" fill="{color}" '
-            'stroke="#d62728" stroke-width="3" data-animation-property="height" data-anchor="bottom" data-animation-axis="y"/>'
+            f'stroke="#d62728" stroke-width="3" data-animation-property="{"width" if horizontal else "height"}" data-anchor="{"left" if horizontal else "bottom"}" data-animation-axis="{"x" if horizontal else "y"}" data-orientation="{orientation}"/>'
         )
         value_text = f"{e['value']:g}{unit}"
         value_w = max(56.0, _estimate_text_width(value_text, 22) + 22)
         value_h = 30.0
-        value_x = e["x"] + e["w"] / 2 - value_w / 2
-        value_y = e["y"] - value_h - 8
+        if horizontal:
+            value_x = e["x"] + e["w"] + 10
+            value_y = e["y"] + e["h"] / 2 - value_h / 2
+            value_text_x = value_x + 8
+            value_text_anchor = "start"
+        else:
+            value_x = e["x"] + e["w"] / 2 - value_w / 2
+            value_y = e["y"] - value_h - 8
+            value_text_x = e["x"] + e["w"] / 2
+            value_text_anchor = "middle"
         lines.append(
             f'<rect id="{eid}-value-box" data-role="value-box" data-entity-id="{eid}" '
             f'x="{value_x:.1f}" y="{value_y:.1f}" width="{value_w:.1f}" height="{value_h:.1f}" '
@@ -364,13 +430,21 @@ def _build_components_svg(layout: list[dict[str, Any]], title: str, unit: str) -
         )
         lines.append(
             f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
-            f'x="{e["x"] + e["w"] / 2:.1f}" y="{value_y + 21:.1f}" text-anchor="middle" '
+            f'x="{value_text_x:.1f}" y="{value_y + 21:.1f}" text-anchor="{value_text_anchor}" '
             f'font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#222222">{html.escape(value_text)}</text>'
         )
         label_w = max(e["w"], _estimate_text_width(e["label"], 18) + 26)
         label_h = 30.0
-        label_x = e["x"] + e["w"] / 2 - label_w / 2
-        label_y = BOTTOM + 12
+        if horizontal:
+            label_x = e["x"]
+            label_y = e["y"] - label_h - 8
+            label_text_x = label_x + 8
+            label_text_anchor = "start"
+        else:
+            label_x = e["x"] + e["w"] / 2 - label_w / 2
+            label_y = BOTTOM + 12
+            label_text_x = e["x"] + e["w"] / 2
+            label_text_anchor = "middle"
         lines.append(
             f'<rect id="{eid}-label-box" data-role="category-box" data-entity-id="{eid}" '
             f'x="{label_x:.1f}" y="{label_y:.1f}" width="{label_w:.1f}" height="{label_h:.1f}" '
@@ -378,7 +452,7 @@ def _build_components_svg(layout: list[dict[str, Any]], title: str, unit: str) -
         )
         lines.append(
             f'<text id="{eid}-label" data-role="category-label" data-entity-id="{eid}" '
-            f'x="{e["x"] + e["w"] / 2:.1f}" y="{label_y + 21:.1f}" text-anchor="middle" '
+            f'x="{label_text_x:.1f}" y="{label_y + 21:.1f}" text-anchor="{label_text_anchor}" '
             f'font-family="Arial, sans-serif" font-size="18" fill="#333333">{html.escape(e["label"])}</text>'
         )
         lines.append("</g>")
@@ -388,7 +462,11 @@ def _build_components_svg(layout: list[dict[str, Any]], title: str, unit: str) -
 
 
 def _render_components_preview(
-    layout: list[dict[str, Any]], title: str, unit: str, out: Path
+    layout: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    out: Path,
+    orientation: str = "vertical",
 ) -> bool:
     """Render the boxed component diagram as a PNG for quick visual review."""
     try:
@@ -404,6 +482,7 @@ def _render_components_preview(
         font_a = ImageFont.truetype("arial.ttf", 22)
     except Exception:
         font_t = font_v = font_l = font_a = ImageFont.load_default()
+    horizontal = orientation == "horizontal"
     title_w = max(200.0, d.textlength(title, font=font_t) + 44)
     d.rectangle([W / 2 - title_w / 2, 28, W / 2 + title_w / 2, 88], fill="white", outline=(51, 51, 51), width=3)
     d.text((W / 2 - d.textlength(title, font=font_t) / 2, 34), title, fill=(34, 34, 34), font=font_t)
@@ -411,37 +490,54 @@ def _render_components_preview(
     d.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
     maxv = max(e["value"] for e in layout) or 1.0
     for tv in _nice_ticks(maxv):
-        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
-        d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
-        d.text((LEFT - 70, ty - 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+        if horizontal:
+            tx = LEFT + tv / maxv * (RIGHT - LEFT)
+            d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
+            d.text((tx - 20, BOTTOM + 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+        else:
+            ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+            d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
+            d.text((LEFT - 70, ty - 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
     for i, e in enumerate(layout):
-        d.rectangle([e["x"], e["y"], e["x"] + e["w"], BOTTOM], fill=_color(i), outline=(214, 39, 40), width=3)
+        d.rectangle([e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"]], fill=_color(i), outline=(214, 39, 40), width=3)
         value_text = f"{e['value']:g}{unit}"
         value_w = max(56.0, d.textlength(value_text, font=font_v) + 22)
-        value_x = e["x"] + e["w"] / 2 - value_w / 2
-        value_y = e["y"] - 38
+        if horizontal:
+            value_x = e["x"] + e["w"] + 8
+            value_y = e["y"] + e["h"] / 2 - 15
+            value_text_x = value_x + 6
+            value_text_anchor = "la"
+        else:
+            value_x = e["x"] + e["w"] / 2 - value_w / 2
+            value_y = e["y"] - 38
+            value_text_x = e["x"] + e["w"] / 2 - d.textlength(value_text, font=font_v) / 2
+            value_text_anchor = "la"
         d.rectangle([value_x, value_y, value_x + value_w, value_y + 30], fill=(250, 250, 250), outline=(51, 51, 51), width=2)
-        d.text(
-            (e["x"] + e["w"] / 2 - d.textlength(value_text, font=font_v) / 2, value_y + 4),
-            value_text,
-            fill=(34, 34, 34),
-            font=font_v,
-        )
+        d.text((value_text_x, value_y + 4), value_text, fill=(34, 34, 34), font=font_v, anchor=value_text_anchor)
         label_w = max(e["w"], d.textlength(e["label"], font=font_l) + 26)
-        label_x = e["x"] + e["w"] / 2 - label_w / 2
-        label_y = BOTTOM + 12
+        if horizontal:
+            label_x = e["x"]
+            label_y = e["y"] - 38
+            label_text_x = label_x + 6
+            label_text_anchor = "la"
+        else:
+            label_x = e["x"] + e["w"] / 2 - label_w / 2
+            label_y = BOTTOM + 12
+            label_text_x = e["x"] + e["w"] / 2 - d.textlength(e["label"], font=font_l) / 2
+            label_text_anchor = "la"
         d.rectangle([label_x, label_y, label_x + label_w, label_y + 30], fill=(250, 250, 250), outline=(51, 51, 51), width=2)
-        d.text(
-            (e["x"] + e["w"] / 2 - d.textlength(e["label"], font=font_l) / 2, label_y + 5),
-            e["label"],
-            fill=(51, 51, 51),
-            font=font_l,
-        )
+        d.text((label_text_x, label_y + 5), e["label"], fill=(51, 51, 51), font=font_l, anchor=label_text_anchor)
     img.save(out)
     return out.exists()
 
 
-def _render_preview(layout: list[dict[str, Any]], title: str, unit: str, out: Path) -> bool:
+def _render_preview(
+    layout: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    out: Path,
+    orientation: str = "vertical",
+) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception:
@@ -455,19 +551,29 @@ def _render_preview(layout: list[dict[str, Any]], title: str, unit: str, out: Pa
         font_a = ImageFont.truetype("arial.ttf", 22)
     except Exception:
         font_t = font_v = font_l = font_a = ImageFont.load_default()
+    horizontal = orientation == "horizontal"
     d.text((W / 2 - d.textlength(title, font=font_t) / 2, 30), title, fill=(30, 30, 30), font=font_t)
     d.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
     d.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
     maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
-        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
-        d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
-        d.text((LEFT - 70, ty - 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+        if horizontal:
+            tx = LEFT + tv / maxv * (RIGHT - LEFT)
+            d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
+            d.text((tx - 20, BOTTOM + 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+        else:
+            ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+            d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
+            d.text((LEFT - 70, ty - 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
     for i, e in enumerate(layout):
-        d.rectangle([e["x"], e["y"], e["x"] + e["w"], BOTTOM], fill=_color(i), outline=(0, 0, 0))
+        d.rectangle([e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"]], fill=_color(i), outline=(0, 0, 0))
         text = f"{e['value']:g}{unit}"
-        d.text((e["x"] + e["w"] / 2 - d.textlength(text, font=font_v) / 2, e["y"] - 28), text, fill=(30, 30, 30), font=font_v)
-        d.text((e["x"] + e["w"] / 2 - d.textlength(e["label"], font=font_l) / 2, BOTTOM + 8), e["label"], fill=(50, 50, 50), font=font_l)
+        if horizontal:
+            d.text((e["x"] + e["w"] + 10, e["y"] + e["h"] / 2 - 16), text, fill=(30, 30, 30), font=font_v)
+            d.text((e["x"] + 2, e["y"] - 28), e["label"], fill=(50, 50, 50), font=font_l)
+        else:
+            d.text((e["x"] + e["w"] / 2 - d.textlength(text, font=font_v) / 2, e["y"] - 28), text, fill=(30, 30, 30), font=font_v)
+            d.text((e["x"] + e["w"] / 2 - d.textlength(e["label"], font=font_l) / 2, BOTTOM + 8), e["label"], fill=(50, 50, 50), font=font_l)
     img.save(out)
     return out.exists()
 
@@ -479,18 +585,19 @@ def render_data_driven(
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
     entities = entities_from_metadata(metadata)
-    layout = _layout(entities)
+    orientation = str(metadata.get("orientation") or "vertical")
+    layout = _layout(entities, orientation)
     title = str(metadata.get("title") or "Data Chart")
     unit = _sanitize_unit(metadata.get("unit"), metadata)
-    components = _build_components(clip_id, layout, title, unit)
+    components = _build_components(clip_id, layout, title, unit, orientation)
     svg_path = out_dir / "semantic.svg"
     components_svg_path = out_dir / "semantic_components.svg"
     comp_path = out_dir / "semantic_components.json"
     scene_path = out_dir / "semantic_scene.json"
     preview_path = out_dir / "semantic_preview.png"
     components_preview_path = out_dir / "semantic_components_preview.png"
-    svg_path.write_text(_build_svg(layout, title, unit), encoding="utf-8")
-    components_svg_path.write_text(_build_components_svg(layout, title, unit), encoding="utf-8")
+    svg_path.write_text(_build_svg(layout, title, unit, orientation), encoding="utf-8")
+    components_svg_path.write_text(_build_components_svg(layout, title, unit, orientation), encoding="utf-8")
     write_json(comp_path, components)
     write_json(
         scene_path,
@@ -514,8 +621,8 @@ def render_data_driven(
             "non_entity_components": [],
         },
     )
-    preview_success = _render_preview(layout, title, unit, preview_path)
-    components_preview_success = _render_components_preview(layout, title, unit, components_preview_path)
+    preview_success = _render_preview(layout, title, unit, preview_path, orientation)
+    components_preview_success = _render_components_preview(layout, title, unit, components_preview_path, orientation)
     return {
         "tool": "semantic_render",
         "generator": "datavideo.semantic_render_v1",

@@ -82,6 +82,23 @@ def test_detect_bars_on_light_background(tmp_path):
     assert abs(boxes[1]["h"] - 345) <= 5
 
 
+def test_detect_bars_horizontal(tmp_path):
+    """Horizontal bars share a left edge and vary in width; they must be
+    detected with orientation='horizontal' and sorted top-to-bottom."""
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    for cy, w, color in [(180, 380, (30, 144, 255)), (300, 240, (255, 165, 0)), (420, 120, (220, 20, 60))]:
+        cv2.rectangle(img, (200, cy - 20), (200 + w, cy + 20), color, -1)
+    path = tmp_path / "horizontal.png"
+    cv2.imwrite(str(path), img)
+
+    bars = detect_bars(path)
+    assert len(bars) == 3
+    assert all(b["orientation"] == "horizontal" for b in bars)
+    assert [b["x"] for b in bars] == [200, 200, 200]
+    assert all(abs(bars[i]["w"] - expected) <= 1 for i, expected in enumerate([380, 240, 120]))
+    assert [b["y"] for b in bars] == sorted(b["y"] for b in bars)
+
+
 def test_match_entities_uses_vision_order_and_creates_frame_entity():
     boxes = [
         {"x": 172, "y": 330, "w": 158, "h": 236},
@@ -281,6 +298,55 @@ def test_locate_text_boxes_geometry_selection(tmp_path):
     assert label_box is not None and label_box[1] >= 600
 
 
+def test_locate_text_boxes_horizontal(tmp_path):
+    """For horizontal bars the value is at the right end and the label sits
+    above the bar."""
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    cv2.rectangle(img, (200, 180), (580, 220), (30, 144, 255), -1)
+    cv2.putText(img, "A", (210, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 3)
+    cv2.putText(img, "380", (600, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 3)
+    path = tmp_path / "frame.png"
+    cv2.imwrite(str(path), img)
+    aligned = [
+        {
+            "entity_id": "a",
+            "label": "A",
+            "x": 200,
+            "y": 180,
+            "w": 380,
+            "h": 40,
+            "orientation": "horizontal",
+            "value_text": "380",
+        }
+    ]
+    boxes = locate_text_boxes(path, aligned)
+    value_box = boxes["a"]["value_box"]
+    label_box = boxes["a"]["label_box"]
+    assert value_box is not None and value_box[0] >= 580
+    assert label_box is not None and label_box[3] <= 180
+
+
+def test_render_aligned_svg_horizontal(tmp_path):
+    aligned = [
+        {
+            "x": 200,
+            "y": 180,
+            "w": 380,
+            "h": 40,
+            "entity_id": "a",
+            "label": "A",
+            "value_text": "380",
+            "orientation": "horizontal",
+        }
+    ]
+    out = tmp_path / "aligned.svg"
+    assert _render_aligned_svg(aligned, out)
+    svg = out.read_text(encoding="utf-8")
+    assert 'data-animation-property="width"' in svg
+    assert 'data-anchor="left"' in svg
+    assert 'data-orientation="horizontal"' in svg
+
+
 def test_value_plausibility_filters_outliers():
     aligned = [
         {"label": "SSA", "h": 236, "value": 36.1, "value_text": "36.1%"},
@@ -295,7 +361,7 @@ def test_value_plausibility_filters_outliers():
     bad = {"label": "EU", "h": 6, "value": 248.0, "value_text": "248"}
     ok, message = _value_plausibility(bad, aligned)
     assert not ok
-    assert "0-100" in message
+    assert "ratio" in message
 
     wrong = {"label": "SSA", "h": 236, "value": 30.0, "value_text": "30%"}
     ok, message = _value_plausibility(wrong, aligned)
