@@ -6,11 +6,14 @@ import numpy as np
 from datavideo.cv_align import (
     _clean_vision_label,
     _contrast_outline_color,
+    _labeled_value_pairs,
+    _parse_label_json,
     _ratio_consistency,
     _render_aligned_svg,
     _render_overlay,
     _value_plausibility,
     detect_bars,
+    estimate_unlabeled_values,
     locate_text_boxes,
     match_entities,
 )
@@ -80,6 +83,23 @@ def test_detect_bars_on_light_background(tmp_path):
     assert [b["x"] for b in boxes] == [272, 666]
     assert abs(boxes[0]["h"] - 385) <= 5
     assert abs(boxes[1]["h"] - 345) <= 5
+
+
+def test_detect_bars_horizontal(tmp_path):
+    """Horizontal bars share a left edge and vary in width; they must be
+    detected with orientation='horizontal' and sorted top-to-bottom."""
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    for cy, w, color in [(180, 380, (30, 144, 255)), (300, 240, (255, 165, 0)), (420, 120, (220, 20, 60))]:
+        cv2.rectangle(img, (200, cy - 20), (200 + w, cy + 20), color, -1)
+    path = tmp_path / "horizontal.png"
+    cv2.imwrite(str(path), img)
+
+    bars = detect_bars(path)
+    assert len(bars) == 3
+    assert all(b["orientation"] == "horizontal" for b in bars)
+    assert [b["x"] for b in bars] == [200, 200, 200]
+    assert all(abs(bars[i]["w"] - expected) <= 1 for i, expected in enumerate([380, 240, 120]))
+    assert [b["y"] for b in bars] == sorted(b["y"] for b in bars)
 
 
 def test_match_entities_uses_vision_order_and_creates_frame_entity():
@@ -161,6 +181,27 @@ def test_clean_vision_label():
     assert _clean_vision_label("1. Sub-Saharan Africa") == "Sub-Saharan Africa"
     assert _clean_vision_label("2) EU") == "EU"
     assert _clean_vision_label("  Latin America & Caribbean  ") == "Latin America & Caribbean"
+
+
+def test_labeled_value_pairs_supports_dollar_and_comma_labels():
+    text = "Less than $20,000: 890, More than $200,000: 1150"
+    pairs = _labeled_value_pairs(text)
+    assert ("Less than $20,000", "890") in pairs
+    assert ("More than $200,000", "1150") in pairs
+
+
+def test_parse_label_json_keeps_comma_labels_intact():
+    text = (
+        '```json\n'
+        '[{"label": "Less than $20,000"}, {"label": "$40,000"},'
+        ' {"label": "More than $200,000"}]\n'
+        '```'
+    )
+    assert _parse_label_json(text) == [
+        "Less than $20,000",
+        "$40,000",
+        "More than $200,000",
+    ]
 
 
 def test_render_aligned_svg_has_value_and_category_boxes(tmp_path):
@@ -281,6 +322,55 @@ def test_locate_text_boxes_geometry_selection(tmp_path):
     assert label_box is not None and label_box[1] >= 600
 
 
+def test_locate_text_boxes_horizontal(tmp_path):
+    """For horizontal bars the value is at the right end and the label sits
+    above the bar."""
+    img = np.full((720, 1280, 3), (216, 216, 216), dtype=np.uint8)
+    cv2.rectangle(img, (200, 180), (580, 220), (30, 144, 255), -1)
+    cv2.putText(img, "A", (210, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 3)
+    cv2.putText(img, "380", (600, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 3)
+    path = tmp_path / "frame.png"
+    cv2.imwrite(str(path), img)
+    aligned = [
+        {
+            "entity_id": "a",
+            "label": "A",
+            "x": 200,
+            "y": 180,
+            "w": 380,
+            "h": 40,
+            "orientation": "horizontal",
+            "value_text": "380",
+        }
+    ]
+    boxes = locate_text_boxes(path, aligned)
+    value_box = boxes["a"]["value_box"]
+    label_box = boxes["a"]["label_box"]
+    assert value_box is not None and value_box[0] >= 580
+    assert label_box is not None and label_box[3] <= 180
+
+
+def test_render_aligned_svg_horizontal(tmp_path):
+    aligned = [
+        {
+            "x": 200,
+            "y": 180,
+            "w": 380,
+            "h": 40,
+            "entity_id": "a",
+            "label": "A",
+            "value_text": "380",
+            "orientation": "horizontal",
+        }
+    ]
+    out = tmp_path / "aligned.svg"
+    assert _render_aligned_svg(aligned, out)
+    svg = out.read_text(encoding="utf-8")
+    assert 'data-animation-property="width"' in svg
+    assert 'data-anchor="left"' in svg
+    assert 'data-orientation="horizontal"' in svg
+
+
 def test_value_plausibility_filters_outliers():
     aligned = [
         {"label": "SSA", "h": 236, "value": 36.1, "value_text": "36.1%"},
@@ -295,9 +385,45 @@ def test_value_plausibility_filters_outliers():
     bad = {"label": "EU", "h": 6, "value": 248.0, "value_text": "248"}
     ok, message = _value_plausibility(bad, aligned)
     assert not ok
-    assert "0-100" in message
+    assert "ratio" in message
 
     wrong = {"label": "SSA", "h": 236, "value": 30.0, "value_text": "30%"}
     ok, message = _value_plausibility(wrong, aligned)
     assert not ok
     assert "ratio" in message
+
+    # Directly printed (majority-verified) values are trusted even when the
+    # measured bar length disagrees slightly with the scale.
+    printed = {"label": "SSA", "h": 456, "value": 890.0, "value_text": "890", "value_read_verified": True}
+    ok, _ = _value_plausibility(printed, aligned)
+    assert ok
+
+
+def test_estimate_unlabeled_values_linear_scale_vertical():
+    aligned = [
+        {"label": "A", "h": 200, "w": 20, "value": 100.0, "value_text": "100"},
+        {"label": "B", "h": 150, "w": 20, "value": None, "value_text": None},
+        {"label": "C", "h": 50, "w": 20, "value": None, "value_text": None},
+        {"label": "E", "h": 100, "w": 20, "value": 50.0, "value_text": "50"},
+    ]
+    count = estimate_unlabeled_values(aligned)
+    assert count == 2
+    by_label = {a["label"]: a for a in aligned}
+    assert by_label["B"]["value_estimated"] is True
+    assert by_label["B"]["value_type"] == "estimated"
+    assert abs(by_label["B"]["value"] - 75.0) < 1.0
+    assert abs(by_label["C"]["value"] - 25.0) < 1.0
+
+
+def test_estimate_unlabeled_values_linear_scale_horizontal():
+    aligned = [
+        {"label": "A", "w": 400, "h": 30, "value": 1150.0, "value_text": "1150", "orientation": "horizontal"},
+        {"label": "B", "w": 320, "h": 30, "value": None, "value_text": None, "orientation": "horizontal"},
+        {"label": "D", "w": 300, "h": 30, "value": 890.0, "value_text": "890", "orientation": "horizontal"},
+    ]
+    count = estimate_unlabeled_values(aligned)
+    assert count == 1
+    by_label = {a["label"]: a for a in aligned}
+    assert by_label["B"]["value_estimated"] is True
+    # linear through (400,1150) and (300,890): slope = 2.6, intercept = 110
+    assert abs(by_label["B"]["value"] - (110 + 2.6 * 320)) < 2.0

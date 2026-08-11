@@ -78,6 +78,8 @@ def _download_context_source(row: dict[str, Any], cfg: dict[str, Any], out_path:
         str(cookies),
         "--js-runtimes",
         "node",
+        "--remote-components",
+        "ejs:github",
         "--download-sections",
         section,
         "--force-keyframes-at-cuts",

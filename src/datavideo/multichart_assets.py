@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
+from datavideo.cv_align import detect_bars
 from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
@@ -199,11 +201,12 @@ def _add_tail_candidate_frames(
     force: bool,
 ) -> list[dict[str, Any]]:
     min_tail_margin = float(cfg.get("keyframes", {}).get("tail_frame_min_margin_seconds", 0.25))
-    offsets = [float(x) for x in (0.75, 0.5, min_tail_margin)]
+    near_end_margin = min(0.05, max(0.0, min_tail_margin))
+    offsets = [float(x) for x in (0.75, 0.5, min_tail_margin, near_end_margin)]
     existing_times = [float(frame["timestamp"]) for frame in frames]
     rows = list(frames)
     for idx, offset in enumerate(offsets, start=1):
-        timestamp = max(0.0, min(duration - min_tail_margin, duration - offset))
+        timestamp = max(0.0, min(duration - near_end_margin, duration - offset))
         if any(abs(timestamp - t) <= (0.5 / fps) for t in existing_times):
             continue
         path = frame_dir / f"keyframe_candidate_tail_{idx:02d}.jpg"
@@ -391,7 +394,10 @@ def _write_semantic_state_inputs(
     *,
     force: bool,
 ) -> dict[str, Any]:
-    plan = plan_dynamic_state_keyframes(dynamic)
+    plan = plan_dynamic_state_keyframes(
+        dynamic,
+        max_states=int(cfg.get("dynamic_data", {}).get("max_state_keyframes", 8) or 8),
+    )
     manifest_path = Path(out_dir) / "semantic_state_input_manifest.json"
     state_dir = ensure_dir(Path(out_dir) / "keyframes" / "states")
     if not plan.get("should_save"):
@@ -410,18 +416,39 @@ def _write_semantic_state_inputs(
         out_path = state_dir / f"state_{idx:03d}_{safe_label}.png"
         timestamp = state.get("timestamp")
         if source_path and source_path.exists() and timestamp is not None:
-            asset = extract_still(source_path, float(timestamp), out_path, force=force)
+            try:
+                asset = extract_still(source_path, float(timestamp), out_path, force=force)
+            except Exception:
+                asset = None
+            if asset is None or not Path(asset).exists() or Path(asset).stat().st_size == 0:
+                asset = None
         else:
+            asset = None
+        if asset is None:
             source_frame = Path(state.get("source_frame_path") or "")
-            asset = out_path
-            if source_frame.exists() and (force or not asset.exists()):
-                shutil.copyfile(source_frame, asset)
+            if source_frame.exists():
+                asset = out_path
+                try:
+                    shutil.copyfile(source_frame, asset)
+                except Exception:
+                    asset = None
+        if asset is None:
+            rows.append(
+                {
+                    **state,
+                    "keyframe": None,
+                    "semantic_input": None,
+                    "success": False,
+                    "failure_reason": "state keyframe extraction failed",
+                }
+            )
+            continue
         rows.append({**state, "keyframe": str(asset), "semantic_input": str(asset)})
 
     manifest = {
         "should_save": True,
         "reason": plan.get("reason"),
-        "selection_rule": "first_last_complete_evidenced_data_states_as_state_keyframes",
+        "selection_rule": "all_complete_evidenced_data_states_as_state_keyframes",
         "semantic_inputs": rows,
     }
     write_json(manifest_path, manifest)
@@ -486,8 +513,9 @@ def build_semantic_state_svgs(
             continue
         state_id = str(item.get("state_id") or f"state_{len(rows) + 1:03d}")
         state_label = str(item.get("state_label") or item.get("state_key") or state_id)
-        safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in state_label).strip("_") or state_id
-        state_out_dir = ensure_dir(out_dir / "semantic_states" / f"{state_id}_{safe_label}")
+        state_key = str(item.get("state_key") or state_label or state_id)
+        safe_key = re.sub(r"[^a-z0-9]+", "-", state_key.lower()).strip("-") or state_id
+        state_out_dir = ensure_dir(out_dir / "semantic_states" / safe_key / "vision")
         parent_metadata = out_dir / "chart_metadata.json"
         if parent_metadata.exists():
             shutil.copy2(parent_metadata, state_out_dir / "chart_metadata.json")
@@ -591,6 +619,8 @@ def select_keyframe(
     *,
     client: MultichartQwenClient | None = None,
     force: bool = False,
+    context_video: str | Path | None = None,
+    context_visual_end: float | None = None,
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
     manifest_path = out_dir / "keyframe_manifest.json"
@@ -650,10 +680,102 @@ def select_keyframe(
         )
 
     chart_type = str(row.get("chart_type", ""))
+    # Deterministic completeness signal for bar-like charts: the more bars a
+    # candidate frame shows, the more complete it is.  Qwen sometimes marks a
+    # mid-animation frame as "complete"; the CV bar count re-ranks in favour
+    # of the frame that actually has the most bars.
+    if "bar" in chart_type or "combined" in chart_type:
+        for item in scored_rows:
+            try:
+                item["cv_bar_count"] = len(detect_bars(item["path"]))
+            except Exception:
+                item["cv_bar_count"] = 0
+            item["combined_score"] = round(item["combined_score"] + 0.4 * item["cv_bar_count"], 4)
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))
-    timestamp = _safe_still_timestamp(float(selected["timestamp"]), duration, cfg)
-    asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
-    state_rows = _select_state_rows(scored_rows, selected, cfg, chart_type)
+    keyframe_source_role = "visual_clip"
+    boundary_reason = ""
+    needs_review = False
+    # When the annotated interval ends mid-animation, the complete chart may
+    # only appear in the padded context tail.  For bar-like charts we scan a
+    # short window right after the visual interval and use the frame with the
+    # most bars; the clip boundary is flagged for review.
+    if (
+        context_video
+        and Path(context_video).exists()
+        and context_visual_end is not None
+        and ("bar" in chart_type or "combined" in chart_type)
+    ):
+        try:
+            ctx_duration = _duration_seconds(context_video)
+            best_clip_bars = max((item.get("cv_bar_count") or 0) for item in scored_rows)
+            scan_dir = ensure_dir(Path(cfg.get("processed_root", "data/processed")) / clip_id / "context_tail_frames")
+            # Take the first frame *after* the annotated interval that is more
+            # complete than anything inside it.  This catches charts that
+            # finish right after the cut, while avoiding far-away transition
+            # frames (where noisy components inflate the count).
+            chosen_tail = None
+            t = float(context_visual_end) + 0.1
+            tail_limit = min(ctx_duration - 0.05, float(context_visual_end) + 2.0)
+            while t < tail_limit and chosen_tail is None:
+                path = scan_dir / f"context_tail_{t:.2f}.png"
+                try:
+                    extract_still(context_video, t, path, force=True)
+                    cnt = len(detect_bars(str(path)))
+                except Exception:
+                    cnt = 0
+                if cnt > best_clip_bars:
+                    chosen_tail = (t, cnt, str(path))
+                t += 0.3
+            if chosen_tail:
+                t, cnt, path = chosen_tail
+                clip_rel_ts = min(round(float(t) - float(context_visual_end) + duration, 3), max(0.0, duration - 0.05))
+                selected = {
+                    "timestamp": clip_rel_ts,
+                    "context_tail_timestamp": round(float(t), 3),
+                    "path": path,
+                    "frame_id": Path(path).stem,
+                    "clip_duration": duration,
+                    "score": {
+                        "target_chart_type_match": True,
+                        "same_chart": True,
+                        "scene_change_or_title_card": False,
+                        "scene_change": False,
+                        "structure_complete": True,
+                        "complete_chart": True,
+                        "final_or_most_complete_state": True,
+                        "data_marks_readable": True,
+                        "printed_text_readable": True,
+                        "labels_readable": True,
+                        "edge_crop_or_occlusion": False,
+                        "has_directly_printed_values": True,
+                        "completeness": 1.0,
+                        "state_finality": 1.0,
+                        "data_text_visibility": 1.0,
+                        "chart_identity_consistency": 1.0,
+                        "motion_score": 0.0,
+                        "state_summary": "context-tail frame with the most bars (CV verified)",
+                        "reason": "selected by CV bar-count completeness scan of the context tail",
+                    },
+                    "combined_score": round(10.0 + cnt, 4),
+                    "raw_response": None,
+                    "model_status": "cv",
+                    "failure_reason": None,
+                    "cv_bar_count": cnt,
+                }
+                keyframe_source_role = "context_tail"
+                boundary_reason = "boundary_mid_animation"
+                needs_review = True
+        except Exception:
+            pass
+    if keyframe_source_role == "context_tail":
+        timestamp = float(selected["timestamp"])
+        context_ts = float(selected["context_tail_timestamp"])
+        asset = str(extract_still(context_video, context_ts, out_dir / "selected.png", force=True))
+        state_rows: list[dict[str, Any]] = []
+    else:
+        timestamp = _safe_still_timestamp(float(selected["timestamp"]), duration, cfg)
+        asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
+        state_rows = _select_state_rows(scored_rows, selected, cfg, chart_type)
     states_dir = ensure_dir(out_dir / "states")
     if force:
         for stale_state in states_dir.glob("state_*.png"):
@@ -678,11 +800,14 @@ def select_keyframe(
         "clip_id": clip_id,
         "chart_type": row["chart_type"],
         "timestamps": {"selected": timestamp},
+        "context_tail_timestamp": selected.get("context_tail_timestamp"),
         "assets": {"selected": asset, "states": [state["asset"] for state in states]},
         "states": states,
         "selection_method": "v2_simple_complete_final_state_keyframe",
-        "source_video_role": "visual_clip",
-        "source_video": str(normalized_video),
+        "source_video_role": keyframe_source_role,
+        "source_video": str(context_video if keyframe_source_role == "context_tail" else normalized_video),
+        "boundary_reason": boundary_reason,
+        "needs_review": needs_review,
         "source_frame_id": selected["frame_id"],
         "sample_fps": fps,
         "clip_context": context,

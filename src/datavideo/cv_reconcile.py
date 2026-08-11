@@ -105,6 +105,13 @@ def clean_states(
                 best_by_label[label] = r
         rows = list(best_by_label.values())
 
+        # A state that CV alignment verified keeps only the bars that were
+        # actually detected in the frame; recovered entities that are not in
+        # the frame (e.g. a hallucinated "SAT=30") are dropped.
+        has_aligned_rows = any(str(r.get("source_type")) == "visual_frame_align" for r in rows)
+        if has_aligned_rows and aligned_ids:
+            rows = [r for r in rows if str(r.get("entity_id") or "") in aligned_ids]
+
         # Metric/entity confusion: a row whose metric is another entity's
         # label while the entity itself was not confirmed by CV is a
         # hallucination (e.g. entity "cycling" with metric "drivers").
@@ -114,6 +121,12 @@ def clean_states(
             if _normalize_label(r.get("metric")) not in entity_labels
             or str(r.get("entity_id") or "") in aligned_ids
         ]
+        # Isolated single-entity states that CV never confirmed are recovery
+        # hallucinations (e.g. "SAT=30" at t=0); real historical states keep
+        # multiple entities and survive.
+        eids = {str(r.get("entity_id") or "") for r in rows if r.get("entity_id")}
+        if len(eids) == 1 and not (eids & aligned_ids):
+            rows = []
         cleaned.extend(rows)
     return cleaned
 
@@ -201,10 +214,13 @@ def reconcile_dynamic_data(
             )
             states.append(row)
         row["value"] = value
-        row["value_type"] = "exact"
+        row["value_type"] = str(bar.get("value_type") or "exact")
         row["source_type"] = "visual_frame_align"
-        row["confidence"] = max(float(row.get("confidence") or 0.0), 0.85)
+        base_confidence = 0.7 if bar.get("value_estimated") else 0.85
+        row["confidence"] = max(float(row.get("confidence") or 0.0), base_confidence)
         row["review_status"] = "machine"
+        if bar.get("value_estimated"):
+            row["needs_review"] = True
         row["raw_text"] = value_text
         row["evidence_text"] = value_text or f"{value:g}"
         row["evidence_frames"] = [

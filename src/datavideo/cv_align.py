@@ -152,9 +152,10 @@ def _estimate_background_mask(hsv: np.ndarray) -> np.ndarray:
 def detect_bars(image_path: str | Path) -> list[dict[str, Any]]:
     """Detect colored bar regions in a chart keyframe via color segmentation.
 
-    Short bars (e.g. a 1% bar only a few pixels tall) are kept, so the height
-    threshold is low; components that do not sit on the dominant baseline of
-    the tall bars (typically value circles or category-label text) are dropped.
+    Orientation is inferred from the candidate geometry: vertical bars share a
+    bottom baseline (height encodes the value), horizontal bars share a left
+    (or right) edge and vary in width.  Each returned bar carries an
+    ``orientation`` field so downstream steps can dispatch correctly.
     """
     img = cv2.imread(str(image_path))
     if img is None:
@@ -181,23 +182,94 @@ def detect_bars(image_path: str | Path) -> list[dict[str, Any]]:
             continue
         candidates.append({"x": int(x), "y": int(y), "w": int(w), "h": int(hh)})
 
-    if candidates:
-        tall = [b for b in candidates if b["h"] >= 25]
-        if tall:
-            # Use the most common bottom position (rounded to 10 px) as the
-            # baseline instead of the median: a median can be pulled away by a
-            # couple of non-bar components (e.g. value circles above bars),
-            # which then makes every real bar look off-baseline.
-            bottoms = np.array([b["y"] + b["h"] for b in tall])
-            rounded = np.round(bottoms / 10.0).astype(np.int64)
+    orientation = _classify_bar_orientation(candidates)
+    if orientation == "horizontal":
+        candidates = _keep_horizontal_bars(candidates)
+    elif orientation == "vertical":
+        candidates = _keep_vertical_bars(candidates)
+    for b in candidates:
+        b["orientation"] = orientation
+    return candidates
+
+
+def _classify_bar_orientation(candidates: list[dict[str, Any]]) -> str:
+    """Decide whether candidate components look like vertical or horizontal
+    bars: vertical bars share a bottom baseline; horizontal bars share a left
+    (or right) edge and vary in width."""
+    if len(candidates) < 2:
+        return "vertical"
+    tall = [b for b in candidates if b["h"] >= 25]
+    if len(tall) >= 2:
+        bottoms = np.array([b["y"] + b["h"] for b in tall])
+        if float(np.ptp(bottoms)) <= 30:
+            return "vertical"
+    wide = [b for b in candidates if b["w"] >= 25 and 8 <= b["h"] <= 150]
+    if len(wide) >= 2:
+        for key in ("left", "right"):
+            values = np.array([b["x"] if key == "left" else b["x"] + b["w"] for b in wide])
+            rounded = np.round(values / 10.0).astype(np.int64)
             counts = np.bincount(rounded - rounded.min())
             peak = rounded.min() + int(np.argmax(counts))
-            baseline = float(peak * 10)
-            candidates = [
-                b for b in candidates if abs((b["y"] + b["h"]) - baseline) <= 15
-            ]
+            members = [b for b in wide if abs(round((b["x"] if key == "left" else b["x"] + b["w"]) / 10.0) - peak) <= 2]
+            if len(members) >= 2:
+                widths = np.array([b["w"] for b in members])
+                if float(np.ptp(widths)) >= max(20.0, 0.2 * float(widths.max())):
+                    return "horizontal"
+    return "vertical"
+
+
+def _keep_vertical_bars(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep components sitting on the dominant bottom baseline (vertical bars),
+    dropping value circles / label text / other floating components."""
+    if not candidates:
+        return []
+    tall = [b for b in candidates if b["h"] >= 25]
+    if tall:
+        # Use the most common bottom position (rounded to 10 px) as the
+        # baseline instead of the median: a median can be pulled away by a
+        # couple of non-bar components (e.g. value circles above bars).
+        bottoms = np.array([b["y"] + b["h"] for b in tall])
+        rounded = np.round(bottoms / 10.0).astype(np.int64)
+        counts = np.bincount(rounded - rounded.min())
+        peak = rounded.min() + int(np.argmax(counts))
+        baseline = float(peak * 10)
+        candidates = [
+            b for b in candidates if abs((b["y"] + b["h"]) - baseline) <= 15
+        ]
     candidates.sort(key=lambda b: b["x"])
     return candidates
+
+
+def _keep_horizontal_bars(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep components that form horizontal bars: the majority share a common
+    left (or right) edge and have a similar thickness; sort top-to-bottom."""
+    if not candidates:
+        return []
+    wide = [b for b in candidates if b["w"] >= 25 and 8 <= b["h"] <= 150]
+    if not wide:
+        return []
+    kept = []
+    for key in ("left", "right"):
+        values = np.array([b["x"] if key == "left" else b["x"] + b["w"] for b in wide])
+        rounded = np.round(values / 10.0).astype(np.int64)
+        counts = np.bincount(rounded - rounded.min())
+        peak = rounded.min() + int(np.argmax(counts))
+        members = [b for b in wide if abs(round((b["x"] if key == "left" else b["x"] + b["w"]) / 10.0) - peak) <= 2]
+        if len(members) > len(kept):
+            kept = members
+    if len(kept) < 2:
+        return []
+    # Similar thickness (tolerant: labels may merge with bars, making one bar
+    # noticeably thicker), then drop non-bar fragments that are far shorter
+    # than the longest bar.
+    thickness = np.array([b["h"] for b in kept])
+    med = float(np.median(thickness))
+    kept = [b for b in kept if med * 0.5 <= b["h"] <= med * 2.5]
+    maxw = max((b["w"] for b in kept), default=0)
+    if maxw > 0:
+        kept = [b for b in kept if b["w"] >= max(25.0, 0.12 * maxw)]
+    kept.sort(key=lambda b: b["y"])
+    return kept
 
 
 def _clean_vision_label(part: str) -> str:
@@ -220,12 +292,33 @@ def _normalize_label(text: Any) -> str:
 def _labeled_value_pairs(text: str) -> list[tuple[str, str]]:
     """Extract ``Label: value`` pairs from a vision response."""
     pairs: list[tuple[str, str]] = []
-    for match in re.finditer(r"([A-Za-z][A-Za-z &'\-\.]*?):\s*(-?\d+(?:\.\d+)?\s*%?)", text):
+    for match in re.finditer(r"([A-Za-z][A-Za-z0-9 $&'\-\.\,]*?):\s*(-?\d+(?:\.\d+)?\s*%?)", text):
         label = _clean_vision_label(match.group(1))
         value_match = re.search(r"-?\d+(?:\.\d+)?\s*%?", match.group(2))
         if label and value_match:
             pairs.append((label, value_match.group(0).strip()))
     return pairs
+
+
+def _parse_label_json(text: str) -> list[str]:
+    """Extract a JSON array of label strings (or {"label": ...} objects) from
+    a vision response, tolerating ```json fences and prose."""
+    cleaned = re.sub(r"```(?:json)?", "", text)
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+    except Exception:
+        return []
+    labels: list[str] = []
+    for item in parsed if isinstance(parsed, list) else []:
+        if isinstance(item, str):
+            labels.append(item)
+        elif isinstance(item, dict) and item.get("label"):
+            labels.append(str(item["label"]))
+    return [str(label).strip() for label in labels if str(label).strip()]
 
 
 def match_entities(
@@ -278,14 +371,35 @@ def match_entities(
     return aligned, warnings
 
 
-def read_entity_order(image_path: str | Path, cfg: dict[str, Any] | None = None) -> list[str]:
-    """Ask the vision model for the left-to-right category labels of the bars."""
+def read_entity_order(
+    image_path: str | Path,
+    cfg: dict[str, Any] | None = None,
+    orientation: str = "vertical",
+) -> list[str]:
+    """Ask the vision model for the category labels of the bars, ordered along
+    the categorical axis (left-to-right for vertical bars, top-to-bottom for
+    horizontal bars)."""
+    if orientation == "horizontal":
+        prompt = (
+            "这是横向条形图的一帧。请从上到下依次列出每根条形左侧的类别名称。"
+            '只返回 JSON 数组，格式 [{"label":"类别名"}, ...]，'
+            '类别名必须保持完整（例如 "Less than $20,000"，里面的逗号是数字分隔符，绝不能拆分），不要额外解释。'
+        )
+    else:
+        prompt = (
+            "这是柱状图的一帧。请从左到右依次列出每根柱子底部的类别标签，"
+            "只要名字本身，用逗号分隔，不要额外解释。"
+        )
     text = _call_vision(
         image_path,
-        "这是柱状图的一帧。请从左到右依次列出每根柱子底部的类别标签，只要名字本身，用逗号分隔，不要额外解释。",
+        prompt,
         cfg,
         temperature=0.0,
     )
+    if orientation == "horizontal":
+        json_labels = _parse_label_json(text)
+        if json_labels:
+            return [_clean_vision_label(label) for label in json_labels]
     labels = []
     skip = {"从左到右", "依次为", "第一根", "第二根", "第三根", "第四根", "柱子", "类别", "标签"}
     for part in re.split(r"[,，\n;；、]", text):
@@ -326,6 +440,7 @@ def read_bar_values(
     image_path: str | Path,
     aligned: list[dict[str, Any]],
     cfg: dict[str, Any] | None = None,
+    orientation: str = "vertical",
 ) -> list[dict[str, Any]]:
     """Read each bar's printed value via one full-frame vision call.
 
@@ -334,10 +449,18 @@ def read_bar_values(
     Bars with no value from the full-frame call fall back to a focused crop.
     """
     values: list[str | None] = [None] * len(aligned)
-    value_prompt = (
-        "这是一个柱状图。请按从左到右的顺序，用「标签: 数值」的格式列出每根柱子的"
-        "底部标签和顶部数值，例如 Sub-Saharan Africa: 36.1%。不要解释。"
-    )
+    if orientation == "horizontal":
+        value_prompt = (
+            "这是横向条形图。请找出画面中**实际印刷了数值**的条形，用「标签: 数值」的格式"
+            "列出它们的左侧完整名称和右端数值（例如 Less than $20,000: 890）。"
+            "没有印刷数值的条形**绝对不能写数值、绝对不能编造**，只列有数值的条形即可；"
+            "宁可少报，不要瞎编。不要解释。"
+        )
+    else:
+        value_prompt = (
+            "这是一个柱状图。请按从左到右的顺序，用「标签: 数值」的格式列出每根柱子的"
+            "底部标签和顶部数值，例如 Sub-Saharan Africa: 36.1%。不要解释。"
+        )
     attempts: list[str] = []
     for _ in range(3):
         try:
@@ -361,7 +484,7 @@ def read_bar_values(
                     per_bar[idx].append(value)
                     assigned.add(idx)
                     break
-        if not assigned:
+        if not assigned and orientation != "horizontal":
             tokens = re.findall(r"-?\d+(?:\.\d+)?\s*%?", text)
             percentages = [token for token in tokens if "%" in token]
             sequence = percentages if len(percentages) >= len(aligned) else tokens
@@ -372,7 +495,16 @@ def read_bar_values(
 
     for idx, candidates in enumerate(per_bar):
         if candidates:
-            values[idx] = max(set(candidates), key=candidates.count)
+            majority = max(set(candidates), key=candidates.count)
+            count = candidates.count(majority)
+            # Only trust a value when at least two of three attempts agree;
+            # a value seen once is likely a hallucination (e.g. an unlabeled
+            # bar given a neighbour's number) and should be left for the
+            # scale estimation instead.
+            if len(attempts) >= 2 and count < 2:
+                values[idx] = None
+            else:
+                values[idx] = majority
 
     img = cv2.imread(str(image_path))
     out: list[dict[str, Any]] = []
@@ -402,23 +534,31 @@ def _value_plausibility(item: dict[str, Any], aligned: list[dict[str, Any]]) -> 
     value = item.get("value")
     if value is None:
         return False, "no value"
-    if not (0 <= value <= 100):
-        return False, f"value {value:g} outside plausible 0-100 range"
-    heights = [float(a["h"]) for a in aligned if a["h"] > 0]
+    value_text = str(item.get("value_text") or "")
+    if value < 0:
+        return False, f"value {value:g} is negative"
+    if "%" in value_text and value > 100:
+        return False, f"value {value:g} outside plausible 0-100 range for percentages"
+    if item.get("value_read_verified"):
+        # Directly printed values are trusted over noisy bar-length geometry
+        # (detection can under/over-measure a bar by several percent), so the
+        # ratio check is skipped for them.
+        return True, "ok"
+    lengths = [_bar_length(a) for a in aligned if _bar_length(a) > 0]
     values = [
         float(a["value"])
         for a in aligned
         if isinstance(a.get("value"), (int, float)) and a["value"] > 0
     ]
-    if len(heights) >= 2 and len(values) >= 2:
-        max_h = max(heights)
+    if len(lengths) >= 2 and len(values) >= 2:
+        max_len = max(lengths)
         max_v = max(values)
         value_ratio = value / max_v
-        height_ratio = float(item["h"]) / max_h
+        length_ratio = _bar_length(item) / max_len
         tolerance = 0.15 if value < 5 else 0.12
-        if abs(value_ratio - height_ratio) > tolerance:
+        if abs(value_ratio - length_ratio) > tolerance:
             return False, (
-                f"value ratio {value_ratio:.3f} vs height ratio {height_ratio:.3f} "
+                f"value ratio {value_ratio:.3f} vs bar length ratio {length_ratio:.3f} "
                 "differs beyond tolerance"
             )
     return True, "ok"
@@ -427,10 +567,10 @@ def _value_plausibility(item: dict[str, Any], aligned: list[dict[str, Any]]) -> 
 def _ratio_consistency(aligned: list[dict[str, Any]]) -> tuple[bool, str]:
     if len(aligned) < 2:
         return True, "too few bars to check"
-    heights = [float(a["h"]) for a in aligned]
-    maxh = max(heights)
-    if maxh <= 0:
-        return True, "degenerate bar heights"
+    lengths = [_bar_length(a) for a in aligned]
+    max_len = max(lengths)
+    if max_len <= 0:
+        return True, "degenerate bar lengths"
     values = [
         float(a["value"])
         for a in aligned
@@ -444,13 +584,75 @@ def _ratio_consistency(aligned: list[dict[str, Any]]) -> tuple[bool, str]:
         v = a.get("value")
         if not isinstance(v, (int, float)) or v == 0:
             continue
-        expected = float(a["h"]) / maxh
+        expected = _bar_length(a) / max_len
         val_ratio = float(v) / maxv
         if abs(val_ratio - expected) > 0.12:
-            errors.append(f"{a['label']}: value ratio {val_ratio:.2f} vs height ratio {expected:.2f}")
+            errors.append(f"{a['label']}: value ratio {val_ratio:.2f} vs bar length ratio {expected:.2f}")
     if errors:
         return False, "; ".join(errors)
     return True, "ok"
+
+
+def _bar_length(item: dict[str, Any]) -> float:
+    """The dimension that encodes the value: height for vertical bars, width
+    for horizontal bars."""
+    if str(item.get("orientation")) == "horizontal":
+        return float(item.get("w") or 0.0)
+    return float(item.get("h") or 0.0)
+
+
+def estimate_unlabeled_values(
+    aligned: list[dict[str, Any]],
+    chart_type: str = "bar",
+) -> int:
+    """Estimate values for marks without printed values from the linear scale
+    implied by the marks that do have printed values.
+
+    The general rule: whatever geometric dimension encodes the value (bar
+    length/height, line/point position along the value axis, pie arc angle),
+    a linear calibration over the labeled marks maps that dimension back to
+    values for the unlabeled ones.
+
+    Currently implemented:
+      * bar (vertical and horizontal): value ~ bar length (height or width).
+    Estimated marks are flagged with ``value_estimated`` / ``value_type`` and
+    carry a lower confidence + ``needs_review`` when reconciled.
+    """
+    if chart_type not in ("bar", "combined"):
+        return 0
+    labeled: list[tuple[float, float]] = []
+    for item in aligned:
+        value = item.get("value")
+        length = _bar_length(item)
+        if length > 0 and isinstance(value, (int, float)) and item.get("value_text"):
+            labeled.append((length, float(value)))
+    if len(labeled) < 2:
+        return 0
+    xs = np.array([x for x, _ in labeled], dtype=float)
+    ys = np.array([y for _, y in labeled], dtype=float)
+    try:
+        slope, intercept = np.polyfit(xs, ys, 1)
+    except Exception:
+        return 0
+    if not (np.isfinite(slope) and np.isfinite(intercept)):
+        return 0
+    count = 0
+    for item in aligned:
+        if item.get("value") is not None:
+            continue
+        length = _bar_length(item)
+        if length <= 0:
+            continue
+        est = float(intercept + slope * length)
+        if est < 0 or not np.isfinite(est):
+            est = 0.0
+        item["value"] = est
+        item["value_text"] = f"{est:.0f}"
+        item["value_estimated"] = True
+        item["value_type"] = "estimated"
+        item["plausibility_message"] = "estimated from labeled-bar scale"
+        count += 1
+    return count
 
 
 def _text_width_estimate(text: str, font_size: float) -> float:
@@ -583,50 +785,84 @@ def locate_text_boxes(
         center = (ln["x1"] + ln["x2"]) / 2
         return x - 15 <= center <= x + w + 15
 
+    def _zone_lines(zone: tuple[int, int, int, int]) -> list[dict[str, int]]:
+        zx1, zy1, zx2, zy2 = zone
+        out = []
+        for ln in lines:
+            cx = (ln["x1"] + ln["x2"]) / 2
+            cy = (ln["y1"] + ln["y2"]) / 2
+            if zx1 - 25 <= cx <= zx2 + 25 and zy1 - 25 <= cy <= zy2 + 25:
+                out.append(ln)
+        return out
+
+    def _center_dist(ln: dict[str, int], anchor: tuple[int, int]) -> float:
+        ax, ay = anchor
+        return ((ln["x1"] + ln["x2"]) / 2 - ax) ** 2 + ((ln["y1"] + ln["y2"]) / 2 - ay) ** 2
+
     for item in aligned:
         eid = str(item.get("entity_id") or "")
         x, y, w, hh = item.get("x"), item.get("y"), item.get("w"), item.get("h")
         if not eid or None in (x, y, w, hh):
             continue
         x, y, w, hh = int(x), int(y), int(w), int(hh)
+        orientation = str(item.get("orientation") or ("horizontal" if w > hh else "vertical"))
         boxes = result.setdefault(eid, {})
         baseline = y + hh
-        value_zone_end = y + max(40, min(130, int(hh * 0.6)))
-        value_candidates = [
-            ln
-            for ln in lines
-            if y - 120 <= ln["y2"] <= value_zone_end and _span_hits(ln, x, w)
-        ]
-        label_candidates = [
-            ln
-            for ln in lines
-            if baseline + 2 <= ln["y1"] <= baseline + 100 and _span_hits(ln, x, w)
-        ]
-        if value_candidates:
-            solid = [ln for ln in value_candidates if ln["ratio"] >= 0.08]
-            pool = solid or value_candidates
-            ln = max(pool, key=lambda ln: ln["y2"])
-            box = _tighten_text_line(textmask, ln)
-            boxes["value_box"] = [max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])]
-        if label_candidates:
-            solid = [ln for ln in label_candidates if ln["ratio"] >= 0.08]
-            pool = solid or label_candidates
-            ln = min(pool, key=lambda ln: (ln["y1"], -ln["ratio"]))
-            x1, y1, x2, y2 = ln["x1"], ln["y1"], ln["x2"], ln["y2"]
-            # Multi-line labels: extend the box down over the wrapped second
-            # line(s) of the same label (e.g. "Sub-Saharan" / "Africa").
-            for other in lines:
-                if other is ln or other["y1"] < y1 - 4:
-                    continue
-                if baseline + 2 <= other["y1"] <= y2 + 35:
-                    if other["x2"] >= x - 15 and other["x1"] <= x + w + 15:
-                        x1 = min(x1, other["x1"])
-                        x2 = max(x2, other["x2"])
-                        y2 = max(y2, other["y2"])
-            box = _tighten_text_line(
-                textmask, {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "ratio": 1.0}
-            )
-            boxes["label_box"] = [max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])]
+        if orientation == "horizontal":
+            # Horizontal bars: the value is printed at the right end of the
+            # bar and the category label sits above the bar.
+            value_candidates = _zone_lines((x + w - 140, y - 12, x + w + 180, y + hh + 12))
+            label_candidates = _zone_lines((x - 12, max(0, y - 80), x + w + 12, y - 2))
+            if value_candidates:
+                solid = [ln for ln in value_candidates if ln["ratio"] >= 0.08]
+                pool = solid or value_candidates
+                ln = min(pool, key=lambda ln: _center_dist(ln, (x + w, y + hh // 2)))
+                box = _tighten_text_line(textmask, ln)
+                boxes["value_box"] = [max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])]
+            if label_candidates:
+                solid = [ln for ln in label_candidates if ln["ratio"] >= 0.08]
+                pool = solid or label_candidates
+                ln = max(pool, key=lambda ln: ln["y2"])
+                box = _tighten_text_line(textmask, ln)
+                boxes["label_box"] = [max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])]
+        else:
+            value_zone_end = y + max(40, min(130, int(hh * 0.6)))
+            value_candidates = [
+                ln
+                for ln in lines
+                if y - 120 <= ln["y2"] <= value_zone_end and _span_hits(ln, x, w)
+            ]
+            label_candidates = [
+                ln
+                for ln in lines
+                if baseline + 2 <= ln["y1"] <= baseline + 100 and _span_hits(ln, x, w)
+            ]
+            if value_candidates:
+                solid = [ln for ln in value_candidates if ln["ratio"] >= 0.08]
+                pool = solid or value_candidates
+                ln = max(pool, key=lambda ln: ln["y2"])
+                box = _tighten_text_line(textmask, ln)
+                boxes["value_box"] = [max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])]
+            if label_candidates:
+                solid = [ln for ln in label_candidates if ln["ratio"] >= 0.08]
+                pool = solid or label_candidates
+                ln = min(pool, key=lambda ln: (ln["y1"], -ln["ratio"]))
+                x1, y1, x2, y2 = ln["x1"], ln["y1"], ln["x2"], ln["y2"]
+                # Multi-line labels: extend the box down over the wrapped
+                # second line(s) of the same label (e.g. "Sub-Saharan" /
+                # "Africa").
+                for other in lines:
+                    if other is ln or other["y1"] < y1 - 4:
+                        continue
+                    if baseline + 2 <= other["y1"] <= y2 + 35:
+                        if other["x2"] >= x - 15 and other["x1"] <= x + w + 15:
+                            x1 = min(x1, other["x1"])
+                            x2 = max(x2, other["x2"])
+                            y2 = max(y2, other["y2"])
+                box = _tighten_text_line(
+                    textmask, {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "ratio": 1.0}
+                )
+                boxes["label_box"] = [max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])]
     return result
 
 
@@ -680,37 +916,56 @@ def _render_aligned_svg(
             if boxes.get("label_box")
             else ""
         )
+        orientation = str(a.get("orientation") or ("horizontal" if a["w"] >= a["h"] else "vertical"))
+        anim_prop = "width" if orientation == "horizontal" else "height"
+        anchor = "left" if orientation == "horizontal" else "bottom"
         lines.append(f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(str(a.get("label") or ""))}">')
         lines.append(
             f'<rect id="{eid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{html.escape(value)}" '
             f'x="{a["x"]}" y="{a["y"]}" width="{a["w"]}" height="{a["h"]}" '
-            'data-animation-property="height" data-anchor="bottom" fill="#3cb44b"/>'
+            f'data-animation-property="{anim_prop}" data-anchor="{anchor}" data-orientation="{orientation}" fill="#3cb44b"/>'
         )
         if value:
             vw = max(52.0, _text_width_estimate(value, 20) + 18)
-            vx = a["x"] + a["w"] / 2 - vw / 2
-            vy = max(0, a["y"] - 36)
+            if orientation == "horizontal":
+                vx = a["x"] + a["w"] + 8
+                vy = max(0, a["y"] + a["h"] / 2 - 14)
+                text_anchor = "start"
+                tx = vx + 9
+            else:
+                vx = a["x"] + a["w"] / 2 - vw / 2
+                vy = max(0, a["y"] - 36)
+                text_anchor = "middle"
+                tx = a["x"] + a["w"] / 2
             lines.append(
                 f'<rect id="{eid}-value-box" data-role="value-box" data-entity-id="{eid}" '
                 f'x="{vx:.1f}" y="{vy:.1f}" width="{vw:.1f}" height="28" fill="#ffffff" stroke="#333333" stroke-width="2"{value_box_attr}/>'
             )
             lines.append(
-                f'<text data-role="value-label" x="{a["x"] + a["w"] / 2}" y="{vy + 21}" '
-                f'text-anchor="middle" font-size="20" font-weight="700">{html.escape(value)}</text>'
+                f'<text data-role="value-label" x="{tx:.1f}" y="{vy + 21}" '
+                f'text-anchor="{text_anchor}" font-size="20" font-weight="700">{html.escape(value)}</text>'
             )
         label = str(a.get("label") or "")
         if label:
-            baseline = a["y"] + a["h"]
             lw = max(float(a["w"]), _text_width_estimate(label, 16) + 18)
-            lx = a["x"] + a["w"] / 2 - lw / 2
-            ly = baseline + 8
+            if orientation == "horizontal":
+                lx = a["x"] - 4
+                ly = max(0, a["y"] - 34)
+                text_anchor = "start"
+                tx = lx + 9
+            else:
+                baseline = a["y"] + a["h"]
+                lx = a["x"] + a["w"] / 2 - lw / 2
+                ly = baseline + 8
+                text_anchor = "middle"
+                tx = a["x"] + a["w"] / 2
             lines.append(
                 f'<rect id="{eid}-label-box" data-role="category-box" data-entity-id="{eid}" '
                 f'x="{lx:.1f}" y="{ly:.1f}" width="{lw:.1f}" height="28" fill="#ffffff" stroke="#333333" stroke-width="2"{label_box_attr}/>'
             )
             lines.append(
-                f'<text data-role="category-label" x="{a["x"] + a["w"] / 2}" y="{ly + 21}" '
-                f'text-anchor="middle" font-size="16">{html.escape(label)}</text>'
+                f'<text data-role="category-label" x="{tx:.1f}" y="{ly + 21}" '
+                f'text-anchor="{text_anchor}" font-size="16">{html.escape(label)}</text>'
             )
         lines.append("</g>")
     lines.append("</svg>")
@@ -728,12 +983,13 @@ def run_cv_align(
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
     boxes = detect_bars(image_path)
+    orientation = boxes[0].get("orientation") if boxes else "vertical"
     try:
-        vision_order = read_entity_order(image_path, cfg)
+        vision_order = read_entity_order(image_path, cfg, orientation)
     except Exception:
         vision_order = None
     aligned, warnings = match_entities(boxes, entities, vision_order)
-    values = read_bar_values(image_path, aligned, cfg)
+    values = read_bar_values(image_path, aligned, cfg, orientation)
     for item in values:
         if item.get("value_text"):
             try:
@@ -742,6 +998,19 @@ def run_cv_align(
                 item["value"] = None
         else:
             item["value"] = None
+    # A zero read on a visible bar is almost always a misread of an unlabeled
+    # bar (or an axis tick), not a genuine zero; let the scale estimation
+    # fill it in instead.
+    for item in values:
+        if item.get("value") == 0 and _bar_length(item) > 5 and str(item.get("value_text") or "") not in ("0%", "0 %"):
+            item["value"] = None
+            item["value_text"] = None
+    # Values that survived the majority vote are treated as directly printed
+    # (trusted); the scale estimation fills in whatever is still unlabeled.
+    for item in values:
+        if item.get("value_text"):
+            item["value_read_verified"] = True
+    estimated_count = estimate_unlabeled_values(values)
     for item in values:
         item["value_plausible"], item["plausibility_message"] = _value_plausibility(item, values)
     implausible = [
@@ -773,6 +1042,11 @@ def run_cv_align(
         "clip_id": clip_id,
         "detected_bar_count": len(boxes),
         "matched_count": len(values),
+        "estimated_value_count": estimated_count,
+        "orientation": (
+            (values[0].get("orientation") if values else None)
+            or (boxes[0].get("orientation") if boxes else None)
+        ),
         "warnings": warnings,
         "value_geometry_consistent": consistent,
         "consistency_message": message,
