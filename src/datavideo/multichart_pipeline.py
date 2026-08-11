@@ -169,6 +169,91 @@ def run_asr_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]
     return report
 
 
+def build_dataset_folder(
+    clip_root: str | Path,
+    clip_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble a self-contained ``dataset/`` folder for one clip.
+
+    The folder holds the files that constitute the dataset item (semantic.svg,
+    components svg, final data table, narration, intent, keyframe, aligned
+    overlay) plus a ``manifest.json`` summarising the clip and its review
+    status, so each sample is easy to review and to ship.
+    """
+    import csv
+    import shutil
+
+    clip_root = Path(clip_root)
+    out = ensure_dir(clip_root / "dataset")
+    copies = [
+        ("semantic.svg", "semantic.svg"),
+        ("semantic_components.svg", "semantic_components.svg"),
+        ("final_data_table.csv", "data_table.csv"),
+        ("animation_detection.json", "intent.json"),
+    ]
+    written = {}
+    for src_name, dst_name in copies:
+        src = clip_root / src_name
+        if src.exists() and src.stat().st_size > 0:
+            shutil.copy2(src, out / dst_name)
+            written[dst_name] = str(out / dst_name)
+
+    nar = None
+    processed_dir = (clip_report.get("context") or {}).get("processed_dir")
+    if processed_dir:
+        nar = Path(processed_dir) / "narration" / "selected_full_sentences.jsonl"
+    if nar is None:
+        asr_path = (clip_report.get("asr") or {}).get("path")
+        if asr_path:
+            nar = Path(asr_path).parent / "selected_full_sentences.jsonl"
+    if nar is not None and nar.exists() and nar.stat().st_size > 0:
+        shutil.copy2(nar, out / "narration.jsonl")
+        written["narration.jsonl"] = str(out / "narration.jsonl")
+
+    keyframes = clip_report.get("keyframes") or {}
+    assets = keyframes.get("assets") if isinstance(keyframes.get("assets"), dict) else {}
+    selected = assets.get("selected")
+    if selected and Path(selected).exists():
+        shutil.copy2(Path(selected), out / "keyframe.png")
+        written["keyframe.png"] = str(out / "keyframe.png")
+    overlay = clip_root / "aligned_overlay.png"
+    if overlay.exists():
+        shutil.copy2(overlay, out / "aligned_overlay.png")
+        written["aligned_overlay.png"] = str(out / "aligned_overlay.png")
+
+    values = []
+    table = clip_root / "final_data_table.csv"
+    if table.exists():
+        with table.open("r", encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                values.append(
+                    {
+                        "entity": r.get("entity"),
+                        "value": r.get("value"),
+                        "type": r.get("type"),
+                        "confidence": r.get("confidence"),
+                    }
+                )
+    clip = clip_report.get("clip") or {}
+    manifest = {
+        "clip_id": clip.get("clip_id"),
+        "title": clip.get("raw_video_title"),
+        "chart_type": clip.get("chart_type"),
+        "source_time_range": {
+            "start": clip.get("start_seconds"),
+            "end": clip.get("end_seconds"),
+        },
+        "needs_review": bool(keyframes.get("needs_review")),
+        "boundary_reason": keyframes.get("boundary_reason"),
+        "animation_description": clip.get("animation_description"),
+        "values": values,
+        "files": written,
+    }
+    write_json(out / "manifest.json", manifest)
+    written["manifest.json"] = str(out / "manifest.json")
+    return {"dataset_dir": str(out), "files": written}
+
+
 def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
     processed_root = ensure_dir(cfg.get("processed_root", "data/processed"))
     generated_root = ensure_dir(cfg.get("generated_root", "data/generated"))
@@ -350,6 +435,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             clip_report["asset_status"] = "fresh"
             clip_report["clip"]["visual_clip_path"] = str(visual_clip)
             clip_report["clip"]["visual_clip_source"] = "reference_source"
+            write_json(clip_root / "clip_report.json", clip_report)
+            clip_report["dataset"] = build_dataset_folder(clip_root, clip_report)
             write_json(clip_root / "clip_report.json", clip_report)
             clip_reports.append(clip_report)
             failed_path = clip_root / "clip_report_failed.json"
