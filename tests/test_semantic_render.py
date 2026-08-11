@@ -1,4 +1,6 @@
 from datavideo.semantic_render import (
+    _format_value,
+    _infer_unit,
     _timestamp_evidenced,
     metadata_from_dynamic,
     render_data_driven,
@@ -29,6 +31,38 @@ def test_components_svg_has_value_and_category_boxes(tmp_path):
     assert (tmp_path / "semantic_components_preview.png").exists()
     assert report["semantic_components_svg"] == str(tmp_path / "semantic_components.svg")
     assert report["components_preview_success"] is True
+
+
+def test_format_value_handles_unit_and_currency_prefix():
+    assert _format_value(36.1, "%") == "36.1%"
+    assert _format_value(890, None) == "890"
+    assert _format_value(300, "$") == "$300"
+    assert _format_value(1150, "") == "1150"
+
+
+def test_infer_unit_never_defaults_to_percent():
+    assert _infer_unit([{"unit": "%"}]) == "%"
+    assert _infer_unit([{"unit": None}]) == ""
+    assert _infer_unit([{"unit": None}], visible_text=["$20,000", "890"]) == ""
+    assert _infer_unit([{"unit": None}], visible_text=["48%", "Sub-Saharan Africa"]) == "%"
+    assert _infer_unit([{"unit": "$"}]) == "$"
+
+
+def test_render_dynamic_states_does_not_invent_percent_unit(tmp_path):
+    from datavideo.semantic_render import render_dynamic_states
+
+    dynamic = {
+        "states": [
+            {"entity_id": "a", "entity": "A", "metric": "Score", "value": 890.0, "unit": None, "state_key": "2019", "state_start": 0.0, "source_type": "visual_frame_align"},
+            {"entity_id": "b", "entity": "B", "metric": "Score", "value": 1150.0, "unit": None, "state_key": "2019", "state_start": 0.0, "source_type": "visual_frame_align"},
+        ]
+    }
+    reports = render_dynamic_states("clip_x", dynamic, tmp_path, visible_text=[])
+    assert reports and reports[0]["success"] is True
+    svg = (tmp_path / "semantic_states" / "2019" / "semantic.svg").read_text(encoding="utf-8")
+    assert "890%" not in svg
+    assert "1150%" not in svg
+    assert '>890<' in svg or 'data-value="890"' in svg
 
 
 def test_timestamp_evidenced_requires_visible_year():

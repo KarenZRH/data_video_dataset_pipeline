@@ -139,6 +139,36 @@ def _sanitize_unit(unit: Any, metadata: dict[str, Any]) -> str:
     return ""
 
 
+def _infer_unit(rows: list[dict[str, Any]], visible_text: Any = None) -> str:
+    """Infer the render unit from recovered rows, falling back to visible text.
+
+    The unit must come from the original chart (printed labels/axis), never a
+    hard-coded default: e.g. SAT scores must not render as "890%".
+    """
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        unit = str(row.get("unit") or "").strip()
+        if unit.lower() not in ("", "none", "unknown", "unit"):
+            return unit
+    tokens = [str(token) for token in visible_text] if isinstance(visible_text, list) else []
+    if any("%" in token or "percent" in token.lower() for token in tokens):
+        return "%"
+    return ""
+
+
+def _format_value(value: Any, unit: Any) -> str:
+    """Format a numeric value with its unit; currency uses a "$" prefix."""
+    unit = str(unit or "").strip()
+    try:
+        rendered = f"{float(value):g}"
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if unit == "$":
+        return f"${rendered}"
+    return f"{rendered}{unit}"
+
+
 def _layout(
     entities: list[dict[str, Any]],
     orientation: str = "vertical",
@@ -218,8 +248,8 @@ def _build_components(
                 "id": f"{eid}-value-label",
                 "entity_id": eid,
                 "type": "value_label",
-                "label": f"{e['value']:g}{unit}",
-                "text": f"{e['value']:g}{unit}",
+                "label": _format_value(e["value"], unit),
+                "text": _format_value(e["value"], unit),
                 "text_status": "readable",
                 "bbox_px": value_label_bbox,
                 "dominant_color": _color(i),
@@ -411,7 +441,7 @@ def _build_components_svg(
             f'x="{e["x"]:.1f}" y="{e["y"]:.1f}" width="{e["w"]:.1f}" height="{e["h"]:.1f}" fill="{color}" '
             f'stroke="#d62728" stroke-width="3" data-animation-property="{"width" if horizontal else "height"}" data-anchor="{"left" if horizontal else "bottom"}" data-animation-axis="{"x" if horizontal else "y"}" data-orientation="{orientation}"/>'
         )
-        value_text = f"{e['value']:g}{unit}"
+        value_text = _format_value(e["value"], unit)
         value_w = max(56.0, _estimate_text_width(value_text, 22) + 22)
         value_h = 30.0
         if horizontal:
@@ -494,14 +524,14 @@ def _render_components_preview(
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
             d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
-            d.text((tx - 20, BOTTOM + 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+            d.text((tx - 20, BOTTOM + 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
         else:
             ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
             d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
-            d.text((LEFT - 70, ty - 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+            d.text((LEFT - 70, ty - 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
     for i, e in enumerate(layout):
         d.rectangle([e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"]], fill=_color(i), outline=(214, 39, 40), width=3)
-        value_text = f"{e['value']:g}{unit}"
+        value_text = _format_value(e["value"], unit)
         value_w = max(56.0, d.textlength(value_text, font=font_v) + 22)
         if horizontal:
             value_x = e["x"] + e["w"] + 8
@@ -561,14 +591,14 @@ def _render_preview(
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
             d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
-            d.text((tx - 20, BOTTOM + 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+            d.text((tx - 20, BOTTOM + 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
         else:
             ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
             d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
-            d.text((LEFT - 70, ty - 12), f"{tv:g}{unit}", fill=(80, 80, 80), font=font_a)
+            d.text((LEFT - 70, ty - 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
     for i, e in enumerate(layout):
         d.rectangle([e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"]], fill=_color(i), outline=(0, 0, 0))
-        text = f"{e['value']:g}{unit}"
+        text = _format_value(e["value"], unit)
         if horizontal:
             d.text((e["x"] + e["w"] + 10, e["y"] + e["h"] / 2 - 16), text, fill=(30, 30, 30), font=font_v)
             d.text((e["x"] + 2, e["y"] - 28), e["label"], fill=(50, 50, 50), font=font_l)
@@ -652,7 +682,6 @@ def render_dynamic_states(
     """Render one data-driven SVG per recovered state (state_key)."""
     states = dynamic.get("states") if isinstance(dynamic, dict) else []
     groups: dict[str, list[dict[str, Any]]] = {}
-    unit = "%"
     for row in states if isinstance(states, list) else []:
         if not isinstance(row, dict):
             continue
@@ -662,12 +691,11 @@ def render_dynamic_states(
         value = _to_float(row.get("value"))
         if value is None:
             continue
-        if row.get("unit") not in (None, ""):
-            unit = str(row["unit"])
         key = str(row.get("state_key") or row.get("state_label") or row.get("state_id") or "state")
         groups.setdefault(key, []).append(
             {"id": eid, "label": str(row.get("entity") or eid), "value": value}
         )
+    unit = _infer_unit(states if isinstance(states, list) else [], visible_text)
     reports = []
     state_root = ensure_dir(Path(out_dir) / "semantic_states")
     keep = {
@@ -715,7 +743,6 @@ def metadata_from_dynamic(
     if not isinstance(states, list):
         return None
     groups: dict[str, list[dict[str, Any]]] = {}
-    unit = "%"
     metric = "Value"
     for row in states:
         if not isinstance(row, dict):
@@ -726,8 +753,6 @@ def metadata_from_dynamic(
         value = _to_float(row.get("value"))
         if value is None:
             continue
-        if row.get("unit") not in (None, ""):
-            unit = str(row["unit"])
         if row.get("metric"):
             metric = str(row["metric"])
         key = str(row.get("state_key") or row.get("state_label") or row.get("state_id") or "state")
@@ -737,6 +762,7 @@ def metadata_from_dynamic(
                 "values": [value],
                 "source_type": str(row.get("source_type") or ""),
                 "confidence": _to_float(row.get("confidence")) or 0.0,
+                "unit": row.get("unit"),
             }
         )
     if not groups:
@@ -784,6 +810,7 @@ def metadata_from_dynamic(
     series.sort(key=lambda e: -float(e["values"][0]))
     if not series:
         return None
+    unit = _infer_unit(list(best.values()), visible_text)
     if _slug(metric) in {_slug(r["name"]) for r in best.values()}:
         metric = "Value"
     title = (
