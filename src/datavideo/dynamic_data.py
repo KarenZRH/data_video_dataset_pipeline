@@ -762,7 +762,11 @@ def build_data_change_events(states: list[dict[str, Any]]) -> list[dict[str, Any
     return events
 
 
-def plan_dynamic_state_keyframes(result: dict[str, Any]) -> dict[str, Any]:
+def plan_dynamic_state_keyframes(
+    result: dict[str, Any],
+    *,
+    max_states: int = 8,
+) -> dict[str, Any]:
     states = result.get("states") if isinstance(result.get("states"), list) else []
     if not result.get("include_in_dataset") or not result.get("dynamic_data"):
         return {"should_save": False, "reason": "not_dynamic_recovered_data", "states": []}
@@ -798,10 +802,22 @@ def plan_dynamic_state_keyframes(result: dict[str, Any]) -> dict[str, Any]:
     if _state_signature(first[2]) == _state_signature(last[2]):
         return {"should_save": False, "reason": "no_entity_or_value_change", "states": []}
 
-    planned = [_dynamic_keyframe_row(first), _dynamic_keyframe_row(last)]
+    # Keep every complete evidenced state as a keyframe, capped at max_states.
+    # When capped, always keep the first and last and sample the middle evenly.
+    limit = max(2, int(max_states) if int(max_states) > 0 else 8)
+    if len(complete_groups) > limit:
+        total = len(complete_groups)
+        picks = sorted({round(index * (total - 1) / (limit - 1)) for index in range(limit)})
+        complete_groups = [complete_groups[index] for index in picks]
+    planned = [_dynamic_keyframe_row(group) for group in complete_groups]
     if any(row.get("timestamp") is None and not row.get("source_frame_path") for row in planned):
         return {"should_save": False, "reason": "missing_visual_frame_evidence", "states": []}
-    return {"should_save": True, "reason": "first_last_data_states_changed", "states": planned}
+    return {
+        "should_save": True,
+        "reason": "complete_evidenced_data_states_selected",
+        "selection_rule": "all_complete_evidenced_data_states_as_state_keyframes",
+        "states": planned,
+    }
 
 
 def _dynamic_keyframe_row(group: tuple[float, str, list[dict[str, Any]]]) -> dict[str, Any]:

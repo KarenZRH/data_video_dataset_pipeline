@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -668,11 +669,19 @@ def render_dynamic_states(
             {"id": eid, "label": str(row.get("entity") or eid), "value": value}
         )
     reports = []
+    state_root = ensure_dir(Path(out_dir) / "semantic_states")
+    keep = {
+        re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-") or "state"
+        for key in groups
+    }
+    for child in state_root.iterdir():
+        if child.is_dir() and child.name not in keep:
+            shutil.rmtree(child, ignore_errors=True)
     for key, entities in groups.items():
         if not entities:
             continue
         safe = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-") or "state"
-        sub = ensure_dir(Path(out_dir) / "semantic_states" / safe)
+        sub = ensure_dir(state_root / safe)
         metadata = {
             "title": (
                 f"{clip_id} state {key}"

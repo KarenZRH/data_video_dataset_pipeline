@@ -229,17 +229,17 @@ def _vlm_check_clip(clip_root: Path, cfg: dict[str, Any]) -> list[dict[str, Any]
         return [_issue(clip_id, NEEDS_REVIEW, "qc_vlm_interface_missing", "Quality model client does not implement review_quality", str(clip_root), layer="vlm")]
 
     images = []
-    for rel in [
-        "keyframes/selected.png",
-        "semantic_preview.png",
-        "keyframes/states/state_001_1990.png",
-        "keyframes/states/state_002_2017.png",
-        "semantic_states/state_001_1990/semantic_preview.png",
-        "semantic_states/state_002_2017/semantic_preview.png",
-    ]:
+    for rel in ["keyframes/selected.png", "semantic_preview.png"]:
         path = clip_root / rel
         if path.exists():
             images.append(str(path))
+    for state_dir in sorted((clip_root / "semantic_states").glob("*/")):
+        for rel in ["semantic_preview.png", "vision/semantic_preview.png"]:
+            path = state_dir / rel
+            if path.exists():
+                images.append(str(path))
+    for state_keyframe in sorted((clip_root / "keyframes" / "states").glob("state_*.png")):
+        images.append(str(state_keyframe))
     summaries = {}
     for rel in ["dynamic_data.json", "animation_detection.json", "semantic_scene.json", "semantic_state_svg_manifest.json"]:
         path = clip_root / rel

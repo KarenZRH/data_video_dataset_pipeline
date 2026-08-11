@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -393,7 +394,10 @@ def _write_semantic_state_inputs(
     *,
     force: bool,
 ) -> dict[str, Any]:
-    plan = plan_dynamic_state_keyframes(dynamic)
+    plan = plan_dynamic_state_keyframes(
+        dynamic,
+        max_states=int(cfg.get("dynamic_data", {}).get("max_state_keyframes", 8) or 8),
+    )
     manifest_path = Path(out_dir) / "semantic_state_input_manifest.json"
     state_dir = ensure_dir(Path(out_dir) / "keyframes" / "states")
     if not plan.get("should_save"):
@@ -444,7 +448,7 @@ def _write_semantic_state_inputs(
     manifest = {
         "should_save": True,
         "reason": plan.get("reason"),
-        "selection_rule": "first_last_complete_evidenced_data_states_as_state_keyframes",
+        "selection_rule": "all_complete_evidenced_data_states_as_state_keyframes",
         "semantic_inputs": rows,
     }
     write_json(manifest_path, manifest)
@@ -509,8 +513,9 @@ def build_semantic_state_svgs(
             continue
         state_id = str(item.get("state_id") or f"state_{len(rows) + 1:03d}")
         state_label = str(item.get("state_label") or item.get("state_key") or state_id)
-        safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in state_label).strip("_") or state_id
-        state_out_dir = ensure_dir(out_dir / "semantic_states" / f"{state_id}_{safe_label}")
+        state_key = str(item.get("state_key") or state_label or state_id)
+        safe_key = re.sub(r"[^a-z0-9]+", "-", state_key.lower()).strip("-") or state_id
+        state_out_dir = ensure_dir(out_dir / "semantic_states" / safe_key / "vision")
         parent_metadata = out_dir / "chart_metadata.json"
         if parent_metadata.exists():
             shutil.copy2(parent_metadata, state_out_dir / "chart_metadata.json")

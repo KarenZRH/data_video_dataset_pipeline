@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import csv
+import json
+import re
+import shutil
 from pathlib import Path
 from typing import Any
 
 from datavideo.context import create_context_media
-from .animation import detect_animation
+from .animation import detect_animation, reconcile_intent_with_data
 from datavideo.cv_align import run_cv_align
 from datavideo.cv_reconcile import reconcile_dynamic_data
 from datavideo.metadata import read_clip_rows
@@ -169,34 +173,231 @@ def run_asr_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]
     return report
 
 
+def _as_number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_state_key(key: str) -> str:
+    safe = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")
+    return safe or "state"
+
+
+def _state_groups(dynamic: dict[str, Any] | None) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """Return ordered ``(state_key, state_label, rows)`` groups from dynamic data."""
+    states = dynamic.get("states") if isinstance(dynamic, dict) else []
+    if not isinstance(states, list):
+        return []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: dict[str, float] = {}
+    labels: dict[str, str] = {}
+    for row in states:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("state_key") or row.get("state_label") or row.get("state_id") or "")
+        if not key:
+            continue
+        start = _as_number(row.get("state_start"))
+        groups.setdefault(key, []).append(row)
+        order[key] = min(order.get(key, start if start is not None else 0.0), start if start is not None else 0.0)
+        labels[key] = str(row.get("state_label") or row.get("state_key") or labels.get(key, key))
+    return [
+        (key, labels.get(key, key), groups[key])
+        for key in sorted(groups, key=lambda item: (order[item], item))
+    ]
+
+
+def _find_state_render_dir(
+    clip_root: Path,
+    state_key: str,
+    rows: list[dict[str, Any]],
+) -> Path | None:
+    """Locate the data-driven semantic output dir for one state."""
+    safe = _safe_state_key(state_key)
+    candidates = [clip_root / "semantic_states" / safe]
+    for row in rows:
+        state_id = str(row.get("state_id") or "")
+        if not state_id:
+            continue
+        label = str(row.get("state_label") or state_key)
+        safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in label).strip("_") or state_id
+        candidates.append(clip_root / "semantic_states" / f"{state_id}_{safe_label}")
+        candidates.append(clip_root / "semantic_states" / f"{state_id}_{safe}")
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / "semantic.svg").is_file():
+            return candidate
+    return None
+
+
+def _find_state_keyframe(clip_root: Path, state_key: str) -> Path | None:
+    """Locate the extracted keyframe PNG for one state."""
+    manifest_path = clip_root / "keyframes" / "keyframe_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+        for state in manifest.get("states") or []:
+            if isinstance(state, dict) and str(state.get("state_key") or "") == state_key:
+                asset = state.get("asset")
+                if asset and Path(asset).is_file():
+                    return Path(asset)
+    safe = _safe_state_key(state_key)
+    state_dir = clip_root / "keyframes" / "states"
+    if state_dir.is_dir():
+        matches = sorted(state_dir.glob(f"state_*{safe}*.png"))
+        if matches:
+            return matches[0]
+        matches = sorted(state_dir.glob("state_*.png"))
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _pick_primary_state(
+    clip_report: dict[str, Any],
+    groups: list[tuple[str, str, list[dict[str, Any]]]],
+) -> str | None:
+    """Pick the state that best matches the selected keyframe (CV-verified preferred)."""
+    if not groups:
+        return None
+    keyframes = clip_report.get("keyframes") or {}
+    selected_ts = _as_number((keyframes.get("timestamps") or {}).get("selected"))
+    if selected_ts is not None:
+        best_key: str | None = None
+        best_delta: float | None = None
+        for key, _, rows in groups:
+            for row in rows:
+                start = _as_number(row.get("state_start"))
+                if start is None:
+                    continue
+                delta = abs(start - selected_ts)
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    best_key = key
+        if best_key is not None and best_delta is not None and best_delta <= 1.0:
+            return best_key
+    for key, _, rows in groups:
+        if any(str(row.get("source_type") or "") == "visual_frame_align" for row in rows):
+            return key
+    return groups[-1][0]
+
+
+def _copy_if_exists(src: Path, dst: Path, written: dict[str, str], dst_name: str) -> None:
+    if src.exists() and src.stat().st_size > 0:
+        shutil.copy2(src, dst)
+        written[dst_name] = str(dst)
+
+
+def _write_state_table(
+    clip_root: Path,
+    rows: list[dict[str, Any]],
+    out_path: Path,
+) -> bool:
+    csv_path = clip_root / "dynamic_data.csv"
+    if csv_path.exists():
+        wanted = {
+            str(row.get("state_key") or row.get("state_label") or row.get("state_id"))
+            for row in rows
+        }
+        state_ids = {str(row.get("state_id")) for row in rows if row.get("state_id")}
+        kept = []
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            for record in csv.DictReader(f):
+                if str(record.get("state_key") or record.get("state_label") or record.get("state_id")) in wanted:
+                    kept.append(record)
+                elif state_ids and str(record.get("state_id")) in state_ids:
+                    kept.append(record)
+        if kept:
+            with out_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(kept[0].keys()))
+                writer.writeheader()
+                writer.writerows(kept)
+            return True
+    if not rows:
+        return False
+    fields = [
+        "clip_id",
+        "state_id",
+        "state_key",
+        "state_label",
+        "entity",
+        "entity_id",
+        "metric",
+        "value",
+        "unit",
+        "value_type",
+        "source_type",
+        "confidence",
+        "review_status",
+        "state_start",
+        "state_end",
+    ]
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return True
+
+
 def build_dataset_folder(
     clip_root: str | Path,
     clip_report: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble a self-contained ``dataset/`` folder for one clip.
 
-    The folder holds the files that constitute the dataset item (semantic.svg,
-    components svg, final data table, narration, intent, keyframe, aligned
-    overlay) plus a ``manifest.json`` summarising the clip and its review
-    status, so each sample is easy to review and to ship.
+    For dynamic clips (multiple recovered data states) the folder contains a
+    top-level full dynamic data table + reconciled animation intent, and one
+    ``states/<state_key>/`` subfolder per state with that state's semantic.svg,
+    components svg, keyframe, data rows and a static intent. Static clips keep
+    a single flat sample (semantic.svg + data_table.csv + intent.json).
     """
-    import csv
-    import shutil
-
     clip_root = Path(clip_root)
-    out = ensure_dir(clip_root / "dataset")
-    copies = [
-        ("semantic.svg", "semantic.svg"),
-        ("semantic_components.svg", "semantic_components.svg"),
-        ("final_data_table.csv", "data_table.csv"),
-        ("animation_detection.json", "intent.json"),
+    out = clip_root / "dataset"
+    if out.exists():
+        shutil.rmtree(out)
+    out = ensure_dir(out)
+    written: dict[str, str] = {}
+
+    dynamic = None
+    dynamic_path = clip_root / "dynamic_data.json"
+    if dynamic_path.exists():
+        try:
+            dynamic = json.loads(dynamic_path.read_text(encoding="utf-8"))
+        except Exception:
+            dynamic = None
+    groups = [
+        (key, label, rows)
+        for key, label, rows in _state_groups(dynamic)
+        if any(
+            str(row.get("source_type") or "") in {"visual", "visual_frame_align"}
+            for row in rows
+        )
     ]
-    written = {}
-    for src_name, dst_name in copies:
-        src = clip_root / src_name
-        if src.exists() and src.stat().st_size > 0:
-            shutil.copy2(src, out / dst_name)
-            written[dst_name] = str(out / dst_name)
+    dynamic_packaging = len(groups) >= 2
+
+    intent = None
+    intent_path = clip_root / "animation_detection.json"
+    if intent_path.exists():
+        try:
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        except Exception:
+            intent = None
+    if intent is not None and dynamic is not None:
+        intent = reconcile_intent_with_data(intent, dynamic)
+    if intent is not None:
+        write_json(out / "intent.json", intent)
+        written["intent.json"] = str(out / "intent.json")
+
+    if dynamic_packaging:
+        table_src = clip_root / "dynamic_data.csv"
+        if table_src.exists() and table_src.stat().st_size > 0:
+            shutil.copy2(table_src, out / "data_table.csv")
+            written["data_table.csv"] = str(out / "data_table.csv")
+    if "data_table.csv" not in written:
+        _copy_if_exists(clip_root / "final_data_table.csv", out / "data_table.csv", written, "data_table.csv")
 
     nar = None
     processed_dir = (clip_report.get("context") or {}).get("processed_dir")
@@ -216,42 +417,112 @@ def build_dataset_folder(
     if selected and Path(selected).exists():
         shutil.copy2(Path(selected), out / "keyframe.png")
         written["keyframe.png"] = str(out / "keyframe.png")
-    overlay = clip_root / "aligned_overlay.png"
-    if overlay.exists():
-        shutil.copy2(overlay, out / "aligned_overlay.png")
-        written["aligned_overlay.png"] = str(out / "aligned_overlay.png")
+    _copy_if_exists(clip_root / "aligned_overlay.png", out / "aligned_overlay.png", written, "aligned_overlay.png")
+
+    primary_dir = None
+    if dynamic_packaging:
+        primary_key = _pick_primary_state(clip_report, groups)
+        if primary_key is not None:
+            primary_rows = next((rows for key, _, rows in groups if key == primary_key), [])
+            primary_dir = _find_state_render_dir(clip_root, primary_key, primary_rows)
+    if primary_dir is not None:
+        _copy_if_exists(primary_dir / "semantic.svg", out / "semantic.svg", written, "semantic.svg")
+        _copy_if_exists(primary_dir / "semantic_components.svg", out / "semantic_components.svg", written, "semantic_components.svg")
+    if "semantic.svg" not in written:
+        _copy_if_exists(clip_root / "semantic.svg", out / "semantic.svg", written, "semantic.svg")
+    if "semantic_components.svg" not in written:
+        _copy_if_exists(clip_root / "semantic_components.svg", out / "semantic_components.svg", written, "semantic_components.svg")
+
+    clip = clip_report.get("clip") or {}
+    chart_type = str(clip.get("chart_type") or "")
+    clip_id = str(clip.get("clip_id") or "")
+    state_entries = []
+    if dynamic_packaging:
+        for state_key, state_label, rows in groups:
+            safe = _safe_state_key(state_key)
+            state_out = ensure_dir(out / "states" / safe)
+            state_files: dict[str, str] = {}
+            render_dir = _find_state_render_dir(clip_root, state_key, rows)
+            if render_dir is not None:
+                _copy_if_exists(render_dir / "semantic.svg", state_out / "semantic.svg", state_files, "semantic.svg")
+                _copy_if_exists(render_dir / "semantic_components.svg", state_out / "semantic_components.svg", state_files, "semantic_components.svg")
+                _copy_if_exists(render_dir / "semantic_scene.json", state_out / "semantic_scene.json", state_files, "semantic_scene.json")
+                _copy_if_exists(render_dir / "semantic_components.json", state_out / "semantic_components.json", state_files, "semantic_components.json")
+            keyframe = _find_state_keyframe(clip_root, state_key)
+            if keyframe is not None and keyframe.exists():
+                shutil.copy2(keyframe, state_out / "keyframe.png")
+                state_files["keyframe.png"] = str(state_out / "keyframe.png")
+            if _write_state_table(clip_root, rows, state_out / "data_table.csv"):
+                state_files["data_table.csv"] = str(state_out / "data_table.csv")
+            metric = str(rows[0].get("metric") or "指标") if rows else "指标"
+            static_intent = {
+                "clip_id": clip_id,
+                "state_key": state_key,
+                "state_label": state_label,
+                "chart_type": chart_type,
+                "is_static": True,
+                "static_description": f"渲染{state_label}年的{metric}图表（静态状态快照）。",
+                "source": "static_state_snapshot",
+            }
+            write_json(state_out / "intent.json", static_intent)
+            state_files["intent.json"] = str(state_out / "intent.json")
+            state_entries.append(
+                {
+                    "state_key": state_key,
+                    "state_label": state_label,
+                    "dir": str(state_out),
+                    "entity_count": len(rows),
+                    "files": state_files,
+                }
+            )
 
     values = []
-    table = clip_root / "final_data_table.csv"
-    if table.exists():
-        with table.open("r", encoding="utf-8-sig", newline="") as f:
-            for r in csv.DictReader(f):
-                values.append(
-                    {
-                        "entity": r.get("entity"),
-                        "value": r.get("value"),
-                        "type": r.get("type"),
-                        "confidence": r.get("confidence"),
-                    }
-                )
-    clip = clip_report.get("clip") or {}
+    for _, _, rows in groups:
+        for row in rows:
+            values.append(
+                {
+                    "state_key": row.get("state_key") or row.get("state_label"),
+                    "entity": row.get("entity"),
+                    "value": row.get("value"),
+                    "type": row.get("value_type"),
+                    "confidence": row.get("confidence"),
+                }
+            )
+    if not values:
+        table = clip_root / "final_data_table.csv"
+        if table.exists():
+            with table.open("r", encoding="utf-8-sig", newline="") as f:
+                for record in csv.DictReader(f):
+                    values.append(
+                        {
+                            "state_key": None,
+                            "entity": record.get("entity"),
+                            "value": record.get("value"),
+                            "type": record.get("type"),
+                            "confidence": record.get("confidence"),
+                        }
+                    )
+
     manifest = {
-        "clip_id": clip.get("clip_id"),
+        "clip_id": clip_id,
         "title": clip.get("raw_video_title"),
-        "chart_type": clip.get("chart_type"),
+        "chart_type": chart_type,
         "source_time_range": {
             "start": clip.get("start_seconds"),
             "end": clip.get("end_seconds"),
         },
         "needs_review": bool(keyframes.get("needs_review")),
         "boundary_reason": keyframes.get("boundary_reason"),
-        "animation_description": clip.get("animation_description"),
+        "animation_description": (intent or {}).get("overall_description"),
+        "intent_reconciled_with_data": bool((intent or {}).get("reconciled_with_data")),
+        "data_state_count": len(groups),
+        "states": state_entries,
         "values": values,
         "files": written,
     }
     write_json(out / "manifest.json", manifest)
     written["manifest.json"] = str(out / "manifest.json")
-    return {"dataset_dir": str(out), "files": written}
+    return {"dataset_dir": str(out), "files": written, "state_count": len(groups)}
 
 
 def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
@@ -411,6 +682,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             "state_key": reconciled["state_key"],
                             "state_id": reconciled["state_id"],
                         }
+            animation = reconcile_intent_with_data(animation, dynamic)
+            write_json(clip_root / "animation_detection.json", animation)
             semantic_state_svgs = build_semantic_state_svgs(
                 chart_data.get("semantic_state_inputs"),
                 clip_root,

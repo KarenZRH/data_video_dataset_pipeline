@@ -45,8 +45,12 @@ def _clamp01(value: Any, default: float = 0.0) -> float:
 
 
 def _clip_id_for_out_dir(out_dir: Path) -> str:
-    if out_dir.parent.name == "semantic_states" and out_dir.parent.parent.name:
-        return out_dir.parent.parent.name
+    try:
+        index = out_dir.parts.index("semantic_states")
+    except ValueError:
+        return out_dir.name
+    if index >= 1:
+        return out_dir.parts[index - 1]
     return out_dir.name
 
 

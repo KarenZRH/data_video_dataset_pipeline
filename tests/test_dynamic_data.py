@@ -389,6 +389,62 @@ def test_dynamic_state_keyframes_skip_single_state():
     assert plan["should_save"] is False
 
 
+def test_dynamic_state_keyframes_keep_all_complete_states():
+    result = build_dynamic_records(
+        clip_id="bar_3",
+        visual_data=_visual_data(
+            [
+                {"state": "1990", "year": 1990, "label": "A", "value": "10 %", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
+                {"state": "2000", "year": 2000, "label": "A", "value": "20 %", "unit": "%", "source_frame": "frame_001", "time_seconds": 0.5},
+                {"state": "2010", "year": 2010, "label": "A", "value": "15 %", "unit": "%", "source_frame": "frame_002", "time_seconds": 1.0},
+            ]
+        ),
+        frame_context=_frame_context(),
+        image_paths=["visual_frames/frame_000.jpg", "visual_frames/frame_001.jpg", "visual_frames/frame_002.jpg"],
+        narration_sentences=[],
+        chart_context={},
+    )
+
+    plan = plan_dynamic_state_keyframes(result)
+
+    assert plan["should_save"] is True
+    assert [state["state_id"] for state in plan["states"]] == ["state_001", "state_002", "state_003"]
+
+
+def test_dynamic_state_keyframes_cap_keeps_first_and_last():
+    rows = []
+    frames = []
+    for index in range(12):
+        rows.append(
+            {
+                "state": str(1990 + index),
+                "year": 1990 + index,
+                "label": "A",
+                "value": f"{10 + index} %",
+                "unit": "%",
+                "source_frame": f"frame_{index:03d}",
+                "time_seconds": index * 0.5,
+            }
+        )
+        frames.append({"image_index": index + 1, "source_frame": f"frame_{index:03d}", "time_seconds": index * 0.5})
+    result = build_dynamic_records(
+        clip_id="bar_4",
+        visual_data=_visual_data(rows),
+        frame_context=frames,
+        image_paths=[f"visual_frames/frame_{index:03d}.jpg" for index in range(12)],
+        narration_sentences=[],
+        chart_context={},
+    )
+
+    plan = plan_dynamic_state_keyframes(result, max_states=4)
+
+    assert plan["should_save"] is True
+    keys = [state["state_id"] for state in plan["states"]]
+    assert len(keys) == 4
+    assert keys[0] == "state_001"
+    assert keys[-1] == "state_012"
+
+
 def test_bar_two_start_and_end_years_are_kept_as_dynamic_updates():
     rows = [
         {"state": "1990", "year": 1990, "label": "Sub-Saharan Africa", "value": "48 %", "unit": "%", "source_frame": "frame_000", "time_seconds": 0.0},
