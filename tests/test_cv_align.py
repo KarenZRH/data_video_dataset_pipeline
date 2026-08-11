@@ -18,6 +18,8 @@ from datavideo.cv_align import (
     _value_plausibility,
     detect_axis_tick_marks,
     detect_bars,
+    detect_lines,
+    reconcile_line_dynamic,
     estimate_unlabeled_values,
     estimate_unlabeled_values_from_ticks,
     locate_text_boxes,
@@ -127,6 +129,11 @@ def test_parse_tick_labels():
     labels, unit = _parse_tick_labels('["0%", "50%"]')
     assert unit == "%"
     assert _parse_tick_labels("no array here") == ([], "")
+    # thousand/million suffixes must scale the value (50k -> 50000)
+    labels, unit = _parse_tick_labels('["50k", "100k", "350k"]')
+    assert labels == [50000.0, 100000.0, 350000.0]
+    labels, unit = _parse_tick_labels('["$0", "$500k", "$1m"]')
+    assert labels == [0.0, 500000.0, 1000000.0]
 
 
 def test_infer_baseline_coord_from_bar_geometry():
@@ -172,6 +179,68 @@ def test_labels_match_distinguishes_insured_and_uninsured():
     assert _labels_match("Less than $20,000", "Less than $20,000") is True
     assert _labels_match("United States", "Insured United States") is True
     assert _labels_match("UK", "United Kingdom") is False
+
+
+def _line_frame(tmp_path: Path, *, thick: bool = False, curve: bool = False) -> Path:
+    img = np.full((720, 1280, 3), 25, dtype=np.uint8)  # dark background
+    width = 8 if thick else 3
+    if curve:
+        xs = np.linspace(220, 1060, 200)
+        ys = 420 - 180 * np.sin((xs - 220) / 840 * np.pi * 1.5)
+        for x, y in zip(xs, ys):
+            cv2.circle(img, (int(x), int(y)), width, (255, 255, 255), -1)
+        # fake x-axis ticks
+        for tx in [300, 500, 700, 900]:
+            cv2.line(img, (tx, 650), (tx, 670), (255, 255, 255), 2)
+    else:
+        points = [(220, 560), (430, 300), (640, 480), (850, 220), (1060, 380)]
+        for index in range(len(points) - 1):
+            cv2.line(img, points[index], points[index + 1], (255, 255, 255), width)
+    path = tmp_path / "line.png"
+    cv2.imwrite(str(path), img)
+    return path
+
+
+def test_detect_lines_finds_corners_on_thick_polyline(tmp_path):
+    path = _line_frame(tmp_path, thick=True)
+    lines = detect_lines(path)
+    assert len(lines) == 1
+    xs = [point[0] for point in lines[0]["points"]]
+    assert min(xs) <= 240
+    assert max(xs) >= 1040
+    # thick line still yields the 5 corners
+    assert 4 <= len(lines[0]["points"]) <= 6
+
+
+def test_detect_lines_samples_smooth_curve_at_ticks(tmp_path):
+    path = _line_frame(tmp_path, curve=True)
+    lines = detect_lines(path)
+    assert len(lines) == 1
+    points = lines[0]["points"]
+    assert len(points) >= 3
+    tick_xs = [300, 500, 700, 900]
+    detected_xs = [point[0] for point in points]
+    # curve data points should include positions near the x-axis ticks
+    near_ticks = sum(1 for tick in tick_xs if any(abs(dx - tick) < 40 for dx in detected_xs))
+    assert near_ticks >= 2
+
+
+def test_reconcile_line_dynamic_keeps_all_points():
+    lines = [
+        {
+            "label": "Net additions",
+            "points": [
+                {"x": 182, "y": 442, "value": 133600.0},
+                {"x": 539, "y": 324, "value": 221600.0},
+            ],
+        }
+    ]
+    dynamic = reconcile_line_dynamic(lines, clip_id="line_4", image_path="selected.png", keyframe_timestamp=5.0, unit="")
+    assert dynamic["include_in_dataset"] is True
+    assert len(dynamic["states"]) == 2
+    assert len(dynamic["final_data_table"]) == 2
+    assert all(row["value_type"] == "estimated" and row["needs_review"] for row in dynamic["states"])
+    assert dynamic["states"][1]["value"] == 221600.0
 
 
 def test_detect_bars_rejects_label_text(tmp_path):

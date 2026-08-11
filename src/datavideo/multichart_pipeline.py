@@ -10,8 +10,12 @@ from typing import Any
 from datavideo.context import create_context_media
 from .animation import detect_animation, reconcile_intent_with_data
 from datavideo.cv_align import run_cv_align
+from datavideo.cv_align import run_cv_align_line
+from datavideo.cv_align import reconcile_line_dynamic
 from datavideo.cv_align import read_frame_title
 from datavideo.cv_reconcile import reconcile_dynamic_data
+from datavideo.cv_reconcile import write_dynamic_outputs
+from datavideo.chart_processors import SUPPORTED_PROCESSORS, detect_chart_type
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
 from datavideo.semantic import build_semantic_svg
@@ -20,6 +24,7 @@ from datavideo.semantic_render import (
     metadata_from_dynamic,
     prefer_frame_visible_title,
     render_data_driven,
+    render_data_driven_line,
     render_dynamic_states,
     resolve_render_title,
 )
@@ -36,7 +41,11 @@ from .multichart_qwen import MultichartQwenClient
 
 
 def _clip_id(row: dict[str, Any]) -> str:
-    return str(row.get("output_stem") or f"{row['chart_type']}_{row['chart_index']}")
+    return str(
+        row.get("output_stem")
+        or row.get("clip_id")
+        or f"{row.get('chart_type') or 'chart'}_{row.get('chart_index') or 0}"
+    )
 
 
 def _reference_clip_metadata(row: dict[str, Any]) -> dict[str, Any]:
@@ -590,6 +599,11 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 client=client,
                 force=asset_force,
             )
+            recovered_type = (chart_data.get("metadata") or {}).get("chart_type") or row.get("chart_type")
+            processor, declared_type, type_consistent = detect_chart_type(
+                row.get("chart_type"),
+                recovered_type,
+            )
             state_inputs = chart_data.get("semantic_state_inputs") if isinstance(chart_data, dict) else None
             try:
                 semantic_input = _semantic_input_path(keyframes, state_inputs)
@@ -611,7 +625,59 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 dynamic,
                 clip_root,
             )
-            if _cv_align_enabled(row, cfg):
+            if processor == "line":
+                selected_keyframe = _selected_keyframe_path(keyframes)
+                line_report = run_cv_align_line(
+                    _clip_id(row),
+                    selected_keyframe,
+                    clip_root,
+                    cfg=cfg,
+                )
+                dynamic = reconcile_line_dynamic(
+                    line_report.get("lines") or [],
+                    clip_id=_clip_id(row),
+                    image_path=selected_keyframe,
+                    keyframe_timestamp=_keyframe_timestamp(keyframes),
+                    unit=line_report.get("tick_unit") or "",
+                )
+                original_title = (chart_data.get("metadata") or {}).get("title")
+                visible_text = (chart_data.get("metadata") or {}).get("visible_text") or []
+                resolved_title = prefer_frame_visible_title(
+                    resolve_render_title(original_title, ""),
+                    visible_text,
+                )
+                if frame_title_status(resolved_title, visible_text) == "none" and selected_keyframe is not None:
+                    try:
+                        frame_title = read_frame_title(selected_keyframe, cfg)
+                        if frame_title:
+                            resolved_title = frame_title
+                    except Exception:
+                        pass
+                series_values: dict[str, list[float]] = {}
+                for state_row in dynamic.get("states") or []:
+                    if not isinstance(state_row, dict):
+                        continue
+                    series_values.setdefault(str(state_row.get("entity") or "series"), []).append(
+                        float(state_row.get("value") or 0.0)
+                    )
+                line_metadata = {
+                    "title": resolved_title,
+                    "unit": line_report.get("tick_unit") or "",
+                    "chart_type": "line",
+                    "series": [
+                        {"name": name, "values": values}
+                        for name, values in series_values.items()
+                    ],
+                }
+                semantic = render_data_driven_line(_clip_id(row), line_metadata, clip_root)
+                semantic["cv_align"] = line_report
+                semantic["reconciled"] = {
+                    "line_count": line_report.get("line_count", 0),
+                    "point_count": line_report.get("point_count", 0),
+                }
+                write_dynamic_outputs(clip_root, dynamic)
+                write_json(clip_root / "chart_metadata.json", line_metadata)
+            elif _cv_align_enabled(row, cfg) and processor == "bar":
                 selected_keyframe = _selected_keyframe_path(keyframes)
                 entities: list[dict[str, Any]] = []
                 seen: set[str] = set()
@@ -729,6 +795,9 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 semantic_state_svgs,
                 chart_data,
             )
+            clip_report["chart_processor"] = processor
+            clip_report["chart_type_consistent"] = type_consistent
+            clip_report["unsupported_processor"] = processor not in SUPPORTED_PROCESSORS
             clip_report["visual_boundary_source"] = "web_reference_interval"
             clip_report["deprecated_clip_boundary_review_ignored"] = True
             clip_report["asset_status"] = "fresh"

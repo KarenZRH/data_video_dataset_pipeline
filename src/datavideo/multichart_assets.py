@@ -7,7 +7,7 @@ from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
-from datavideo.cv_align import bar_layout_regularity, detect_axis_tick_marks, detect_bars
+from datavideo.cv_align import bar_layout_regularity, detect_axis_tick_marks, detect_bars, detect_lines
 from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
@@ -24,7 +24,11 @@ from .multichart_qwen import MultichartQwenClient
 
 
 def _clip_id(row: dict[str, Any]) -> str:
-    return str(row.get("output_stem") or f"{row['chart_type']}_{row['chart_index']}")
+    return str(
+        row.get("output_stem")
+        or row.get("clip_id")
+        or f"{row.get('chart_type') or 'chart'}_{row.get('chart_index') or 0}"
+    )
 
 
 def _keyframe_asset(keyframes: dict[str, Any]) -> Path:
@@ -429,7 +433,12 @@ def _write_semantic_state_inputs(
             if source_frame.exists():
                 asset = out_path
                 try:
-                    shutil.copyfile(source_frame, asset)
+                    # The source frame may be a JPEG/other format while the
+                    # semantic pipeline expects a real PNG payload (it
+                    # inspects the file signature, not just the extension).
+                    from PIL import Image
+
+                    Image.open(source_frame).convert("RGB").save(asset, "PNG")
                 except Exception:
                     asset = None
         if asset is None:
@@ -705,6 +714,22 @@ def select_keyframe(
                 + 0.4 * item["cv_bar_count"]
                 + 0.25 * item["cv_tick_count"]
                 - 3.0 * (1.0 - item["bar_regularity"]),
+                4,
+            )
+    # Line/area charts draw the polyline progressively: the more data points
+    # detect_lines finds, the more complete the line, so re-rank candidates
+    # by the CV line point count (same idea as cv_bar_count for bars).
+    if "line" in chart_type or "area" in chart_type or "timeline" in chart_type:
+        for item in scored_rows:
+            try:
+                detected_lines = detect_lines(item["path"])
+                item["line_point_count"] = sum(
+                    len(line.get("points", [])) for line in detected_lines
+                )
+            except Exception:
+                item["line_point_count"] = 0
+            item["combined_score"] = round(
+                item["combined_score"] + 0.3 * item["line_point_count"],
                 4,
             )
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))

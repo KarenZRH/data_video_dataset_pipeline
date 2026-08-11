@@ -744,6 +744,263 @@ def render_data_driven(
     }
 
 
+def render_data_driven_line(
+    clip_id: str,
+    metadata: dict[str, Any],
+    out_dir: str | Path,
+) -> dict[str, Any]:
+    """Line-chart semantic render: one polyline per series + data points.
+
+    ``metadata["series"]`` is a list of ``{"name", "values": [...]}``; values
+    are plotted evenly across the value axis's x-range (the original x-axis
+    ticks/years are preserved separately in ``x_labels`` if provided).
+    """
+    out_dir = ensure_dir(out_dir)
+    series_raw = metadata.get("series") if isinstance(metadata.get("series"), list) else []
+    series_points: list[dict[str, Any]] = []
+    for item in series_raw:
+        if not isinstance(item, dict):
+            continue
+        values = [_to_float(value) for value in (item.get("values") or [])]
+        values = [value for value in values if value is not None]
+        if values:
+            series_points.append({"name": str(item.get("name") or "series"), "values": values})
+    if not series_points:
+        return {
+            "tool": "semantic_render",
+            "generator": "datavideo.semantic_render_v1",
+            "success": False,
+            "failure_reason": "no_series_values",
+            "entity_count": 0,
+        }
+    title = str(metadata.get("title") or "Data Chart").replace("\r", " ").split("\n", 1)[0].strip() or "Data Chart"
+    unit = _sanitize_unit(metadata.get("unit"), metadata)
+    orientation = str(metadata.get("orientation") or "vertical")
+    x_labels = metadata.get("x_labels") if isinstance(metadata.get("x_labels"), list) else []
+    svg_path = out_dir / "semantic.svg"
+    components_svg_path = out_dir / "semantic_components.svg"
+    comp_path = out_dir / "semantic_components.json"
+    scene_path = out_dir / "semantic_scene.json"
+    preview_path = out_dir / "semantic_preview.png"
+    components_preview_path = out_dir / "semantic_components_preview.png"
+    svg_path.write_text(_build_line_svg(series_points, title, unit, x_labels, orientation), encoding="utf-8")
+    components_svg_path.write_text(_build_line_components_svg(series_points, title, unit, x_labels, orientation), encoding="utf-8")
+    point_count = sum(len(series["values"]) for series in series_points)
+    write_json(
+        comp_path,
+        {
+            "clip_id": clip_id,
+            "source_keyframe": "",
+            "annotation_method": "data_driven_line_render_v1",
+            "automation_level": "deterministic",
+            "chart_type": "line",
+            "needs_review": True,
+            "series": [
+                {
+                    "name": series["name"],
+                    "values": series["values"],
+                    "type": "polyline",
+                    "unit": unit,
+                }
+                for series in series_points
+            ],
+        },
+    )
+    write_json(
+        scene_path,
+        {
+            "clip_id": clip_id,
+            "source_keyframe": "",
+            "image_width": W,
+            "image_height": H,
+            "annotation_source": "semantic_components.json",
+            "generator": "datavideo.semantic_render_v1",
+            "contains_data_values": True,
+            "entities": [
+                {
+                    "entity_id": _slug(series["name"]),
+                    "label": series["name"],
+                    "type": "polyline",
+                    "values": series["values"],
+                    "unit": unit,
+                }
+                for series in series_points
+            ],
+            "non_entity_components": [],
+        },
+    )
+    preview_success = _render_line_preview(series_points, title, unit, preview_path)
+    components_preview_success = _render_line_preview(series_points, title, unit, components_preview_path)
+    return {
+        "tool": "semantic_render",
+        "generator": "datavideo.semantic_render_v1",
+        "input": "",
+        "annotation": str(comp_path),
+        "semantic_svg": str(svg_path),
+        "semantic_components_svg": str(components_svg_path),
+        "semantic_scene": str(scene_path),
+        "semantic_preview": str(preview_path),
+        "semantic_components_preview": str(components_preview_path),
+        "success": bool(series_points) and svg_path.exists(),
+        "failure_reason": None,
+        "preview_success": preview_success,
+        "preview_failure_reason": None,
+        "components_preview_success": components_preview_success,
+        "entity_count": len(series_points),
+        "point_count": point_count,
+    }
+
+
+def _line_point_xy(values: list[float], index: int, maxv: float) -> tuple[float, float]:
+    count = len(values)
+    if count > 1:
+        x = LEFT + index / (count - 1) * (RIGHT - LEFT)
+    else:
+        x = LEFT + (RIGHT - LEFT) / 2
+    y = BOTTOM - float(values[index]) / maxv * (BOTTOM - TOP)
+    return x, y
+
+
+def _build_line_svg(
+    series_points: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    x_labels: list[str],
+    orientation: str = "vertical",
+) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
+        f'<rect id="scene-background-fill" data-role="background-fill" x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>',
+        f'<text id="chart-title" data-role="title" x="{W / 2}" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="36" font-weight="700" fill="#222222">{html.escape(title)}</text>',
+        '<g id="chart-plot" data-role="plot">',
+        f'<line data-role="axis" x1="{LEFT}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
+        f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
+    ]
+    maxv = max(max(series["values"]) for series in series_points) or 1.0
+    maxv = maxv * 1.05
+    for tv in _nice_ticks(maxv):
+        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+        lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
+        lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
+    for series_index, series in enumerate(series_points):
+        color = _color(series_index)
+        eid = _slug(series["name"])
+        values = series["values"]
+        points = [_line_point_xy(values, index, maxv) for index in range(len(values))]
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        lines.append(
+            f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(series["name"])}" data-series="true">'
+        )
+        lines.append(
+            f'<polyline id="{eid}-polyline" data-role="polyline" data-entity-id="{eid}" points="{polyline}" '
+            f'fill="none" stroke="{color}" stroke-width="5" data-animation-property="points"/>'
+        )
+        for index, (x, y) in enumerate(points):
+            lines.append(
+                f'<circle id="{eid}-point-{index}" data-role="data-point" data-entity-id="{eid}" data-index="{index}" '
+                f'data-value="{values[index]:g}" cx="{x:.1f}" cy="{y:.1f}" r="8" fill="{color}" stroke="#222222" stroke-width="2"/>'
+            )
+            lines.append(
+                f'<text data-role="value-label" data-entity-id="{eid}" data-index="{index}" x="{x:.1f}" y="{y - 14:.1f}" '
+                f'text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#222222">{html.escape(_format_value(values[index], unit))}</text>'
+            )
+        lines.append("</g>")
+    legend_y = 92
+    for series_index, series in enumerate(series_points):
+        color = _color(series_index)
+        lines.append(
+            f'<line x1="{W / 2 - 120}" y1="{legend_y}" x2="{W / 2 - 40}" y2="{legend_y}" stroke="{color}" stroke-width="5"/>'
+        )
+        lines.append(
+            f'<text x="{W / 2 - 30}" y="{legend_y + 8}" font-family="Arial, sans-serif" font-size="22" fill="#333333">{html.escape(series["name"])}</text>'
+        )
+        legend_y += 32
+    lines.append("</g>")
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
+def _build_line_components_svg(
+    series_points: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    x_labels: list[str],
+    orientation: str = "vertical",
+) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
+        f'<rect id="scene-background-fill" data-role="background-fill" x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>',
+        f'<text id="chart-title" data-role="title" x="{W / 2}" y="67" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#222222">{html.escape(title)}</text>',
+        f'<rect id="chart-title-box" data-role="title-box" x="{W / 2 - 300}" y="32" width="600" height="54" fill="#ffffff" stroke="#333333" stroke-width="2"/>',
+        '<g id="chart-plot" data-role="plot">',
+    ]
+    maxv = max(max(series["values"]) for series in series_points) or 1.0
+    maxv = maxv * 1.05
+    for tv in _nice_ticks(maxv):
+        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+        lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
+        lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
+    for series_index, series in enumerate(series_points):
+        color = _color(series_index)
+        eid = _slug(series["name"])
+        values = series["values"]
+        points = [_line_point_xy(values, index, maxv) for index in range(len(values))]
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        lines.append(f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(series["name"])}">')
+        lines.append(f'<polyline data-role="polyline" data-entity-id="{eid}" points="{polyline}" fill="none" stroke="{color}" stroke-width="5"/>')
+        for index, (x, y) in enumerate(points):
+            lines.append(
+                f'<rect data-role="value-box" data-entity-id="{eid}" data-index="{index}" x="{x - 28:.1f}" y="{y - 32:.1f}" width="56" height="26" fill="#fafafa" stroke="#333333" stroke-width="2"/>'
+            )
+            lines.append(
+                f'<text data-role="value-label" data-entity-id="{eid}" data-index="{index}" x="{x:.1f}" y="{y - 14:.1f}" '
+                f'text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#222222">{html.escape(_format_value(values[index], unit))}</text>'
+            )
+        lines.append("</g>")
+    lines.append("</g>")
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
+def _render_line_preview(
+    series_points: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    out: Path,
+) -> bool:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return False
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        font_t = ImageFont.truetype("arial.ttf", 34)
+        font_v = ImageFont.truetype("arial.ttf", 20)
+    except Exception:
+        font_t = font_v = ImageFont.load_default()
+    draw.text((W / 2 - draw.textlength(title, font=font_t) / 2, 30), title, fill=(30, 30, 30), font=font_t)
+    draw.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
+    draw.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
+    maxv = max(max(series["values"]) for series in series_points) or 1.0
+    maxv = maxv * 1.05
+    for tv in _nice_ticks(maxv):
+        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+        draw.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
+        draw.text((LEFT - 70, ty - 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_v)
+    for series_index, series in enumerate(series_points):
+        color = tuple(int(_color(series_index)[index : index + 2], 16) for index in (1, 3, 5))
+        values = series["values"]
+        points = [_line_point_xy(values, index, maxv) for index in range(len(values))]
+        draw.line(points, fill=color, width=5)
+        for x, y in points:
+            draw.ellipse([x - 8, y - 8, x + 8, y + 8], fill=color, outline=(20, 20, 20), width=2)
+    img.save(out)
+    return out.exists()
+
+
 def render_dynamic_states(
     clip_id: str,
     dynamic: dict[str, Any],
