@@ -2,6 +2,8 @@ from pathlib import Path
 
 from datavideo.dynamic_data import (
     NO_RECOVERABLE_QUANTITATIVE_DATA,
+    _label_embeds_own_value,
+    sanitize_metric,
     visual_records_from_clip_data,
     build_dynamic_records,
     build_data_change_events,
@@ -47,6 +49,39 @@ def test_visual_only_values_are_included():
     assert result["states"][0]["source_type"] == "visual"
     assert result["states"][0]["entity_id"] == "car"
     assert result["states"][0]["value"] == 20.0
+
+
+def test_sanitize_metric_drops_symbol_only_metrics():
+    assert sanitize_metric("$$$") == ""
+    assert sanitize_metric("!!!") == ""
+    assert sanitize_metric("Illiteracy Rate") == "Illiteracy Rate"
+    assert sanitize_metric(None) == ""
+
+
+def test_label_embeds_own_value_detects_title_confusion():
+    assert _label_embeds_own_value("380,000 km: Average Distance to the Moon", 380000.0) is True
+    assert _label_embeds_own_value("Men: 50%", 50.0) is False
+    assert _label_embeds_own_value("Income: $40,000", 40000.0) is False
+    assert _label_embeds_own_value("Sub-Saharan Africa", 48.0) is False
+
+
+def test_visual_rows_with_embedded_label_values_are_dropped():
+    result = build_dynamic_records(
+        clip_id="bar_1",
+        visual_data=_visual_data(
+            [
+                {"label": "380,000 km: Average Distance to the Moon", "value": "380000 km", "unit": "km", "source_frame": "frame_000", "time_seconds": 0.0},
+                {"label": "CAR", "value": "1 km", "unit": "km", "source_frame": "frame_000", "time_seconds": 0.0},
+            ]
+        ),
+        frame_context=_frame_context(),
+        image_paths=["visual_frames/frame_000.jpg"],
+        narration_sentences=[],
+        chart_context={},
+    )
+    entities = {row["entity"] for row in result["states"]}
+    assert "380,000 km: Average Distance to the Moon" not in entities
+    assert "CAR" in entities
 
 
 def test_visual_records_drop_axis_ticks_shared_by_all_entities():

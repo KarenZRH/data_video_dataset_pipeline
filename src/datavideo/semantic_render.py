@@ -27,8 +27,13 @@ def _slug(text: str) -> str:
 
 
 def _to_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace(",", "").replace("$", "").replace("%", "")
+        return float(text) if text else None
     except (TypeError, ValueError):
         return None
 
@@ -124,9 +129,71 @@ def resolve_render_title(original_title: Any, auto_title: Any) -> str:
         return auto
     years_auto = set(re.findall(r"\d{4}", auto))
     years_orig = set(re.findall(r"\d{4}", original))
-    if years_auto and years_orig != years_auto:
+    # Only override the VLM title when the original itself carries a year
+    # that contradicts the state being rendered. An original without any
+    # year (e.g. "Monthly price of Sovaldi, hepatitis C drug") must be kept,
+    # even when the auto title appends the state year ("Price (2017)").
+    if years_orig and years_auto and years_orig != years_auto:
         return auto
     return original
+
+
+def frame_title_status(title: Any, visible_text: Any) -> str:
+    """Classify how well ``title`` matches the frame's visible text.
+
+    Returns one of:
+      * "visible"  - the title (or a heavily overlapping variant) is printed
+                     in the frame;
+      * "candidate" - the title is not in the frame but a longer visible line
+                     looks like the real chart title;
+      * "none"     - neither, so a vision read of the frame is needed.
+    """
+    title_text = str(title or "").strip()
+    if not title_text:
+        return "none"
+    tokens = [str(token) for token in visible_text] if isinstance(visible_text, list) else []
+    title_norm = re.sub(r"[^a-z0-9]+", "", title_text.lower())
+    for token in tokens:
+        if title_norm and title_norm in re.sub(r"[^a-z0-9]+", "", token.lower()):
+            return "visible"
+    candidates = [
+        token for token in tokens
+        if re.search(r"[a-zA-Z]", token) and len(token) > 15
+    ]
+    if not candidates:
+        return "none"
+    title_tokens = set(re.findall(r"[a-z0-9]+", title_text.lower()))
+    if any(
+        len(title_tokens & set(re.findall(r"[a-z0-9]+", candidate.lower())))
+        / max(1, len(title_tokens))
+        >= 0.5
+        for candidate in candidates
+    ):
+        return "visible"
+    return "candidate"
+
+
+def prefer_frame_visible_title(title: Any, visible_text: Any) -> str:
+    """Prefer the real chart title printed in the frame over a VLM title.
+
+    The VLM occasionally reports the *video* title instead of the chart title
+    (e.g. "Why drugs cost more in America" while the frame says "Adults who
+    skipped prescriptions or doses because of cost"). When the resolved title
+    does not appear in the frame text and no visible candidate overlaps it
+    heavily (a partially-truncated version of the same title), the longest
+    visible text line is used instead.
+    """
+    title_text = str(title or "").strip()
+    status = frame_title_status(title_text, visible_text)
+    if status == "candidate":
+        tokens = [str(token) for token in visible_text] if isinstance(visible_text, list) else []
+        candidates = [
+            token for token in tokens
+            if re.search(r"[a-zA-Z]", token) and len(token) > 15
+        ]
+        if candidates:
+            return max(candidates, key=len)
+    return title_text
 
 
 def _sanitize_unit(unit: Any, metadata: dict[str, Any]) -> str:
@@ -339,11 +406,11 @@ def _build_svg(
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
             lines.append(f'<line data-role="tick" x1="{tx:.1f}" y1="{BOTTOM}" x2="{tx:.1f}" y2="{BOTTOM + 8}" stroke="#666666" stroke-width="2"/>')
-            lines.append(f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>')
+            lines.append(f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
         else:
             ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
             lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
-            lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>')
+            lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
     for i, e in enumerate(layout):
         eid = _slug(e["label"])
         color = _color(i)
@@ -361,7 +428,7 @@ def _build_svg(
         category_anchor = "start" if horizontal else "middle"
         lines.append(
             f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
-            f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{e["value"]:g}{html.escape(unit)}</text>'
+            f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{html.escape(_format_value(e["value"], unit))}</text>'
         )
         lines.append(
             f'<text id="{eid}-label" data-role="category-label" data-entity-id="{eid}" '
@@ -412,7 +479,7 @@ def _build_components_svg(
     lines.append(
         f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>'
     )
-    maxv = max(e["value"] for e in layout) or 1.0
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
@@ -519,7 +586,7 @@ def _render_components_preview(
     d.text((W / 2 - d.textlength(title, font=font_t) / 2, 34), title, fill=(34, 34, 34), font=font_t)
     d.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
     d.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
-    maxv = max(e["value"] for e in layout) or 1.0
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
@@ -618,7 +685,11 @@ def render_data_driven(
     entities = entities_from_metadata(metadata)
     orientation = str(metadata.get("orientation") or "vertical")
     layout = _layout(entities, orientation)
-    title = str(metadata.get("title") or "Data Chart")
+    title = str(metadata.get("title") or "Data Chart").replace("\r", " ")
+    # A VLM title may join the main title and the source line with a newline
+    # ("Monthly price of Humira, arthritis drug\nCommonwealth Fund, 2017");
+    # render only the main title line.
+    title = title.split("\n", 1)[0].strip() or "Data Chart"
     unit = _sanitize_unit(metadata.get("unit"), metadata)
     components = _build_components(clip_id, layout, title, unit, orientation)
     svg_path = out_dir / "semantic.svg"
@@ -813,10 +884,23 @@ def metadata_from_dynamic(
     unit = _infer_unit(list(best.values()), visible_text)
     if _slug(metric) in {_slug(r["name"]) for r in best.values()}:
         metric = "Value"
+    metric_text = str(metric or "").strip()
+    # When the VLM metric is a generic placeholder (value/price/cost...) or
+    # missing, fall back to the longest visible text line (the chart title
+    # is usually the longest printed text, e.g. "Retail prescription drug
+    # spending per capita" instead of "value").
+    if not re.search(r"[a-zA-Z]{3,}", metric_text) or metric_text.lower() in {"value", "price", "cost", "amount", "metric"}:
+        tokens = [str(token) for token in visible_text] if isinstance(visible_text, list) else []
+        candidates = [
+            token for token in tokens
+            if re.search(r"[a-zA-Z]", token) and len(token) > 15
+        ]
+        if candidates:
+            metric_text = max(candidates, key=len)
     title = (
-        f"{metric} ({key})"
+        f"{metric_text} ({key})"
         if key != "state" and _timestamp_evidenced(key, visible_text)
-        else metric
+        else metric_text
     )
     return {
         "title": title,

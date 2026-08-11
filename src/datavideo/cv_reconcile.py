@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from .dynamic_data import (
+    _label_embeds_own_value,
     axis_tick_keys,
     build_data_change_events,
     build_final_data_table,
+    sanitize_metric,
     write_dynamic_outputs,
 )
 
@@ -66,6 +68,9 @@ def clean_states(
     """
     if not states:
         return states
+    states = [dict(row) for row in states]
+    for row in states:
+        row["metric"] = sanitize_metric(row.get("metric"))
     aligned_ids = {
         str(b.get("entity_id") or "")
         for b in (aligned_bars or [])
@@ -104,6 +109,10 @@ def clean_states(
             if cur is None or _row_rank(r, aligned_ids) > _row_rank(cur, aligned_ids):
                 best_by_label[label] = r
         rows = list(best_by_label.values())
+
+        # Title/label-value confusion: a label like "380,000 km: Average
+        # Distance to the Moon" embeds its own value before a colon.
+        rows = [r for r in rows if not _label_embeds_own_value(r.get("entity"), r.get("value"))]
 
         # A state that CV alignment verified keeps only the bars that were
         # actually detected in the frame; recovered entities that are not in
@@ -166,12 +175,10 @@ def reconcile_dynamic_data(
     changed (e.g. no bars or no frame-read values)."""
     bars = cv_report.get("bars") or []
     states = [dict(row) for row in (dynamic.get("states") or [])]
-    if not bars or not states:
+    if not bars:
         return None
     ts = _as_float(keyframe_timestamp)
-    template = _nearest_state(states, ts)
-    if template is None:
-        return None
+    template = _nearest_state(states, ts) if states else None
 
     changed = False
     updated_bar_count = 0
@@ -202,16 +209,36 @@ def reconcile_dynamic_data(
             None,
         )
         if row is None:
-            row = dict(template)
-            row.update(
-                {
+            if template is not None:
+                row = dict(template)
+                row.update(
+                    {
+                        "clip_id": clip_id,
+                        "entity_id": eid,
+                        "entity": label,
+                        "state_start": ts if ts is not None else template.get("state_start"),
+                        "state_end": ts if ts is not None else template.get("state_end"),
+                    }
+                )
+            else:
+                # No recovered rows at all (VLM failed): create the initial
+                # state directly from the frame-read bars.
+                row = {
                     "clip_id": clip_id,
+                    "state_id": "state_001",
+                    "state_key": None,
+                    "state_label": None,
                     "entity_id": eid,
                     "entity": label,
-                    "state_start": ts if ts is not None else template.get("state_start"),
-                    "state_end": ts if ts is not None else template.get("state_end"),
+                    "metric": "",
+                    "unit": "",
+                    "state_start": ts,
+                    "state_end": ts,
+                    "source_type": "visual",
+                    "evidence_frames": [],
+                    "confidence": 0.7,
+                    "review_status": "machine",
                 }
-            )
             states.append(row)
         row["value"] = value
         row["value_type"] = str(bar.get("value_type") or "exact")
@@ -223,6 +250,9 @@ def reconcile_dynamic_data(
             row["needs_review"] = True
         row["raw_text"] = value_text
         row["evidence_text"] = value_text or f"{value:g}"
+        tick_unit = str(cv_report.get("tick_unit") or "").strip()
+        if tick_unit and str(row.get("unit") or "").strip().lower() in ("", "none", "unknown", "unit"):
+            row["unit"] = tick_unit
         row["evidence_frames"] = [
             {
                 "frame_id": Path(image_path).stem,
@@ -265,6 +295,6 @@ def reconcile_dynamic_data(
         "updated_bar_count": updated_bar_count,
         "skipped_bar_count": len(skipped_bars),
         "skipped_bars": skipped_bars,
-        "state_id": template.get("state_id"),
-        "state_key": template.get("state_key"),
+        "state_id": template.get("state_id") if template is not None else None,
+        "state_key": template.get("state_key") if template is not None else None,
     }

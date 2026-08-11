@@ -7,7 +7,7 @@ from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
-from datavideo.cv_align import detect_bars
+from datavideo.cv_align import bar_layout_regularity, detect_axis_tick_marks, detect_bars
 from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
@@ -687,10 +687,26 @@ def select_keyframe(
     if "bar" in chart_type or "combined" in chart_type:
         for item in scored_rows:
             try:
-                item["cv_bar_count"] = len(detect_bars(item["path"]))
+                bars = detect_bars(item["path"])
+                item["cv_bar_count"] = len(bars)
+                orientation = bars[0].get("orientation") if bars else "vertical"
+                item["cv_tick_count"] = len(detect_axis_tick_marks(item["path"], orientation))
+                item["bar_regularity"] = bar_layout_regularity(bars)
             except Exception:
                 item["cv_bar_count"] = 0
-            item["combined_score"] = round(item["combined_score"] + 0.4 * item["cv_bar_count"], 4)
+                item["cv_tick_count"] = 0
+                item["bar_regularity"] = 0.0
+            # A frame with more bars is more complete, a frame with the
+            # value-axis tick marks drawn is far more usable for value
+            # estimation, and a regular bar layout excludes cross-fade frames
+            # where two charts are superimposed.
+            item["combined_score"] = round(
+                item["combined_score"]
+                + 0.4 * item["cv_bar_count"]
+                + 0.25 * item["cv_tick_count"]
+                - 3.0 * (1.0 - item["bar_regularity"]),
+                4,
+            )
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))
     keyframe_source_role = "visual_clip"
     boundary_reason = ""
@@ -720,10 +736,21 @@ def select_keyframe(
                 path = scan_dir / f"context_tail_{t:.2f}.png"
                 try:
                     extract_still(context_video, t, path, force=True)
-                    cnt = len(detect_bars(str(path)))
+                    tail_bars = detect_bars(str(path))
+                    cnt = len(tail_bars)
+                    tail_orientation = tail_bars[0].get("orientation") if tail_bars else "vertical"
+                    tick_cnt = len(detect_axis_tick_marks(str(path), tail_orientation))
+                    regularity = bar_layout_regularity(tail_bars)
                 except Exception:
                     cnt = 0
-                if cnt > best_clip_bars:
+                    tick_cnt = 0
+                    regularity = 0.0
+                # The tail frame must be at least as complete as the best clip
+                # frame *and* still carry the axis tick marks; a frame where
+                # the bars have grown but the grid lines already faded out is
+                # not usable for tick-based estimation, and a cross-fade frame
+                # (irregular bar layout) must never be selected.
+                if cnt >= best_clip_bars and tick_cnt >= 2 and regularity >= 0.7:
                     chosen_tail = (t, cnt, str(path))
                 t += 0.3
             if chosen_tail:

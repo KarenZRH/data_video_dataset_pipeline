@@ -6,14 +6,20 @@ import numpy as np
 from datavideo.cv_align import (
     _clean_vision_label,
     _contrast_outline_color,
+    _labels_match,
     _labeled_value_pairs,
+    _parse_tick_labels,
     _parse_label_json,
+    _infer_baseline_coord,
+    bar_layout_regularity,
     _ratio_consistency,
     _render_aligned_svg,
     _render_overlay,
     _value_plausibility,
+    detect_axis_tick_marks,
     detect_bars,
     estimate_unlabeled_values,
+    estimate_unlabeled_values_from_ticks,
     locate_text_boxes,
     match_entities,
 )
@@ -50,6 +56,122 @@ def test_detect_bars_includes_short_bar(tmp_path):
     assert abs(heights[1] - 46) <= 3
     assert abs(heights[2] - 34) <= 3
     assert abs(heights[3] - 6) <= 3
+
+
+def _tick_frame(tmp_path: Path, orientation: str = "vertical") -> Path:
+    img = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    if orientation == "vertical":
+        axis_x = 80
+        cv2.line(img, (axis_x, 60), (axis_x, 660), (0, 0, 0), 3)
+        for y, value in [(660, 0), (540, 100), (420, 200), (300, 300), (180, 400)]:
+            cv2.line(img, (axis_x - 14, y), (axis_x + 14, y), (0, 0, 0), 3)
+            cv2.putText(img, str(value), (20, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        # two bars whose tops sit between ticks: 200-300 range and 100-200 range
+        cv2.rectangle(img, (200, 360), (360, 660), (90, 90, 250), -1)
+        cv2.rectangle(img, (420, 480), (580, 660), (90, 200, 120), -1)
+    else:
+        axis_y = 640
+        cv2.line(img, (80, axis_y), (1200, axis_y), (0, 0, 0), 3)
+        for x, value in [(100, 0), (300, 100), (500, 200), (700, 300)]:
+            cv2.line(img, (x, axis_y - 14), (x, axis_y + 14), (0, 0, 0), 3)
+            cv2.putText(img, str(value), (x - 16, axis_y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        cv2.rectangle(img, (120, 100), (550, 300), (90, 90, 250), -1)
+        cv2.rectangle(img, (650, 380), (900, 560), (90, 200, 120), -1)
+    path = tmp_path / f"ticks_{orientation}.png"
+    cv2.imwrite(str(path), img)
+    return path
+
+
+def test_detect_axis_tick_marks_vertical(tmp_path):
+    marks = detect_axis_tick_marks(_tick_frame(tmp_path, "vertical"), "vertical")
+    coords = sorted(round(m["coord"]) for m in marks)
+    assert len(coords) >= 4
+    assert max(coords) > 600  # bottom tick near the axis end
+    assert min(coords) < 250  # top tick
+
+
+def test_detect_axis_tick_marks_horizontal(tmp_path):
+    marks = detect_axis_tick_marks(_tick_frame(tmp_path, "horizontal"), "horizontal")
+    coords = sorted(round(m["coord"]) for m in marks)
+    assert len(coords) >= 3
+    assert min(coords) < 200
+    assert max(coords) > 500
+
+
+def test_estimate_from_ticks_interpolates_values():
+    aligned = [
+        {"label": "A", "orientation": "vertical", "x": 200, "y": 360, "w": 160, "h": 300, "value": None},
+        {"label": "B", "orientation": "vertical", "x": 420, "y": 480, "w": 160, "h": 180, "value": None},
+    ]
+    ticks = [
+        {"coord": 660, "value": 0},
+        {"coord": 540, "value": 100},
+        {"coord": 420, "value": 200},
+        {"coord": 300, "value": 300},
+        {"coord": 180, "value": 400},
+    ]
+    count = estimate_unlabeled_values_from_ticks(aligned, ticks)
+    assert count == 2
+    assert abs(aligned[0]["value"] - 250.0) < 1e-6
+    assert abs(aligned[1]["value"] - 150.0) < 1e-6
+    assert aligned[0]["value_type"] == "estimated"
+
+
+def test_parse_tick_labels():
+    labels, unit = _parse_tick_labels('["$0", "$100", "$200"]')
+    assert labels == [0.0, 100.0, 200.0]
+    assert unit == "$"
+    labels, unit = _parse_tick_labels('[0, 10, 20, 30]')
+    assert labels == [0.0, 10.0, 20.0, 30.0]
+    assert unit == ""
+    labels, unit = _parse_tick_labels('["0%", "50%"]')
+    assert unit == "%"
+    assert _parse_tick_labels("no array here") == ([], "")
+
+
+def test_infer_baseline_coord_from_bar_geometry():
+    bars = [
+        {"orientation": "vertical", "x": 306, "y": 454, "w": 40, "h": 134},
+        {"orientation": "vertical", "x": 920, "y": 194, "w": 40, "h": 394},
+    ]
+    assert _infer_baseline_coord(bars, "vertical") == 588.0
+    horizontal = [
+        {"orientation": "horizontal", "x": 120, "y": 100, "w": 400, "h": 40},
+        {"orientation": "horizontal", "x": 220, "y": 200, "w": 700, "h": 40},
+    ]
+    assert _infer_baseline_coord(horizontal, "horizontal") == 120.0
+
+
+def test_bar_layout_regularity_flags_cross_fade_frames():
+    clean = [
+        {"orientation": "vertical", "x": 386, "w": 78},
+        {"orientation": "vertical", "x": 500, "w": 78},
+        {"orientation": "vertical", "x": 614, "w": 78},
+        {"orientation": "vertical", "x": 727, "w": 78},
+        {"orientation": "vertical", "x": 841, "w": 78},
+        {"orientation": "vertical", "x": 955, "w": 78},
+    ]
+    cross_fade = [
+        {"orientation": "vertical", "x": 360, "w": 32},
+        {"orientation": "vertical", "x": 464, "w": 48},
+        {"orientation": "vertical", "x": 574, "w": 48},
+        {"orientation": "vertical", "x": 625, "w": 52},
+        {"orientation": "vertical", "x": 720, "w": 58},
+        {"orientation": "vertical", "x": 812, "w": 74},
+        {"orientation": "vertical", "x": 894, "w": 84},
+    ]
+    assert bar_layout_regularity(clean) > 0.9
+    assert bar_layout_regularity(cross_fade) < 0.5
+    assert bar_layout_regularity([]) == 1.0
+
+
+def test_labels_match_distinguishes_insured_and_uninsured():
+    assert _labels_match("Insured United States", "Insured United States") is True
+    assert _labels_match("Uninsured United States", "Insured United States") is False
+    assert _labels_match("Insured United States", "Uninsured United States") is False
+    assert _labels_match("Less than $20,000", "Less than $20,000") is True
+    assert _labels_match("United States", "Insured United States") is True
+    assert _labels_match("UK", "United Kingdom") is False
 
 
 def test_detect_bars_rejects_label_text(tmp_path):

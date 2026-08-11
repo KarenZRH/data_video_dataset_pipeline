@@ -10,12 +10,15 @@ from typing import Any
 from datavideo.context import create_context_media
 from .animation import detect_animation, reconcile_intent_with_data
 from datavideo.cv_align import run_cv_align
+from datavideo.cv_align import read_frame_title
 from datavideo.cv_reconcile import reconcile_dynamic_data
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
 from datavideo.semantic import build_semantic_svg
 from datavideo.semantic_render import (
+    frame_title_status,
     metadata_from_dynamic,
+    prefer_frame_visible_title,
     render_data_driven,
     render_dynamic_states,
     resolve_render_title,
@@ -620,7 +623,13 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                         continue
                     seen.add(eid)
                     entities.append({"id": eid, "label": str(state_row.get("entity") or eid)})
-                if selected_keyframe is not None and entities:
+                # Bar/combined clips may have an empty recovered table when
+                # the VLM failed (OOM / broken JSON) even though the frame
+                # clearly shows a chart with axis tick marks. Run CV alignment
+                # anyway: match_entities creates entities from the frame
+                # labels, and tick estimation can then recover the values.
+                chart_kind = str(row.get("chart_type") or "")
+                if selected_keyframe is not None and (entities or "bar" in chart_kind or "combined" in chart_kind):
                     cv_report = run_cv_align(
                         _clip_id(row),
                         selected_keyframe,
@@ -658,10 +667,27 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                         if corrected_metadata:
                             original_title = (chart_data.get("metadata") or {}).get("title")
                             if original_title:
-                                corrected_metadata["title"] = resolve_render_title(
+                                visible_text = (chart_data.get("metadata") or {}).get("visible_text") or []
+                                resolved = resolve_render_title(
                                     original_title,
                                     corrected_metadata.get("title"),
                                 )
+                                final_title = prefer_frame_visible_title(resolved, visible_text)
+                                # No usable title candidate in the recovered
+                                # visible text (e.g. bar_29, where the VLM
+                                # dropped the title line entirely): ask the
+                                # vision model to read the frame title.
+                                if (
+                                    frame_title_status(final_title, visible_text) == "none"
+                                    and selected_keyframe is not None
+                                ):
+                                    try:
+                                        frame_title = read_frame_title(selected_keyframe, cfg)
+                                        if frame_title:
+                                            final_title = frame_title
+                                    except Exception:
+                                        pass
+                                corrected_metadata["title"] = final_title
                             cv_orientation = (cv_report or {}).get("orientation")
                             if cv_orientation:
                                 corrected_metadata["orientation"] = cv_orientation

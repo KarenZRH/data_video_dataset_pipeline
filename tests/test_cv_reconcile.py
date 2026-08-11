@@ -1,4 +1,4 @@
-from datavideo.cv_reconcile import reconcile_dynamic_data
+from datavideo.cv_reconcile import clean_states, reconcile_dynamic_data
 
 
 def _dynamic():
@@ -262,3 +262,78 @@ def test_reconcile_marks_estimated_values(tmp_path):
     assert by_id["b"]["value_type"] == "estimated"
     assert by_id["b"]["needs_review"] is True
     assert by_id["b"]["confidence"] >= 0.7
+
+
+def test_clean_states_drops_junk_metric_and_embedded_label_values():
+    states = [
+        {
+            "entity_id": "a",
+            "entity": "A",
+            "metric": "$$$",
+            "value": 890.0,
+            "unit": None,
+            "state_key": "2019",
+            "state_start": 0.0,
+            "source_type": "visual",
+        },
+        {
+            "entity_id": "moon",
+            "entity": "380,000 km: Average Distance to the Moon",
+            "metric": "Distance",
+            "value": 380000.0,
+            "unit": "km",
+            "state_key": "2014",
+            "state_start": 0.0,
+            "source_type": "visual",
+        },
+    ]
+    cleaned = clean_states(states, [{"entity_id": "a"}])
+    by_id = {row["entity_id"]: row for row in cleaned}
+    assert by_id["a"]["metric"] == ""
+    assert "moon" not in by_id
+
+
+def test_reconcile_propagates_tick_unit_to_estimated_rows(tmp_path):
+    dynamic = _dynamic()
+    dynamic["states"] = [
+        {
+            "clip_id": "bar_33",
+            "state_id": "state_001",
+            "state_key": "2019",
+            "state_label": "2019",
+            "entity_id": "a",
+            "entity": "A",
+            "metric": "Price",
+            "value": None,
+            "unit": "",
+            "state_start": 0.0,
+            "state_end": 0.0,
+            "source_type": "visual",
+            "evidence_frames": [],
+            "confidence": 0.8,
+            "review_status": "machine",
+        }
+    ]
+    cv_report = {
+        "tick_unit": "$",
+        "bars": [
+            {
+                "entity_id": "a",
+                "label": "A",
+                "value": 300.0,
+                "value_text": "300",
+                "value_estimated": True,
+                "value_type": "estimated",
+            }
+        ],
+    }
+    result = reconcile_dynamic_data(
+        dynamic,
+        cv_report,
+        clip_id="bar_33",
+        keyframe_timestamp=0.0,
+        image_path="keyframes/selected.png",
+        out_dir=tmp_path,
+    )
+    assert result is not None
+    assert result["dynamic"]["states"][0]["unit"] == "$"
