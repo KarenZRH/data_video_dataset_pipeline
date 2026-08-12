@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import re
 import shutil
 from pathlib import Path
@@ -7,7 +8,13 @@ from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
-from datavideo.cv_align import bar_layout_regularity, detect_axis_tick_marks, detect_bars, detect_lines
+from datavideo.cv_align import (
+    _detect_tick_label_blocks,
+    bar_layout_regularity,
+    detect_axis_tick_marks,
+    detect_bars,
+    detect_lines,
+)
 from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
@@ -517,6 +524,10 @@ def build_semantic_state_svgs(
         if not isinstance(item, dict):
             continue
         image_path = Path(item.get("semantic_input") or "")
+        try:
+            image_path = _ensure_png_payload(image_path)
+        except Exception:
+            pass
         if not image_path.exists():
             rows.append({**item, "success": False, "failure_reason": "semantic input image missing"})
             continue
@@ -538,6 +549,25 @@ def build_semantic_state_svgs(
     }
     write_json(manifest_path, manifest)
     return manifest
+
+
+def _ensure_png_payload(path: Path) -> Path:
+    """Repair a .png file whose payload is not PNG (e.g. a JPEG still written
+    to a .png path by an older ffmpeg invocation or a copied source frame).
+
+    The semantic pipeline inspects the file signature (not just the
+    extension), so such files make every downstream step fail with "Not a PNG
+    image". Re-encode them in place with Pillow.
+    """
+    if not path.exists() or path.suffix.lower() != ".png":
+        return path
+    header = path.read_bytes()[:8]
+    if header == b"\x89PNG\r\n\x1a\n":
+        return path
+    from PIL import Image
+
+    Image.open(path).convert("RGB").save(path, "PNG")
+    return path
 
 
 def _source_fps(video: str | Path) -> float | None:
@@ -716,20 +746,50 @@ def select_keyframe(
                 - 3.0 * (1.0 - item["bar_regularity"]),
                 4,
             )
-    # Line/area charts draw the polyline progressively: the more data points
-    # detect_lines finds, the more complete the line, so re-rank candidates
-    # by the CV line point count (same idea as cv_bar_count for bars).
+    # Line/area charts draw both the polylines and the axis ticks
+    # progressively: completeness is the drawing progress (rightmost point
+    # of the slowest line, normalised by frame width) plus how many value
+    # ticks have been drawn (a frame with a complete axis is usable for value
+    # estimation). Point counts and the raw number of detected lines are NOT
+    # used: illustrations / title cards / annotation arrows produce spurious
+    # lines and points, and finished vs near-finished frames often have
+    # identical counts.
     if "line" in chart_type or "area" in chart_type or "timeline" in chart_type:
         for item in scored_rows:
             try:
                 detected_lines = detect_lines(item["path"])
-                item["line_point_count"] = sum(
-                    len(line.get("points", [])) for line in detected_lines
+                frame = cv2.imread(str(item["path"]))
+                frame_w = frame.shape[1] if frame is not None else 1
+                has_value_axis = bool(
+                    frame is not None and len(_detect_tick_label_blocks(frame, "vertical")) >= 2
                 )
+                item["line_point_count"] = (
+                    sum(len(line.get("points", [])) for line in detected_lines)
+                    if has_value_axis
+                    else 0
+                )
+                item["line_progress"] = 0.0
+                item["line_tick_count"] = 0
+                if has_value_axis and detected_lines:
+                    rightmost = [
+                        max(px for px, _ in line.get("points", []))
+                        for line in detected_lines
+                        if line.get("points")
+                    ]
+                    if rightmost:
+                        item["line_progress"] = round(min(rightmost) / frame_w, 4)
+                    try:
+                        item["line_tick_count"] = len(detect_axis_tick_marks(item["path"], "vertical"))
+                    except Exception:
+                        item["line_tick_count"] = 0
             except Exception:
                 item["line_point_count"] = 0
+                item["line_progress"] = 0.0
+                item["line_tick_count"] = 0
             item["combined_score"] = round(
-                item["combined_score"] + 0.3 * item["line_point_count"],
+                item["combined_score"]
+                + 8.0 * item["line_progress"]
+                + 1.5 * item["line_tick_count"],
                 4,
             )
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))

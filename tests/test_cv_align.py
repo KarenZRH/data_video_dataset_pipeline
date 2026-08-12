@@ -11,10 +11,13 @@ from datavideo.cv_align import (
     _parse_tick_labels,
     _parse_label_json,
     _infer_baseline_coord,
+    _assign_x_labels,
     bar_layout_regularity,
     _ratio_consistency,
     _render_aligned_svg,
     _render_overlay,
+    _remove_horizontal_lines,
+    _trace_dp_path,
     _value_plausibility,
     detect_axis_tick_marks,
     detect_bars,
@@ -230,17 +233,70 @@ def test_reconcile_line_dynamic_keeps_all_points():
         {
             "label": "Net additions",
             "points": [
-                {"x": 182, "y": 442, "value": 133600.0},
-                {"x": 539, "y": 324, "value": 221600.0},
+                {"x": 182, "y": 442, "value": 133600.0, "x_label": "2000-01"},
+                {"x": 539, "y": 324, "value": 221600.0, "x_label": "2007-08"},
             ],
         }
     ]
-    dynamic = reconcile_line_dynamic(lines, clip_id="line_4", image_path="selected.png", keyframe_timestamp=5.0, unit="")
+    dynamic = reconcile_line_dynamic(
+        lines,
+        clip_id="line_4",
+        image_path="selected.png",
+        keyframe_timestamp=5.0,
+        unit="",
+        series_label="Net additions",
+    )
     assert dynamic["include_in_dataset"] is True
     assert len(dynamic["states"]) == 2
     assert len(dynamic["final_data_table"]) == 2
     assert all(row["value_type"] == "estimated" and row["needs_review"] for row in dynamic["states"])
     assert dynamic["states"][1]["value"] == 221600.0
+    assert dynamic["states"][0]["state_key"] == "2000-01"
+    assert dynamic["states"][1]["state_key"] == "2007-08"
+    assert dynamic["states"][0]["entity"] == "Net additions"
+    assert dynamic["states"][0]["entity_id"] == "net-additions"
+
+
+def test_assign_x_labels_interpolates_years_and_snaps_categories():
+    points = [{"x": 182}, {"x": 539}, {"x": 637}]
+    _assign_x_labels(points, [182.0, 640.0, 1098.0], ["2000-01", "2010-11", "2018-09"], 182, 1097)
+    assert points[0]["x_label"] == "2000-01"
+    assert points[1]["x_label"] == "2007-08"
+    assert points[2]["x_label"] == "2009-10"
+
+    categorical = [{"x": 100}, {"x": 400}, {"x": 700}]
+    _assign_x_labels(categorical, [], ["Jan", "Feb", "Mar"], 100, 700)
+    assert categorical[0]["x_label"] == "Jan"
+    assert categorical[1]["x_label"] == "Feb"
+    assert categorical[2]["x_label"] == "Mar"
+
+
+def test_remove_horizontal_lines_drops_gridline_rows():
+    skeleton = np.zeros((80, 200), dtype=np.uint8)
+    # polyline: diagonal with small wave
+    for x in range(200):
+        y = 20 + int(8 * np.sin(x / 18.0)) + x // 10
+        skeleton[min(79, y), x] = 255
+    # horizontal gridline remnant spanning almost every column
+    skeleton[55, :] = 255
+    cleaned = _remove_horizontal_lines(skeleton, min_share=0.6)
+    assert cleaned[55].sum() == 0
+    assert cleaned[20:45].sum() > 0
+
+
+def test_trace_dp_path_follows_polyline_with_noise():
+    skeleton = np.zeros((100, 240), dtype=np.uint8)
+    for x in range(240):
+        y = 30 + int(25 * np.sin(x / 30.0)) + 30
+        skeleton[min(99, y), x] = 255
+    # local noise blob (illustration-like) in the upper right, far from the
+    # wave (wave y range is 35..85 there), so the DP must stay on the line
+    skeleton[5:25, 180:215] = 255
+    path = _trace_dp_path(skeleton)
+    assert len(path) >= 200
+    ys = [py for _, py in path]
+    assert min(ys) >= 30
+    assert max(ys) <= 90
 
 
 def test_detect_bars_rejects_label_text(tmp_path):

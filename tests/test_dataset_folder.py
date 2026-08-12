@@ -1,6 +1,12 @@
 import json
 
-from datavideo.multichart_pipeline import build_dataset_folder
+from datavideo.multichart_pipeline import _series_label_from_title, build_dataset_folder
+
+
+def test_series_label_from_title_strips_location_qualifier():
+    assert _series_label_from_title("'Net additions' in England") == "Net additions"
+    assert _series_label_from_title("Productivity") == "Productivity"
+    assert _series_label_from_title("") == ""
 
 
 def _make_clip(tmp_path):

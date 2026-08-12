@@ -92,3 +92,52 @@ def test_reconcile_keeps_report_when_no_shared_entities():
     )
 
     assert reconcile_intent_with_data(animation, dynamic) is animation
+
+
+def test_reconcile_uses_series_name_when_metric_is_placeholder():
+    animation = {
+        "target_chart_type": "line",
+        "overall_description": "changes",
+        "major_actions": [],
+        "confidence": 0.5,
+        "model_status": "qwen",
+    }
+    dynamic = {
+        "states": [
+            {
+                "state_id": "state_001",
+                "state_key": "2001-02",
+                "state_label": "2001-02",
+                "entity_id": "net-additions",
+                "entity": "Net additions",
+                "metric": "",
+                "value": 130303.0,
+                "unit": "",
+                "state_start": 5.0,
+                "source_type": "visual_line_estimate",
+                "confidence": 0.7,
+            },
+            {
+                "state_id": "state_002",
+                "state_key": "2017-18",
+                "state_label": "2017-18",
+                "entity_id": "net-additions",
+                "entity": "Net additions",
+                "metric": "",
+                "value": 240152.0,
+                "unit": "",
+                "state_start": 5.0,
+                "source_type": "visual_line_estimate",
+                "confidence": 0.7,
+            },
+        ]
+    }
+
+    result = reconcile_intent_with_data(animation, dynamic)
+
+    assert result["data_direction"] == "increase"
+    assert "Net additions" in result["overall_description"]
+    assert "上升" in result["overall_description"]
+    description = result["major_actions"][0]["description"]
+    assert "Net additions" in description
+    assert "的指标" not in description

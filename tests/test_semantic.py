@@ -3,6 +3,7 @@ from pathlib import Path
 
 from datavideo.semantic import build_semantic_svg
 from datavideo.semantic_components import build_semantic_components
+from datavideo.multichart_assets import _ensure_png_payload
 
 
 def _write_minimal_png(path: Path) -> None:
@@ -48,6 +49,26 @@ def test_semantic_svg_builds_role_based_scene_graph(tmp_path):
     ns = {"svg": "http://www.w3.org/2000/svg"}
     background = root.find(".//*[@id='source-frame-background']", ns)
     car = root.find(".//*[@id='entity-car']", ns)
+    car_bar = root.find(".//*[@id='car-bar']", ns)
+    assert background is not None
+    assert background.attrib["data-role"] == "background"
+    assert car is not None
+    assert car.attrib["data-role"] == "entity"
+    assert car_bar is not None
+    assert car_bar.attrib["data-role"] == "bar"
+    assert car_bar.attrib["data-animation-property"] == "width"
+    assert car_bar.attrib["data-anchor"] == "left"
+
+
+def test_ensure_png_payload_repairs_jpeg_under_png_name(tmp_path):
+    from PIL import Image
+
+    fake = tmp_path / "state.png"
+    Image.new("RGB", (8, 8), "white").save(fake, "JPEG")
+    assert fake.read_bytes()[:2] == b"\xff\xd8"
+    fixed = _ensure_png_payload(fake)
+    assert fixed == fake
+    assert fixed.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     car_bar = root.find(".//*[@id='car-bar']", ns)
     assert background is not None
     assert background.attrib["data-role"] == "background"
@@ -130,3 +151,14 @@ def test_semantic_components_accept_direct_model_output(tmp_path, monkeypatch):
     assert not (tmp_path / "semantic_candidates.json").exists()
     root = ET.parse(tmp_path / "semantic_components.svg").getroot()
     assert root.find(".//*[@id='car-bar']") is not None
+
+
+def test_ensure_png_payload_repairs_jpeg_under_png_name(tmp_path):
+    from PIL import Image
+
+    fake = tmp_path / "state.png"
+    Image.new("RGB", (8, 8), "white").save(fake, "JPEG")
+    assert fake.read_bytes()[:2] == b"\xff\xd8"
+    fixed = _ensure_png_payload(fake)
+    assert fixed == fake
+    assert fixed.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

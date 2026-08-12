@@ -751,9 +751,10 @@ def render_data_driven_line(
 ) -> dict[str, Any]:
     """Line-chart semantic render: one polyline per series + data points.
 
-    ``metadata["series"]`` is a list of ``{"name", "values": [...]}``; values
-    are plotted evenly across the value axis's x-range (the original x-axis
-    ticks/years are preserved separately in ``x_labels`` if provided).
+    ``metadata["series"]`` is a list of ``{"name", "values": [...],
+    "x_labels": [...]}``; when the per-point x labels are numeric (years,
+    months), points are positioned by their true x value instead of evenly.
+    The bottom axis labels are positioned by the same x range.
     """
     out_dir = ensure_dir(out_dir)
     series_raw = metadata.get("series") if isinstance(metadata.get("series"), list) else []
@@ -761,10 +762,21 @@ def render_data_driven_line(
     for item in series_raw:
         if not isinstance(item, dict):
             continue
-        values = [_to_float(value) for value in (item.get("values") or [])]
-        values = [value for value in values if value is not None]
+        raw_values = item.get("values") or []
+        raw_x_labels = item.get("x_labels") or []
+        values: list[float] = []
+        x_values: list[float | None] = []
+        for index, value in enumerate(raw_values):
+            parsed = _to_float(value)
+            if parsed is None:
+                continue
+            values.append(parsed)
+            label = raw_x_labels[index] if index < len(raw_x_labels) else ""
+            x_values.append(_parse_x_value(label))
         if values:
-            series_points.append({"name": str(item.get("name") or "series"), "values": values})
+            series_points.append(
+                {"name": str(item.get("name") or "series"), "values": values, "x_values": x_values}
+            )
     if not series_points:
         return {
             "tool": "semantic_render",
@@ -777,14 +789,17 @@ def render_data_driven_line(
     unit = _sanitize_unit(metadata.get("unit"), metadata)
     orientation = str(metadata.get("orientation") or "vertical")
     x_labels = metadata.get("x_labels") if isinstance(metadata.get("x_labels"), list) else []
+    x_range = _line_x_range(series_points, x_labels)
     svg_path = out_dir / "semantic.svg"
     components_svg_path = out_dir / "semantic_components.svg"
     comp_path = out_dir / "semantic_components.json"
     scene_path = out_dir / "semantic_scene.json"
     preview_path = out_dir / "semantic_preview.png"
     components_preview_path = out_dir / "semantic_components_preview.png"
-    svg_path.write_text(_build_line_svg(series_points, title, unit, x_labels, orientation), encoding="utf-8")
-    components_svg_path.write_text(_build_line_components_svg(series_points, title, unit, x_labels, orientation), encoding="utf-8")
+    svg_path.write_text(_build_line_svg(series_points, title, unit, x_labels, orientation, x_range), encoding="utf-8")
+    components_svg_path.write_text(
+        _build_line_components_svg(series_points, title, unit, x_labels, orientation, x_range), encoding="utf-8"
+    )
     point_count = sum(len(series["values"]) for series in series_points)
     write_json(
         comp_path,
@@ -829,8 +844,8 @@ def render_data_driven_line(
             "non_entity_components": [],
         },
     )
-    preview_success = _render_line_preview(series_points, title, unit, preview_path)
-    components_preview_success = _render_line_preview(series_points, title, unit, components_preview_path)
+    preview_success = _render_line_preview(series_points, title, unit, x_labels, preview_path, x_range)
+    components_preview_success = _render_line_preview(series_points, title, unit, x_labels, components_preview_path, x_range)
     return {
         "tool": "semantic_render",
         "generator": "datavideo.semantic_render_v1",
@@ -851,8 +866,54 @@ def render_data_driven_line(
     }
 
 
-def _line_point_xy(values: list[float], index: int, maxv: float) -> tuple[float, float]:
+def _parse_x_value(label: Any) -> float | None:
+    """Extract a leading numeric value from an x-axis label (2000-01 -> 2000)."""
+    match = re.search(r"-?\d+(?:\.\d+)?", str(label or ""))
+    return float(match.group(0)) if match else None
+
+
+def _line_x_range(
+    series_points: list[dict[str, Any]],
+    x_labels: list[str],
+) -> tuple[float, float] | None:
+    """Numeric x range shared by data points and bottom labels, or None."""
+    nums: list[float] = []
+    for series in series_points:
+        nums.extend(value for value in series.get("x_values", []) if value is not None)
+    for label in x_labels:
+        value = _parse_x_value(label)
+        if value is not None:
+            nums.append(value)
+    if len(nums) < 2 or max(nums) <= min(nums):
+        return None
+    return (min(nums), max(nums))
+
+
+def _x_label_x(label: Any, x_range: tuple[float, float] | None) -> float | None:
+    if x_range is None:
+        return None
+    value = _parse_x_value(label)
+    if value is None:
+        return None
+    xmin, xmax = x_range
+    return LEFT + (value - xmin) / (xmax - xmin) * (RIGHT - LEFT)
+
+
+def _line_point_xy(
+    values: list[float],
+    index: int,
+    maxv: float,
+    x_range: tuple[float, float] | None = None,
+    x_values: list[float | None] | None = None,
+) -> tuple[float, float]:
     count = len(values)
+    if x_range is not None and x_values is not None and index < len(x_values):
+        xv = x_values[index]
+        if xv is not None:
+            xmin, xmax = x_range
+            x = LEFT + (xv - xmin) / (xmax - xmin) * (RIGHT - LEFT)
+            y = BOTTOM - float(values[index]) / maxv * (BOTTOM - TOP)
+            return x, y
     if count > 1:
         x = LEFT + index / (count - 1) * (RIGHT - LEFT)
     else:
@@ -867,6 +928,7 @@ def _build_line_svg(
     unit: str,
     x_labels: list[str],
     orientation: str = "vertical",
+    x_range: tuple[float, float] | None = None,
 ) -> str:
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -887,7 +949,10 @@ def _build_line_svg(
         color = _color(series_index)
         eid = _slug(series["name"])
         values = series["values"]
-        points = [_line_point_xy(values, index, maxv) for index in range(len(values))]
+        points = [
+            _line_point_xy(values, index, maxv, x_range, series.get("x_values"))
+            for index in range(len(values))
+        ]
         polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
         lines.append(
             f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(series["name"])}" data-series="true">'
@@ -906,6 +971,16 @@ def _build_line_svg(
                 f'text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#222222">{html.escape(_format_value(values[index], unit))}</text>'
             )
         lines.append("</g>")
+    if len(x_labels) >= 2:
+        for index, label in enumerate(x_labels):
+            lx = LEFT + index / (len(x_labels) - 1) * (RIGHT - LEFT)
+            positioned = _x_label_x(label, x_range)
+            if positioned is not None:
+                lx = positioned
+            lines.append(
+                f'<text data-role="x-axis-label" x="{lx:.1f}" y="{BOTTOM + 30}" text-anchor="middle" '
+                f'font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(str(label))}</text>'
+            )
     legend_y = 92
     for series_index, series in enumerate(series_points):
         color = _color(series_index)
@@ -927,6 +1002,7 @@ def _build_line_components_svg(
     unit: str,
     x_labels: list[str],
     orientation: str = "vertical",
+    x_range: tuple[float, float] | None = None,
 ) -> str:
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -946,7 +1022,10 @@ def _build_line_components_svg(
         color = _color(series_index)
         eid = _slug(series["name"])
         values = series["values"]
-        points = [_line_point_xy(values, index, maxv) for index in range(len(values))]
+        points = [
+            _line_point_xy(values, index, maxv, x_range, series.get("x_values"))
+            for index in range(len(values))
+        ]
         polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
         lines.append(f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(series["name"])}">')
         lines.append(f'<polyline data-role="polyline" data-entity-id="{eid}" points="{polyline}" fill="none" stroke="{color}" stroke-width="5"/>')
@@ -959,6 +1038,16 @@ def _build_line_components_svg(
                 f'text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#222222">{html.escape(_format_value(values[index], unit))}</text>'
             )
         lines.append("</g>")
+    if len(x_labels) >= 2:
+        for index, label in enumerate(x_labels):
+            lx = LEFT + index / (len(x_labels) - 1) * (RIGHT - LEFT)
+            positioned = _x_label_x(label, x_range)
+            if positioned is not None:
+                lx = positioned
+            lines.append(
+                f'<text data-role="x-axis-label" x="{lx:.1f}" y="{BOTTOM + 30}" text-anchor="middle" '
+                f'font-family="Arial, sans-serif" font-size="20" fill="#444444">{html.escape(str(label))}</text>'
+            )
     lines.append("</g>")
     lines.append("</svg>")
     return "\n".join(lines) + "\n"
@@ -968,7 +1057,9 @@ def _render_line_preview(
     series_points: list[dict[str, Any]],
     title: str,
     unit: str,
+    x_labels: list[str],
     out: Path,
+    x_range: tuple[float, float] | None = None,
 ) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -993,10 +1084,20 @@ def _render_line_preview(
     for series_index, series in enumerate(series_points):
         color = tuple(int(_color(series_index)[index : index + 2], 16) for index in (1, 3, 5))
         values = series["values"]
-        points = [_line_point_xy(values, index, maxv) for index in range(len(values))]
+        points = [
+            _line_point_xy(values, index, maxv, x_range, series.get("x_values"))
+            for index in range(len(values))
+        ]
         draw.line(points, fill=color, width=5)
         for x, y in points:
             draw.ellipse([x - 8, y - 8, x + 8, y + 8], fill=color, outline=(20, 20, 20), width=2)
+    if len(x_labels) >= 2:
+        for index, label in enumerate(x_labels):
+            lx = LEFT + index / (len(x_labels) - 1) * (RIGHT - LEFT)
+            positioned = _x_label_x(label, x_range)
+            if positioned is not None:
+                lx = positioned
+            draw.text((lx - draw.textlength(str(label), font=font_v) / 2, BOTTOM + 8), str(label), fill=(80, 80, 80), font=font_v)
     img.save(out)
     return out.exists()
 
