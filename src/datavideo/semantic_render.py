@@ -1,9 +1,9 @@
 """Data-driven semantic SVG renderer.
 
-Renders a chart's semantic.svg / semantic_components.json from the recovered
-data table (entities + values) instead of from VLM-predicted bounding boxes.
-Bar geometry is computed deterministically from the values, so coordinates are
-exact by construction.
+Renders chart semantic.svg / semantic_components.json from recovered data
+instead of VLM-predicted bounding boxes. Bar geometry is computed
+deterministically from the values, and line charts are rendered as polylines
+with per-point labels.
 """
 
 from __future__ import annotations
@@ -26,15 +26,36 @@ def _slug(text: str) -> str:
     return slug or "item"
 
 
+def _entity_id(entity: dict[str, Any]) -> str:
+    return _slug(str(entity.get("entity_id") or entity["label"]))
+
+
+def _mark_id(entity: dict[str, Any]) -> str:
+    metric = str(entity.get("metric") or "").strip()
+    base = str(entity.get("entity_id") or entity["label"])
+    return _slug(f"{base}-{metric}" if metric else base)
+
+
 def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
         return None
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace(",", "").replace("$", "").replace("%", "")
+        return float(text) if text else None
+    except (TypeError, ValueError):
+        match = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?", str(value or ""))
+        if not match:
+            return None
+        try:
+            return float(match.group(0).replace(",", ""))
+        except ValueError:
+            return None
 
 
 def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    """Prefer chart_metadata.series; fall back to entities (skip placeholders)."""
+    """Prefer semantic render metadata series; fall back to entities."""
     series = metadata.get("series") if isinstance(metadata.get("series"), list) else []
     if series:
         entities: list[dict[str, Any]] = []
@@ -44,11 +65,18 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
             label = str(item.get("name") or "").strip()
             if not label:
                 continue
+            metric = str(item.get("metric") or "").strip()
+            display_label = f"{label} - {metric}" if metric else label
             values = item.get("values") if isinstance(item.get("values"), list) else []
             value = _to_float(values[0]) if values else None
             if value is None:
                 continue
-            entities.append({"label": label, "value": value})
+            row = {"label": display_label, "value": value}
+            if item.get("entity_id"):
+                row["entity_id"] = str(item["entity_id"])
+            if metric:
+                row["metric"] = metric
+            entities.append(row)
         if entities:
             return entities
 
@@ -63,11 +91,18 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         value = _to_float(item.get("value"))
         if value is None:
             continue
-        key = label.lower()
+        metric = str(item.get("metric") or "").strip()
+        display_label = f"{label} - {metric}" if metric else label
+        key = (label.lower(), metric.lower())
         if key in seen:
             continue
         seen.add(key)
-        entities.append({"label": label, "value": value})
+        row = {"label": display_label, "value": value}
+        if item.get("entity_id"):
+            row["entity_id"] = str(item["entity_id"])
+        if metric:
+            row["metric"] = metric
+        entities.append(row)
     return entities
 
 
@@ -124,9 +159,39 @@ def resolve_render_title(original_title: Any, auto_title: Any) -> str:
         return auto
     years_auto = set(re.findall(r"\d{4}", auto))
     years_orig = set(re.findall(r"\d{4}", original))
-    if years_auto and years_orig != years_auto:
+    if years_orig and years_auto and years_orig != years_auto:
         return auto
     return original
+
+
+def frame_title_status(title: Any, visible_text: Any) -> str:
+    title_text = str(title or "").strip()
+    if not title_text:
+        return "none"
+    tokens = [str(token) for token in visible_text] if isinstance(visible_text, list) else []
+    title_norm = re.sub(r"[^a-z0-9]+", "", title_text.lower())
+    for token in tokens:
+        if title_norm and title_norm in re.sub(r"[^a-z0-9]+", "", token.lower()):
+            return "visible"
+    candidates = [token for token in tokens if re.search(r"[a-zA-Z]", token) and len(token) > 15]
+    if not candidates:
+        return "none"
+    title_tokens = set(re.findall(r"[a-z0-9]+", title_text.lower()))
+    if any(
+        len(title_tokens & set(re.findall(r"[a-z0-9]+", candidate.lower()))) / max(1, len(title_tokens)) >= 0.5
+        for candidate in candidates
+    ):
+        return "visible"
+    return "candidate"
+
+
+def prefer_frame_visible_title(title: Any, visible_text: Any) -> str:
+    title_text = str(title or "").strip()
+    if frame_title_status(title_text, visible_text) != "candidate":
+        return title_text
+    tokens = [str(token) for token in visible_text] if isinstance(visible_text, list) else []
+    candidates = [token for token in tokens if re.search(r"[a-zA-Z]", token) and len(token) > 15]
+    return max(candidates, key=len) if candidates else title_text
 
 
 def _sanitize_unit(unit: Any, metadata: dict[str, Any]) -> str:
@@ -215,11 +280,12 @@ def _build_components(
     groups = []
     horizontal = orientation == "horizontal"
     for i, e in enumerate(layout):
-        eid = _slug(e["label"])
+        eid = _entity_id(e)
+        mid = _mark_id(e)
         x, y, w, hgt = e["x"], e["y"], e["w"], e["h"]
         objects.append(
             {
-                "id": f"{eid}-bar",
+                "id": f"{mid}-bar",
                 "entity_id": eid,
                 "type": "bar",
                 "label": e["label"],
@@ -245,7 +311,7 @@ def _build_components(
         )
         objects.append(
             {
-                "id": f"{eid}-value-label",
+                "id": f"{mid}-value-label",
                 "entity_id": eid,
                 "type": "value_label",
                 "label": _format_value(e["value"], unit),
@@ -261,7 +327,7 @@ def _build_components(
         )
         objects.append(
             {
-                "id": f"{eid}-label",
+                "id": f"{mid}-label",
                 "entity_id": eid,
                 "type": "category_label",
                 "label": e["label"],
@@ -279,7 +345,7 @@ def _build_components(
             {
                 "entity_id": eid,
                 "label": e["label"],
-                "component_ids": [f"{eid}-bar", f"{eid}-value-label", f"{eid}-label"],
+                "component_ids": [f"{mid}-bar", f"{mid}-value-label", f"{mid}-label"],
                 "confidence": 1.0,
             }
         )
@@ -306,7 +372,7 @@ def _build_components(
         "image_height": H,
         "annotation_method": "data_driven_semantic_render_v1",
         "automation_level": "deterministic",
-        "uses_chart_metadata": True,
+        "uses_render_metadata": True,
         "metadata_title": title,
         "metadata_chart_type": "bar",
         "chart_type": "vertical_bar",
@@ -316,6 +382,364 @@ def _build_components(
         "reconciliation_actions": [],
         "warnings": [],
     }
+
+
+def render_data_driven_line(
+    clip_id: str,
+    metadata: dict[str, Any],
+    out_dir: str | Path,
+) -> dict[str, Any]:
+    """Line-chart semantic render: one polyline per series + data points.
+
+    ``metadata["series"]`` is a list of ``{"name", "values": [...],
+    "x_labels": [...]}``; when the per-point x labels are numeric (years,
+    months), points are positioned by their true x value instead of evenly.
+    The bottom axis labels are positioned by the same x range.
+    """
+    out_dir = ensure_dir(out_dir)
+    series_raw = metadata.get("series") if isinstance(metadata.get("series"), list) else []
+    series_points: list[dict[str, Any]] = []
+    for item in series_raw:
+        if not isinstance(item, dict):
+            continue
+        raw_values = item.get("values") or []
+        raw_x_labels = item.get("x_labels") or []
+        values: list[float] = []
+        x_values: list[float | None] = []
+        for index, value in enumerate(raw_values):
+            parsed = _to_float(value)
+            if parsed is None:
+                continue
+            values.append(parsed)
+            label = raw_x_labels[index] if index < len(raw_x_labels) else ""
+            x_values.append(_parse_x_value(label))
+        if values:
+            series_points.append(
+                {"name": str(item.get("name") or "series"), "values": values, "x_values": x_values}
+            )
+    if not series_points:
+        return {
+            "tool": "semantic_render",
+            "generator": "datavideo.semantic_render_v1",
+            "success": False,
+            "failure_reason": "no_series_values",
+            "entity_count": 0,
+        }
+    title = str(metadata.get("title") or "Data Chart").replace("\r", " ").split("\n", 1)[0].strip() or "Data Chart"
+    unit = _sanitize_unit(metadata.get("unit"), metadata)
+    orientation = str(metadata.get("orientation") or "vertical")
+    x_labels = metadata.get("x_labels") if isinstance(metadata.get("x_labels"), list) else []
+    x_range = _line_x_range(series_points, x_labels)
+    svg_path = out_dir / "semantic.svg"
+    components_svg_path = out_dir / "semantic_components.svg"
+    comp_path = out_dir / "semantic_components.json"
+    scene_path = out_dir / "semantic_scene.json"
+    preview_path = out_dir / "semantic_preview.png"
+    components_preview_path = out_dir / "semantic_components_preview.png"
+    svg_path.write_text(_build_line_svg(series_points, title, unit, x_labels, orientation, x_range), encoding="utf-8")
+    components_svg_path.write_text(
+        _build_line_components_svg(series_points, title, unit, x_labels, orientation, x_range), encoding="utf-8"
+    )
+    point_count = sum(len(series["values"]) for series in series_points)
+    write_json(
+        comp_path,
+        {
+            "clip_id": clip_id,
+            "source_keyframe": "",
+            "annotation_method": "data_driven_line_render_v1",
+            "automation_level": "deterministic",
+            "chart_type": "line",
+            "needs_review": True,
+            "series": [
+                {
+                    "name": series["name"],
+                    "values": series["values"],
+                    "type": "polyline",
+                    "unit": unit,
+                }
+                for series in series_points
+            ],
+        },
+    )
+    write_json(
+        scene_path,
+        {
+            "clip_id": clip_id,
+            "source_keyframe": "",
+            "image_width": W,
+            "image_height": H,
+            "annotation_source": "semantic_components.json",
+            "generator": "datavideo.semantic_render_v1",
+            "contains_data_values": True,
+            "entities": [
+                {
+                    "entity_id": _slug(series["name"]),
+                    "label": series["name"],
+                    "type": "polyline",
+                    "values": series["values"],
+                    "unit": unit,
+                }
+                for series in series_points
+            ],
+            "non_entity_components": [],
+        },
+    )
+    preview_success = _render_line_preview(series_points, title, unit, x_labels, preview_path, x_range)
+    components_preview_success = _render_line_preview(series_points, title, unit, x_labels, components_preview_path, x_range)
+    return {
+        "tool": "semantic_render",
+        "generator": "datavideo.semantic_render_v1",
+        "input": "",
+        "annotation": str(comp_path),
+        "semantic_svg": str(svg_path),
+        "semantic_components_svg": str(components_svg_path),
+        "semantic_scene": str(scene_path),
+        "semantic_preview": str(preview_path),
+        "semantic_components_preview": str(components_preview_path),
+        "success": bool(series_points) and svg_path.exists(),
+        "failure_reason": None,
+        "preview_success": preview_success,
+        "preview_failure_reason": None,
+        "components_preview_success": components_preview_success,
+        "entity_count": len(series_points),
+        "point_count": point_count,
+    }
+
+
+def _parse_x_value(label: Any) -> float | None:
+    """Extract a leading numeric value from an x-axis label (2000-01 -> 2000)."""
+    match = re.search(r"-?\d+(?:\.\d+)?", str(label or ""))
+    return float(match.group(0)) if match else None
+
+
+def _line_x_range(
+    series_points: list[dict[str, Any]],
+    x_labels: list[str],
+) -> tuple[float, float] | None:
+    """Numeric x range shared by data points and bottom labels, or None."""
+    nums: list[float] = []
+    for series in series_points:
+        nums.extend(value for value in series.get("x_values", []) if value is not None)
+    for label in x_labels:
+        value = _parse_x_value(label)
+        if value is not None:
+            nums.append(value)
+    if len(nums) < 2 or max(nums) <= min(nums):
+        return None
+    return (min(nums), max(nums))
+
+
+def _x_label_x(label: Any, x_range: tuple[float, float] | None) -> float | None:
+    if x_range is None:
+        return None
+    value = _parse_x_value(label)
+    if value is None:
+        return None
+    xmin, xmax = x_range
+    return LEFT + (value - xmin) / (xmax - xmin) * (RIGHT - LEFT)
+
+
+def _line_point_xy(
+    values: list[float],
+    index: int,
+    maxv: float,
+    x_range: tuple[float, float] | None = None,
+    x_values: list[float | None] | None = None,
+) -> tuple[float, float]:
+    count = len(values)
+    if x_range is not None and x_values is not None and index < len(x_values):
+        xv = x_values[index]
+        if xv is not None:
+            xmin, xmax = x_range
+            x = LEFT + (xv - xmin) / (xmax - xmin) * (RIGHT - LEFT)
+            y = BOTTOM - float(values[index]) / maxv * (BOTTOM - TOP)
+            return x, y
+    if count > 1:
+        x = LEFT + index / (count - 1) * (RIGHT - LEFT)
+    else:
+        x = LEFT + (RIGHT - LEFT) / 2
+    y = BOTTOM - float(values[index]) / maxv * (BOTTOM - TOP)
+    return x, y
+
+
+def _build_line_svg(
+    series_points: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    x_labels: list[str],
+    orientation: str = "vertical",
+    x_range: tuple[float, float] | None = None,
+) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
+        f'<rect id="scene-background-fill" data-role="background-fill" x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>',
+        f'<text id="chart-title" data-role="title" x="{W / 2}" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="36" font-weight="700" fill="#222222">{html.escape(title)}</text>',
+        '<g id="chart-plot" data-role="plot">',
+        f'<line data-role="axis" x1="{LEFT}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
+        f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
+    ]
+    maxv = max(max(series["values"]) for series in series_points) or 1.0
+    maxv = maxv * 1.05
+    for tv in _nice_ticks(maxv):
+        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+        lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
+        lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
+    for series_index, series in enumerate(series_points):
+        color = _color(series_index)
+        eid = _slug(series["name"])
+        values = series["values"]
+        points = [
+            _line_point_xy(values, index, maxv, x_range, series.get("x_values"))
+            for index in range(len(values))
+        ]
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        lines.append(
+            f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(series["name"])}" data-series="true">'
+        )
+        lines.append(
+            f'<polyline id="{eid}-polyline" data-role="polyline" data-entity-id="{eid}" points="{polyline}" '
+            f'fill="none" stroke="{color}" stroke-width="5" data-animation-property="points"/>'
+        )
+        for index, (x, y) in enumerate(points):
+            lines.append(
+                f'<circle id="{eid}-point-{index}" data-role="data-point" data-entity-id="{eid}" data-index="{index}" '
+                f'data-value="{values[index]:g}" cx="{x:.1f}" cy="{y:.1f}" r="8" fill="{color}" stroke="#222222" stroke-width="2"/>'
+            )
+            lines.append(
+                f'<text data-role="value-label" data-entity-id="{eid}" data-index="{index}" x="{x:.1f}" y="{y - 14:.1f}" '
+                f'text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#222222">{html.escape(_format_value(values[index], unit))}</text>'
+            )
+        lines.append("</g>")
+    if len(x_labels) >= 2:
+        for index, label in enumerate(x_labels):
+            lx = LEFT + index / (len(x_labels) - 1) * (RIGHT - LEFT)
+            positioned = _x_label_x(label, x_range)
+            if positioned is not None:
+                lx = positioned
+            lines.append(
+                f'<text data-role="x-axis-label" x="{lx:.1f}" y="{BOTTOM + 30}" text-anchor="middle" '
+                f'font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(str(label))}</text>'
+            )
+    legend_y = 92
+    for series_index, series in enumerate(series_points):
+        color = _color(series_index)
+        lines.append(
+            f'<line x1="{W / 2 - 120}" y1="{legend_y}" x2="{W / 2 - 40}" y2="{legend_y}" stroke="{color}" stroke-width="5"/>'
+        )
+        lines.append(
+            f'<text x="{W / 2 - 30}" y="{legend_y + 8}" font-family="Arial, sans-serif" font-size="22" fill="#333333">{html.escape(series["name"])}</text>'
+        )
+        legend_y += 32
+    lines.append("</g>")
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
+def _build_line_components_svg(
+    series_points: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    x_labels: list[str],
+    orientation: str = "vertical",
+    x_range: tuple[float, float] | None = None,
+) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
+        f'<rect id="scene-background-fill" data-role="background-fill" x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>',
+        f'<text id="chart-title" data-role="title" x="{W / 2}" y="67" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#222222">{html.escape(title)}</text>',
+        f'<rect id="chart-title-box" data-role="title-box" x="{W / 2 - 300}" y="32" width="600" height="54" fill="#ffffff" stroke="#333333" stroke-width="2"/>',
+        '<g id="chart-plot" data-role="plot">',
+    ]
+    maxv = max(max(series["values"]) for series in series_points) or 1.0
+    maxv = maxv * 1.05
+    for tv in _nice_ticks(maxv):
+        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+        lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
+        lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
+    for series_index, series in enumerate(series_points):
+        color = _color(series_index)
+        eid = _slug(series["name"])
+        values = series["values"]
+        points = [
+            _line_point_xy(values, index, maxv, x_range, series.get("x_values"))
+            for index in range(len(values))
+        ]
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        lines.append(f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(series["name"])}">')
+        lines.append(f'<polyline data-role="polyline" data-entity-id="{eid}" points="{polyline}" fill="none" stroke="{color}" stroke-width="5"/>')
+        for index, (x, y) in enumerate(points):
+            lines.append(
+                f'<rect data-role="value-box" data-entity-id="{eid}" data-index="{index}" x="{x - 28:.1f}" y="{y - 32:.1f}" width="56" height="26" fill="#fafafa" stroke="#333333" stroke-width="2"/>'
+            )
+            lines.append(
+                f'<text data-role="value-label" data-entity-id="{eid}" data-index="{index}" x="{x:.1f}" y="{y - 14:.1f}" '
+                f'text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#222222">{html.escape(_format_value(values[index], unit))}</text>'
+            )
+        lines.append("</g>")
+    if len(x_labels) >= 2:
+        for index, label in enumerate(x_labels):
+            lx = LEFT + index / (len(x_labels) - 1) * (RIGHT - LEFT)
+            positioned = _x_label_x(label, x_range)
+            if positioned is not None:
+                lx = positioned
+            lines.append(
+                f'<text data-role="x-axis-label" x="{lx:.1f}" y="{BOTTOM + 30}" text-anchor="middle" '
+                f'font-family="Arial, sans-serif" font-size="20" fill="#444444">{html.escape(str(label))}</text>'
+            )
+    lines.append("</g>")
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
+def _render_line_preview(
+    series_points: list[dict[str, Any]],
+    title: str,
+    unit: str,
+    x_labels: list[str],
+    out: Path,
+    x_range: tuple[float, float] | None = None,
+) -> bool:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return False
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        font_t = ImageFont.truetype("arial.ttf", 34)
+        font_v = ImageFont.truetype("arial.ttf", 20)
+    except Exception:
+        font_t = font_v = ImageFont.load_default()
+    draw.text((W / 2 - draw.textlength(title, font=font_t) / 2, 30), title, fill=(30, 30, 30), font=font_t)
+    draw.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
+    draw.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
+    maxv = max(max(series["values"]) for series in series_points) or 1.0
+    maxv = maxv * 1.05
+    for tv in _nice_ticks(maxv):
+        ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+        draw.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
+        draw.text((LEFT - 70, ty - 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_v)
+    for series_index, series in enumerate(series_points):
+        color = tuple(int(_color(series_index)[index : index + 2], 16) for index in (1, 3, 5))
+        values = series["values"]
+        points = [
+            _line_point_xy(values, index, maxv, x_range, series.get("x_values"))
+            for index in range(len(values))
+        ]
+        draw.line(points, fill=color, width=5)
+        for x, y in points:
+            draw.ellipse([x - 8, y - 8, x + 8, y + 8], fill=color, outline=(20, 20, 20), width=2)
+    if len(x_labels) >= 2:
+        for index, label in enumerate(x_labels):
+            lx = LEFT + index / (len(x_labels) - 1) * (RIGHT - LEFT)
+            positioned = _x_label_x(label, x_range)
+            if positioned is not None:
+                lx = positioned
+            draw.text((lx - draw.textlength(str(label), font=font_v) / 2, BOTTOM + 8), str(label), fill=(80, 80, 80), font=font_v)
+    img.save(out)
+    return out.exists()
 
 
 def _build_svg(
@@ -345,11 +769,12 @@ def _build_svg(
             lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
             lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>')
     for i, e in enumerate(layout):
-        eid = _slug(e["label"])
+        eid = _entity_id(e)
+        mid = _mark_id(e)
         color = _color(i)
-        lines.append(f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(e["label"])}">')
+        lines.append(f'<g id="entity-{mid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(e["label"])}">')
         lines.append(
-            f'<rect id="{eid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{e["value"]:g}" '
+            f'<rect id="{mid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{e["value"]:g}" '
             f'x="{e["x"]:.1f}" y="{e["y"]:.1f}" width="{e["w"]:.1f}" height="{e["h"]:.1f}" fill="{color}" '
             f'data-animation-property="{"width" if horizontal else "height"}" data-anchor="{"left" if horizontal else "bottom"}" data-animation-axis="{"x" if horizontal else "y"}" data-orientation="{orientation}"/>'
         )
@@ -360,11 +785,11 @@ def _build_svg(
         category_label_y = (e["y"] - 14) if horizontal else (BOTTOM + 30)
         category_anchor = "start" if horizontal else "middle"
         lines.append(
-            f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
+            f'<text id="{mid}-value-label" data-role="value-label" data-entity-id="{eid}" '
             f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{e["value"]:g}{html.escape(unit)}</text>'
         )
         lines.append(
-            f'<text id="{eid}-label" data-role="category-label" data-entity-id="{eid}" '
+            f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
             f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="20" fill="#333333">{html.escape(e["label"])}</text>'
         )
         lines.append("</g>")
@@ -412,7 +837,7 @@ def _build_components_svg(
     lines.append(
         f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>'
     )
-    maxv = max(e["value"] for e in layout) or 1.0
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
@@ -433,11 +858,12 @@ def _build_components_svg(
                 f'font-family="Arial, sans-serif" font-size="22" fill="#444444">{tv:g}{html.escape(unit)}</text>'
             )
     for i, e in enumerate(layout):
-        eid = _slug(e["label"])
+        eid = _entity_id(e)
+        mid = _mark_id(e)
         color = _color(i)
-        lines.append(f'<g id="entity-{eid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(e["label"])}">')
+        lines.append(f'<g id="entity-{mid}" data-role="entity" data-entity-id="{eid}" data-label="{html.escape(e["label"])}">')
         lines.append(
-            f'<rect id="{eid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{e["value"]:g}" '
+            f'<rect id="{mid}-bar" data-role="bar" data-entity-id="{eid}" data-value="{e["value"]:g}" '
             f'x="{e["x"]:.1f}" y="{e["y"]:.1f}" width="{e["w"]:.1f}" height="{e["h"]:.1f}" fill="{color}" '
             f'stroke="#d62728" stroke-width="3" data-animation-property="{"width" if horizontal else "height"}" data-anchor="{"left" if horizontal else "bottom"}" data-animation-axis="{"x" if horizontal else "y"}" data-orientation="{orientation}"/>'
         )
@@ -455,12 +881,12 @@ def _build_components_svg(
             value_text_x = e["x"] + e["w"] / 2
             value_text_anchor = "middle"
         lines.append(
-            f'<rect id="{eid}-value-box" data-role="value-box" data-entity-id="{eid}" '
+            f'<rect id="{mid}-value-box" data-role="value-box" data-entity-id="{eid}" '
             f'x="{value_x:.1f}" y="{value_y:.1f}" width="{value_w:.1f}" height="{value_h:.1f}" '
             'fill="#fafafa" stroke="#333333" stroke-width="2"/>'
         )
         lines.append(
-            f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
+            f'<text id="{mid}-value-label" data-role="value-label" data-entity-id="{eid}" '
             f'x="{value_text_x:.1f}" y="{value_y + 21:.1f}" text-anchor="{value_text_anchor}" '
             f'font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#222222">{html.escape(value_text)}</text>'
         )
@@ -477,12 +903,12 @@ def _build_components_svg(
             label_text_x = e["x"] + e["w"] / 2
             label_text_anchor = "middle"
         lines.append(
-            f'<rect id="{eid}-label-box" data-role="category-box" data-entity-id="{eid}" '
+            f'<rect id="{mid}-label-box" data-role="category-box" data-entity-id="{eid}" '
             f'x="{label_x:.1f}" y="{label_y:.1f}" width="{label_w:.1f}" height="{label_h:.1f}" '
             'fill="#fafafa" stroke="#333333" stroke-width="2"/>'
         )
         lines.append(
-            f'<text id="{eid}-label" data-role="category-label" data-entity-id="{eid}" '
+            f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
             f'x="{label_text_x:.1f}" y="{label_y + 21:.1f}" text-anchor="{label_text_anchor}" '
             f'font-family="Arial, sans-serif" font-size="18" fill="#333333">{html.escape(e["label"])}</text>'
         )
@@ -519,7 +945,7 @@ def _render_components_preview(
     d.text((W / 2 - d.textlength(title, font=font_t) / 2, 34), title, fill=(34, 34, 34), font=font_t)
     d.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
     d.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
-    maxv = max(e["value"] for e in layout) or 1.0
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     for tv in _nice_ticks(maxv):
         if horizontal:
             tx = LEFT + tv / maxv * (RIGHT - LEFT)
@@ -642,7 +1068,7 @@ def render_data_driven(
             "contains_data_values": True,
             "entities": [
                 {
-                    "entity_id": _slug(e["label"]),
+                    "entity_id": _entity_id(e),
                     "label": e["label"],
                     "value": e["value"],
                     "bbox_px": [round(e["x"]), round(e["y"]), round(e["x"] + e["w"]), round(e["y"] + e["h"])],
@@ -744,6 +1170,7 @@ def metadata_from_dynamic(
         return None
     groups: dict[str, list[dict[str, Any]]] = {}
     metric = "Value"
+    has_explicit_state = False
     for row in states:
         if not isinstance(row, dict):
             continue
@@ -755,11 +1182,17 @@ def metadata_from_dynamic(
             continue
         if row.get("metric"):
             metric = str(row["metric"])
+        if row.get("state_key") not in (None, ""):
+            has_explicit_state = True
         key = str(row.get("state_key") or row.get("state_label") or row.get("state_id") or "state")
+        if not has_explicit_state:
+            key = "state"
         groups.setdefault(key, []).append(
             {
+                "entity_id": eid,
                 "name": str(row.get("entity") or eid),
                 "values": [value],
+                "metric": str(row.get("metric") or ""),
                 "source_type": str(row.get("source_type") or ""),
                 "confidence": _to_float(row.get("confidence")) or 0.0,
                 "unit": row.get("unit"),
@@ -785,16 +1218,17 @@ def metadata_from_dynamic(
     if vfa_labels:
         rows = [r for r in rows if _slug(r["name"]) in vfa_labels]
 
-    # Collapse duplicate entity labels in the chosen state to a single row,
+    # Collapse exact duplicate entity+metric marks in the chosen state,
     # preferring the CV-aligned (visual_frame_align) observation.
-    best: dict[str, dict[str, Any]] = {}
+    best: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         norm = _slug(row["name"])
         if not norm or norm == "unknown":
             continue
-        cur = best.get(norm)
+        metric_key = _slug(str(row.get("metric") or ""))
+        cur = best.get((norm, metric_key))
         if cur is None:
-            best[norm] = row
+            best[(norm, metric_key)] = row
             continue
         cur_rank = (
             cur.get("source_type") == "visual_frame_align",
@@ -805,14 +1239,27 @@ def metadata_from_dynamic(
             float(row.get("confidence") or 0.0),
         )
         if row_rank > cur_rank:
-            best[norm] = row
-    series = [{"name": r["name"], "values": r["values"]} for r in best.values()]
-    series.sort(key=lambda e: -float(e["values"][0]))
+            best[(norm, metric_key)] = row
+    series = [
+        {
+            "name": r["name"],
+            "entity_id": r.get("entity_id"),
+            "metric": r.get("metric") or "",
+            "values": r["values"],
+        }
+        for r in best.values()
+    ]
     if not series:
         return None
     unit = _infer_unit(list(best.values()), visible_text)
     if _slug(metric) in {_slug(r["name"]) for r in best.values()}:
         metric = "Value"
+    metrics = sorted({str(r.get("metric") or "") for r in best.values() if r.get("metric")})
+    if len(metrics) > 1:
+        metric = "Value"
+        series.sort(key=lambda e: (str(e.get("name") or "").lower(), str(e.get("metric") or "").lower()))
+    else:
+        series.sort(key=lambda e: -float(e["values"][0]))
     title = (
         f"{metric} ({key})"
         if key != "state" and _timestamp_evidenced(key, visible_text)
@@ -826,7 +1273,13 @@ def metadata_from_dynamic(
         "y_axis": metric,
         "series": series,
         "entities": [
-            {"label": e["name"], "value": e["values"][0], "unit": unit}
+            {
+                "label": e["name"],
+                "entity_id": e.get("entity_id"),
+                "metric": e.get("metric") or "",
+                "value": e["values"][0],
+                "unit": unit,
+            }
             for e in series
         ],
         "visible_text": [],

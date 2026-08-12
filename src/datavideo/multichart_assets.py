@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import re
 import shutil
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
-from datavideo.cv_align import detect_bars
+from datavideo.cv_align import _detect_tick_label_blocks, bar_layout_regularity, detect_axis_tick_marks, detect_bars, detect_lines
 from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
@@ -167,7 +168,7 @@ def _state_enabled_chart_types(cfg: dict[str, Any]) -> set[str]:
 
 
 def _prefer_late_chart_types(cfg: dict[str, Any]) -> set[str]:
-    values = cfg.get("keyframes", {}).get("prefer_late_chart_types", ["bar", "pie", "donut", "combined"])
+    values = cfg.get("keyframes", {}).get("prefer_late_chart_types", ["bar", "line", "pie", "donut", "combined"])
     return {str(value).lower() for value in _as_list(values)}
 
 
@@ -687,10 +688,58 @@ def select_keyframe(
     if "bar" in chart_type or "combined" in chart_type:
         for item in scored_rows:
             try:
-                item["cv_bar_count"] = len(detect_bars(item["path"]))
+                bars = detect_bars(item["path"])
+                item["cv_bar_count"] = len(bars)
+                orientation = bars[0].get("orientation") if bars else "vertical"
+                item["cv_tick_count"] = len(detect_axis_tick_marks(item["path"], orientation))
+                item["bar_regularity"] = bar_layout_regularity(bars)
             except Exception:
                 item["cv_bar_count"] = 0
-            item["combined_score"] = round(item["combined_score"] + 0.4 * item["cv_bar_count"], 4)
+                item["cv_tick_count"] = 0
+                item["bar_regularity"] = 0.0
+            item["combined_score"] = round(
+                item["combined_score"]
+                + 0.4 * item["cv_bar_count"]
+                + 0.25 * item["cv_tick_count"]
+                - 3.0 * (1.0 - item["bar_regularity"]),
+                4,
+            )
+    if "line" in chart_type or "area" in chart_type or "timeline" in chart_type:
+        for item in scored_rows:
+            try:
+                detected_lines = detect_lines(item["path"])
+                frame = cv2.imread(str(item["path"]))
+                frame_w = frame.shape[1] if frame is not None else 1
+                has_value_axis = bool(frame is not None and len(_detect_tick_label_blocks(frame, "vertical")) >= 2)
+                item["line_point_count"] = (
+                    sum(len(line.get("points", [])) for line in detected_lines)
+                    if has_value_axis
+                    else 0
+                )
+                item["line_progress"] = 0.0
+                item["line_tick_count"] = 0
+                if has_value_axis and detected_lines:
+                    rightmost = [
+                        max(px for px, _ in line.get("points", []))
+                        for line in detected_lines
+                        if line.get("points")
+                    ]
+                    if rightmost:
+                        item["line_progress"] = round(min(rightmost) / frame_w, 4)
+                    try:
+                        item["line_tick_count"] = len(detect_axis_tick_marks(item["path"], "vertical"))
+                    except Exception:
+                        item["line_tick_count"] = 0
+            except Exception:
+                item["line_point_count"] = 0
+                item["line_progress"] = 0.0
+                item["line_tick_count"] = 0
+            item["combined_score"] = round(
+                item["combined_score"]
+                + 8.0 * item["line_progress"]
+                + 1.5 * item["line_tick_count"],
+                4,
+            )
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))
     keyframe_source_role = "visual_clip"
     boundary_reason = ""
@@ -720,10 +769,16 @@ def select_keyframe(
                 path = scan_dir / f"context_tail_{t:.2f}.png"
                 try:
                     extract_still(context_video, t, path, force=True)
-                    cnt = len(detect_bars(str(path)))
+                    tail_bars = detect_bars(str(path))
+                    cnt = len(tail_bars)
+                    tail_orientation = tail_bars[0].get("orientation") if tail_bars else "vertical"
+                    tick_cnt = len(detect_axis_tick_marks(str(path), tail_orientation))
+                    regularity = bar_layout_regularity(tail_bars)
                 except Exception:
                     cnt = 0
-                if cnt > best_clip_bars:
+                    tick_cnt = 0
+                    regularity = 0.0
+                if cnt >= best_clip_bars and tick_cnt >= 2 and regularity >= 0.7:
                     chosen_tail = (t, cnt, str(path))
                 t += 0.3
             if chosen_tail:

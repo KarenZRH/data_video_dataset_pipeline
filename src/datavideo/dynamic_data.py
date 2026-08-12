@@ -689,6 +689,7 @@ def build_dynamic_records(
     change_events = build_data_change_events(states)
     return {
         "clip_id": clip_id,
+        "chart_type": str(visual_data.get("chart_type") or chart_context.get("chart_type") or "").lower(),
         "states": states,
         "final_data_table": final_table,
         "data_change_events": change_events,
@@ -708,7 +709,7 @@ def build_dynamic_records(
 def build_final_data_table(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for state in sorted(states, key=lambda row: float(row.get("state_start") or 0.0)):
-        latest[str(state.get("entity_id"))] = state
+        latest[(str(state.get("entity_id")), str(state.get("metric") or ""))] = state
     rows = []
     for state in latest.values():
         rows.append(
@@ -732,14 +733,16 @@ def build_final_data_table(states: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def build_data_change_events(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
     events = []
-    active: dict[str, tuple[float | None, str | None, str | None]] = {}
+    active: dict[tuple[str, str], tuple[float | None, str | None, str | None]] = {}
     for state in sorted(states, key=lambda row: float(row.get("state_start") or 0.0)):
         entity_id = str(state.get("entity_id"))
+        metric = str(state.get("metric") or "")
+        active_key = (entity_id, metric)
         value_sig = (numeric_value(state.get("value")), state.get("unit"), state.get("value_type"))
-        action = "insert" if entity_id not in active else "update" if active[entity_id] != value_sig else None
+        action = "insert" if active_key not in active else "update" if active[active_key] != value_sig else None
         if action is None:
             continue
-        active[entity_id] = value_sig
+        active[active_key] = value_sig
         events.append(
             {
                 "clip_id": state.get("clip_id"),
@@ -810,6 +813,24 @@ def plan_dynamic_state_keyframes(
         picks = sorted({round(index * (total - 1) / (limit - 1)) for index in range(limit)})
         complete_groups = [complete_groups[index] for index in picks]
     planned = [_dynamic_keyframe_row(group) for group in complete_groups]
+    # A static chart can contain many recovered data marks in one representative
+    # frame. If the extractor did not provide an explicit state key, those rows
+    # are chart data points/series groups rather than video states.
+    chart_type = str(result.get("chart_type") or "").lower()
+    planned_evidence = {
+        (
+            row.get("source_frame_id") or row.get("source_frame_path"),
+            _as_float(row.get("timestamp")),
+        )
+        for row in planned
+    }
+    has_explicit_state_key = any(row.get("state_key") not in (None, "") for row in planned)
+    if len(planned_evidence) <= 1 and (chart_type in {"line", "area", "scatter"} or not has_explicit_state_key):
+        return {
+            "should_save": False,
+            "reason": "static_chart_points_from_single_visual_frame",
+            "states": [],
+        }
     if any(row.get("timestamp") is None and not row.get("source_frame_path") for row in planned):
         return {"should_save": False, "reason": "missing_visual_frame_evidence", "states": []}
     return {

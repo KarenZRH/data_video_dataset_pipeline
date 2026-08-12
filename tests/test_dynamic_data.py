@@ -411,6 +411,99 @@ def test_dynamic_state_keyframes_keep_all_complete_states():
     assert [state["state_id"] for state in plan["states"]] == ["state_001", "state_002", "state_003"]
 
 
+def test_static_line_points_from_one_frame_do_not_create_state_keyframes():
+    result = build_dynamic_records(
+        clip_id="line_32",
+        visual_data={
+            "has_extractable_data": True,
+            "chart_type": "line",
+            "unit": "%",
+            "x_axis": "Year",
+            "y_axis": "Share of income",
+            "rows": [
+                {
+                    "year": year,
+                    "label": "Top 10%",
+                    "x": str(year),
+                    "value": f"{value} %",
+                    "unit": "%",
+                    "source_frame": "frame_tail",
+                    "time_seconds": 3.95,
+                }
+                for year, value in [(1910, 40), (1920, 42), (1930, 45), (2010, 48)]
+            ],
+            "manual_stub_rows": [],
+            "visible_text": ["1910", "1920", "1930", "2010", "40%", "42%", "45%", "48%"],
+            "uncertain_fields": [],
+        },
+        frame_context=[{"image_index": 1, "source_frame": "frame_tail", "time_seconds": 3.95}],
+        image_paths=["visual_frames/frame_tail.jpg"],
+        narration_sentences=[],
+        chart_context={},
+    )
+
+    assert result["dynamic_data"] is True
+    plan = plan_dynamic_state_keyframes(result)
+
+    assert plan["should_save"] is False
+    assert plan["reason"] == "static_chart_points_from_single_visual_frame"
+
+
+def test_static_grouped_bar_marks_from_one_frame_do_not_create_state_keyframes():
+    result = build_dynamic_records(
+        clip_id="bar_6",
+        visual_data=_visual_data(
+            [
+                {"label": "Auto", "metric": "National average", "value": "75%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+                {"label": "Auto", "metric": "Transit-oriented developments", "value": "45%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+                {"label": "Bike", "metric": "National average", "value": "2%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+                {"label": "Bike", "metric": "Transit-oriented developments", "value": "5%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+            ]
+        ),
+        frame_context=[{"image_index": 1, "source_frame": "frame_tail", "time_seconds": 8.95}],
+        image_paths=["visual_frames/frame_tail.jpg"],
+        narration_sentences=[],
+        chart_context={},
+    )
+
+    assert result["dynamic_data"] is True
+    assert {row["state_key"] for row in result["states"]} == {None}
+    plan = plan_dynamic_state_keyframes(result)
+
+    assert plan["should_save"] is False
+    assert plan["reason"] == "static_chart_points_from_single_visual_frame"
+
+
+def test_static_grouped_bar_metrics_are_kept_in_final_table_and_events():
+    result = build_dynamic_records(
+        clip_id="bar_6",
+        visual_data=_visual_data(
+            [
+                {"label": "Auto", "metric": "National average", "value": "75%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+                {"label": "Auto", "metric": "Transit-oriented developments", "value": "45%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+                {"label": "Bike", "metric": "National average", "value": "2%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+                {"label": "Bike", "metric": "Transit-oriented developments", "value": "5%", "unit": "%", "source_frame": "frame_tail", "time_seconds": 8.95},
+            ]
+        ),
+        frame_context=[{"image_index": 1, "source_frame": "frame_tail", "time_seconds": 8.95}],
+        image_paths=["visual_frames/frame_tail.jpg"],
+        narration_sentences=[],
+        chart_context={},
+    )
+
+    table_keys = {(row["entity_id"], row["metric"]) for row in result["final_data_table"]}
+    event_keys = {(row["entity_id"], row["metric"]) for row in result["data_change_events"]}
+
+    assert len(result["final_data_table"]) == 4
+    assert table_keys == {
+        ("auto", "National average"),
+        ("auto", "Transit-oriented developments"),
+        ("bike", "National average"),
+        ("bike", "Transit-oriented developments"),
+    }
+    assert event_keys == table_keys
+
+
 def test_dynamic_state_keyframes_cap_keeps_first_and_last():
     rows = []
     frames = []

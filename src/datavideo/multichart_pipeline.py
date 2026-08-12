@@ -9,21 +9,16 @@ from typing import Any
 
 from datavideo.context import create_context_media
 from .animation import detect_animation, reconcile_intent_with_data
-from datavideo.cv_align import run_cv_align
+from datavideo.chart_processors import SUPPORTED_PROCESSORS, detect_chart_type
+from datavideo.cv_align import read_frame_title, read_series_label, run_cv_align, run_cv_align_line, reconcile_line_dynamic
 from datavideo.cv_reconcile import reconcile_dynamic_data
+from datavideo.cv_reconcile import write_dynamic_outputs
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
-from datavideo.semantic import build_semantic_svg
-from datavideo.semantic_render import (
-    metadata_from_dynamic,
-    render_data_driven,
-    render_dynamic_states,
-    resolve_render_title,
-)
+from datavideo.semantic_render import metadata_from_dynamic, render_data_driven, render_data_driven_line, render_dynamic_states, prefer_frame_visible_title, frame_title_status, resolve_render_title
 from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
 
 from .multichart_assets import (
-    _keyframe_asset,
     _keyframe_timestamp,
     build_semantic_state_svgs,
     recover_clip_data,
@@ -33,7 +28,18 @@ from .multichart_qwen import MultichartQwenClient
 
 
 def _clip_id(row: dict[str, Any]) -> str:
-    return str(row.get("output_stem") or f"{row['chart_type']}_{row['chart_index']}")
+    return str(row.get("output_stem") or row.get("clip_id") or f"{row.get('chart_type') or 'chart'}_{row.get('chart_index') or 0}")
+
+
+def _series_label_from_title(title: Any) -> str:
+    text = str(title or "").strip().strip("\"'`.,")
+    if not text:
+        return ""
+    for separator in (" in ", " for ", " from ", " over "):
+        if separator in text:
+            text = text.split(separator, 1)[0]
+            break
+    return text.strip().strip("'\"`").strip()[:60]
 
 
 def _reference_clip_metadata(row: dict[str, Any]) -> dict[str, Any]:
@@ -46,23 +52,6 @@ def _reference_clip_metadata(row: dict[str, Any]) -> dict[str, Any]:
 
 def _load_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return read_clip_rows(cfg)
-
-
-def _semantic_input_path(keyframes: dict[str, Any], state_inputs: Any) -> str:
-    if isinstance(state_inputs, dict):
-        inputs = state_inputs.get("semantic_inputs")
-        if isinstance(inputs, list) and inputs:
-            asset = inputs[0].get("semantic_input") if isinstance(inputs[0], dict) else None
-            if asset:
-                return str(asset)
-    states = keyframes.get("states") if isinstance(keyframes.get("states"), list) else []
-    for state in states:
-        if isinstance(state, dict) and state.get("asset"):
-            return str(state["asset"])
-    assets = keyframes.get("assets") if isinstance(keyframes.get("assets"), dict) else {}
-    if assets.get("selected"):
-        return str(assets["selected"])
-    raise RuntimeError("No semantic input frame available")
 
 
 def _selected_keyframe_path(keyframes: dict[str, Any]) -> Path | None:
@@ -180,6 +169,36 @@ def _as_number(value: Any) -> float | None:
         return None
 
 
+def _line_metadata_from_dynamic(
+    dynamic: dict[str, Any],
+    *,
+    title: str,
+    unit: str = "",
+    x_labels: list[str] | None = None,
+) -> dict[str, Any]:
+    series_values: dict[str, list[float]] = {}
+    series_x_labels: dict[str, list[str]] = {}
+    for row_item in dynamic.get("states") or []:
+        if not isinstance(row_item, dict):
+            continue
+        value = _as_number(row_item.get("value"))
+        if value is None:
+            continue
+        entity = str(row_item.get("entity") or row_item.get("entity_id") or "series")
+        series_values.setdefault(entity, []).append(value)
+        series_x_labels.setdefault(entity, []).append(str(row_item.get("state_key") or row_item.get("x_label") or ""))
+    return {
+        "title": title,
+        "unit": unit,
+        "chart_type": "line",
+        "x_labels": x_labels or [],
+        "series": [
+            {"name": name, "values": values, "x_labels": series_x_labels.get(name, [])}
+            for name, values in series_values.items()
+        ],
+    }
+
+
 def _safe_state_key(key: str) -> str:
     safe = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")
     return safe or "state"
@@ -190,6 +209,21 @@ def _state_groups(dynamic: dict[str, Any] | None) -> list[tuple[str, str, list[d
     states = dynamic.get("states") if isinstance(dynamic, dict) else []
     if not isinstance(states, list):
         return []
+    # Rows without an explicit state key are static chart marks recovered from
+    # one visual state, not separate video states. Keep them as one flat sample.
+    if states and not any(isinstance(row, dict) and row.get("state_key") not in (None, "") for row in states):
+        return []
+    chart_type = str(dynamic.get("chart_type") or "").lower() if isinstance(dynamic, dict) else ""
+    if chart_type in {"line", "area", "scatter"}:
+        visual_ranges = set()
+        for row in states:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("source_type") or "") not in {"visual", "visual_frame_align"}:
+                continue
+            visual_ranges.add((_as_number(row.get("state_start")), _as_number(row.get("state_end"))))
+        if len(visual_ranges) <= 1:
+            return []
     groups: dict[str, list[dict[str, Any]]] = {}
     order: dict[str, float] = {}
     labels: dict[str, str] = {}
@@ -587,28 +621,90 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 client=client,
                 force=asset_force,
             )
-            state_inputs = chart_data.get("semantic_state_inputs") if isinstance(chart_data, dict) else None
-            try:
-                semantic_input = _semantic_input_path(keyframes, state_inputs)
-            except Exception:
-                semantic_input = _keyframe_asset(keyframes)
-            qwen_semantic = None
-            if semantic_input and Path(semantic_input).exists():
-                qwen_semantic = build_semantic_svg(
-                    Path(semantic_input),
-                    ensure_dir(clip_root / "qwen_semantic"),
-                    cfg,
-                    force=asset_force,
-                )
-            semantic = render_data_driven(_clip_id(row), chart_data.get("metadata") or {}, clip_root)
-            semantic["qwen_semantic_svg"] = (qwen_semantic or {}).get("semantic_svg")
             dynamic = chart_data.get("dynamic_data") or {}
-            semantic["state_renders"] = render_dynamic_states(
-                _clip_id(row),
+            recovered_type = (chart_data.get("metadata") or {}).get("chart_type") or row.get("chart_type")
+            processor, declared_type, type_consistent = detect_chart_type(row.get("chart_type"), recovered_type)
+            render_metadata = metadata_from_dynamic(
                 dynamic,
-                clip_root,
+                visible_text=(chart_data.get("metadata") or {}).get("visible_text"),
             )
-            if _cv_align_enabled(row, cfg):
+            if render_metadata:
+                original_title = (chart_data.get("metadata") or {}).get("title")
+                if original_title:
+                    render_metadata["title"] = resolve_render_title(
+                        original_title,
+                        render_metadata.get("title"),
+                    )
+                write_json(clip_root / "chart_metadata.json", render_metadata)
+                chart_data = {**chart_data, "metadata": render_metadata}
+            else:
+                render_metadata = chart_data.get("metadata") or {}
+            if processor == "line":
+                selected_keyframe = _selected_keyframe_path(keyframes)
+                if selected_keyframe is not None:
+                    line_report = run_cv_align_line(_clip_id(row), selected_keyframe, clip_root, cfg=cfg)
+                    visible_text = (chart_data.get("metadata") or {}).get("visible_text") or []
+                    original_title = (chart_data.get("metadata") or {}).get("title")
+                    resolved_title = prefer_frame_visible_title(resolve_render_title(original_title, ""), visible_text)
+                    try:
+                        frame_title = read_frame_title(selected_keyframe, cfg)
+                        if frame_title and len(frame_title) >= 3:
+                            resolved_title = frame_title
+                    except Exception:
+                        pass
+                    series_label = None
+                    qwen_series = (chart_data.get("metadata") or {}).get("series")
+                    if isinstance(qwen_series, list) and qwen_series and isinstance(qwen_series[0], dict):
+                        candidate = str(qwen_series[0].get("name") or "").strip()
+                        if candidate and candidate.lower() not in {"series", "value", "metric", "unknown"}:
+                            series_label = candidate
+                    if not series_label:
+                        try:
+                            series_label = read_series_label(selected_keyframe, cfg)
+                        except Exception:
+                            series_label = None
+                    if not series_label:
+                        series_label = _series_label_from_title(resolved_title)
+                    cv_dynamic = reconcile_line_dynamic(
+                        line_report.get("lines") or [],
+                        clip_id=_clip_id(row),
+                        image_path=selected_keyframe,
+                        keyframe_timestamp=_keyframe_timestamp(keyframes),
+                        unit=line_report.get("tick_unit") or "",
+                        series_label=series_label,
+                    )
+                    cv_has_values = bool(cv_dynamic.get("states"))
+                    if cv_has_values:
+                        dynamic = cv_dynamic
+                        chart_data = {**chart_data, "dynamic_data": dynamic}
+                    line_metadata = _line_metadata_from_dynamic(
+                        dynamic,
+                        title=resolved_title,
+                        unit=line_report.get("tick_unit") or str((chart_data.get("metadata") or {}).get("unit") or ""),
+                        x_labels=line_report.get("x_axis_labels") or [],
+                    )
+                    semantic = render_data_driven_line(_clip_id(row), line_metadata, clip_root)
+                    semantic["cv_align"] = line_report
+                    semantic["reconciled"] = {
+                        "line_count": line_report.get("line_count", 0),
+                        "point_count": line_report.get("point_count", 0),
+                        "used_cv_values": cv_has_values,
+                        "fallback_source": None if cv_has_values else "qwen_dynamic_data",
+                    }
+                    write_dynamic_outputs(clip_root, dynamic)
+                    write_json(clip_root / "chart_metadata.json", line_metadata)
+            else:
+                semantic = render_data_driven(_clip_id(row), render_metadata, clip_root)
+            if processor != "line":
+                semantic["state_renders"] = render_dynamic_states(
+                    _clip_id(row),
+                    dynamic,
+                    clip_root,
+                    visible_text=(chart_data.get("metadata") or {}).get("visible_text"),
+                )
+            else:
+                semantic["state_renders"] = []
+            if processor == "bar" and _cv_align_enabled(row, cfg):
                 selected_keyframe = _selected_keyframe_path(keyframes)
                 entities: list[dict[str, Any]] = []
                 seen: set[str] = set()
@@ -668,7 +764,6 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             write_json(clip_root / "chart_metadata.json", corrected_metadata)
                             chart_data = {**chart_data, "metadata": corrected_metadata}
                             semantic = render_data_driven(_clip_id(row), corrected_metadata, clip_root)
-                            semantic["qwen_semantic_svg"] = (qwen_semantic or {}).get("semantic_svg")
                         semantic["state_renders"] = render_dynamic_states(
                             _clip_id(row),
                             dynamic,

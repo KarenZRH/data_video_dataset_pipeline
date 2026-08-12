@@ -1,4 +1,5 @@
 from datavideo.semantic_render import (
+    entities_from_metadata,
     _format_value,
     _infer_unit,
     _timestamp_evidenced,
@@ -38,6 +39,35 @@ def test_format_value_handles_unit_and_currency_prefix():
     assert _format_value(890, None) == "890"
     assert _format_value(300, "$") == "$300"
     assert _format_value(1150, "") == "1150"
+
+
+def test_render_data_driven_uses_entities_with_unit_strings(tmp_path):
+    metadata = {
+        "title": "Transportation mode, by share of use",
+        "unit": "%",
+        "series": [],
+        "entities": [
+            {"label": "Auto", "value": "75%", "unit": "%"},
+            {"label": "Public transit", "value": "5%", "unit": "%"},
+        ],
+    }
+
+    report = render_data_driven("bar_6", metadata, tmp_path)
+    svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+
+    assert report["success"] is True
+    assert report["entity_count"] == 2
+    assert 'data-role="bar"' in svg
+    assert "Auto" in svg
+    assert "75%" in svg
+
+
+def test_render_data_driven_empty_metadata_returns_failure_without_crashing(tmp_path):
+    report = render_data_driven("empty", {}, tmp_path)
+
+    assert report["success"] is False
+    assert report["failure_reason"] == "no_recoverable_entities"
+    assert (tmp_path / "semantic.svg").exists()
 
 
 def test_infer_unit_never_defaults_to_percent():
@@ -93,6 +123,55 @@ def test_metadata_from_dynamic_prefers_cv_aligned_state():
     assert meta["title"] == "Illiteracy Rate (2017)"
     assert [e["label"] for e in meta["entities"]] == ["Sub-Saharan Africa", "Latin America & Caribbean"]
     assert [e["value"] for e in meta["entities"]] == [36.1, 6.9]
+
+
+def test_metadata_from_dynamic_keeps_static_grouped_bar_metrics():
+    dynamic = {
+        "chart_type": "bar",
+        "states": [
+            {"entity_id": "auto", "entity": "Auto", "metric": "National average", "value": 75.0, "unit": "%", "state_key": None, "state_id": "state_001", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "auto", "entity": "Auto", "metric": "Transit-oriented developments", "value": 45.0, "unit": "%", "state_key": None, "state_id": "state_002", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "bike", "entity": "Bike", "metric": "National average", "value": 2.0, "unit": "%", "state_key": None, "state_id": "state_003", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "bike", "entity": "Bike", "metric": "Transit-oriented developments", "value": 5.0, "unit": "%", "state_key": None, "state_id": "state_004", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "public-transit", "entity": "Public transit", "metric": "National average", "value": 5.0, "unit": "%", "state_key": None, "state_id": "state_005", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "public-transit", "entity": "Public transit", "metric": "Transit-oriented developments", "value": 30.0, "unit": "%", "state_key": None, "state_id": "state_006", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "walk", "entity": "Walk", "metric": "National average", "value": 5.0, "unit": "%", "state_key": None, "state_id": "state_007", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "walk", "entity": "Walk", "metric": "Transit-oriented developments", "value": 20.0, "unit": "%", "state_key": None, "state_id": "state_008", "source_type": "visual", "confidence": 1.0},
+        ],
+    }
+
+    meta = metadata_from_dynamic(dynamic, visible_text=["National average", "Transit-oriented developments"])
+
+    assert meta is not None
+    assert len(meta["series"]) == 8
+    assert {row["metric"] for row in meta["series"]} == {"National average", "Transit-oriented developments"}
+    assert len(entities_from_metadata(meta)) == 8
+
+
+def test_render_data_driven_draws_static_grouped_bar_from_dynamic_metadata(tmp_path):
+    dynamic = {
+        "chart_type": "bar",
+        "states": [
+            {"entity_id": "auto", "entity": "Auto", "metric": "National average", "value": 75.0, "unit": "%", "state_key": None, "state_id": "state_001", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "auto", "entity": "Auto", "metric": "Transit-oriented developments", "value": 45.0, "unit": "%", "state_key": None, "state_id": "state_002", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "bike", "entity": "Bike", "metric": "National average", "value": 2.0, "unit": "%", "state_key": None, "state_id": "state_003", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "bike", "entity": "Bike", "metric": "Transit-oriented developments", "value": 5.0, "unit": "%", "state_key": None, "state_id": "state_004", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "public-transit", "entity": "Public transit", "metric": "National average", "value": 5.0, "unit": "%", "state_key": None, "state_id": "state_005", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "public-transit", "entity": "Public transit", "metric": "Transit-oriented developments", "value": 30.0, "unit": "%", "state_key": None, "state_id": "state_006", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "walk", "entity": "Walk", "metric": "National average", "value": 5.0, "unit": "%", "state_key": None, "state_id": "state_007", "source_type": "visual", "confidence": 1.0},
+            {"entity_id": "walk", "entity": "Walk", "metric": "Transit-oriented developments", "value": 20.0, "unit": "%", "state_key": None, "state_id": "state_008", "source_type": "visual", "confidence": 1.0},
+        ],
+    }
+    meta = metadata_from_dynamic(dynamic, visible_text=["Transportation mode, by share of use"])
+
+    report = render_data_driven("bar_6", meta, tmp_path)
+    svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+
+    assert report["success"] is True
+    assert report["entity_count"] == 8
+    assert svg.count('data-role="bar"') == 8
+    assert "Auto - National average" in svg
+    assert "Auto - Transit-oriented developments" in svg
 
 
 def test_metadata_from_dynamic_drops_hallucinated_entity_and_unseen_year():

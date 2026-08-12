@@ -61,6 +61,7 @@ keyframes:
     - treemap
   prefer_late_chart_types:
     - bar
+    - line
     - pie
     - donut
     - combined
