@@ -1,12 +1,28 @@
 import json
 
-from datavideo.multichart_pipeline import _series_label_from_title, build_dataset_folder
+from datavideo.multichart_pipeline import _line_metadata_from_dynamic, _series_label_from_title, build_dataset_folder
 
 
 def test_series_label_from_title_strips_location_qualifier():
     assert _series_label_from_title("'Net additions' in England") == "Net additions"
     assert _series_label_from_title("Productivity") == "Productivity"
     assert _series_label_from_title("") == ""
+
+
+def test_line_metadata_from_dynamic_preserves_unit_and_x_labels():
+    metadata = _line_metadata_from_dynamic(
+        {
+            "states": [
+                {"entity": "GM", "state_key": "2012", "value": 80.0, "unit": "%"},
+                {"entity": "GM", "state_key": "2013", "value": 50.0, "unit": "%"},
+            ]
+        },
+        title="Share of profits spent on stock buybacks",
+    )
+
+    assert metadata["unit"] == "%"
+    assert metadata["x_labels"] == ["2012", "2013"]
+    assert metadata["series"] == [{"name": "GM", "values": [80.0, 50.0], "x_labels": ["2012", "2013"]}]
 
 
 def _make_clip(tmp_path):
