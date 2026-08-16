@@ -204,6 +204,11 @@ def visual_records_from_clip_data(
         entity_id = entity_id_from_row(row)
         if entity_id == "unknown":
             continue
+        if _label_embeds_own_value(
+            row.get("label") or row.get("series") or row.get("x") or row.get("state"),
+            value_num,
+        ):
+            continue
         evidence_text = row.get("evidence_text") or row.get("raw_text") or value
         frame = _frame_for_row(row, frame_context, image_paths)
         time_value = frame.get("time_seconds") if frame else row.get("time_seconds")
@@ -278,6 +283,39 @@ def _sentence_id(row: dict[str, Any], fallback: int) -> str:
         if row.get(key) not in (None, ""):
             return str(row[key])
     return f"sentence_{fallback:03d}"
+
+
+def sanitize_metric(metric: Any) -> str:
+    """Drop junk metrics that carry no letters/digits (e.g. a VLM reading the
+    dollar signs ``$$$`` as the metric); empty metrics fall back to "Value"."""
+    text = str(metric or "").strip()
+    if not re.search(r"[A-Za-z0-9]", text):
+        return ""
+    return text
+
+
+def _label_embeds_own_value(label: Any, value: Any) -> bool:
+    """True when a label like "380,000 km: Average Distance to the Moon"
+    embeds its own number+unit before a colon (title/label-value confusion).
+
+    Legitimate category labels such as "Men: 50%" or "Income: $40,000" do not
+    start with a number, so they are never caught by this rule.
+    """
+    text = str(label or "")
+    if ":" not in text:
+        return False
+    head = text.split(":", 1)[0].strip()
+    if not re.match(r"^[\d,.\s]+\s*[A-Za-z%$€£¥]+$", head):
+        return False
+    digits = re.sub(r"[^0-9.]", "", head)
+    if not digits:
+        return False
+    try:
+        head_number = float(digits)
+    except ValueError:
+        return False
+    value_number = numeric_value(value)
+    return value_number is not None and abs(value_number - head_number) < 1e-6
 
 
 def _sentence_overlaps_visual(row: dict[str, Any], intervals: dict[str, Any] | None) -> bool:
@@ -680,6 +718,8 @@ def build_dynamic_records(
         image_paths=image_paths,
     )
     fused = fuse_visual_and_narration_records(visual, narration)
+    for record in fused:
+        record["metric"] = sanitize_metric(record.get("metric"))
     states = merge_consecutive_states(fused)
     numeric_fact_count = sum(1 for row in states if row.get("value") is not None)
     excluded = numeric_fact_count == 0

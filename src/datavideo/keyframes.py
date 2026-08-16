@@ -14,12 +14,45 @@ from .schemas import ensure_dir, read_json, write_json, write_jsonl
 def extract_still(video: str | Path, timestamp: float, out: str | Path, force: bool = False) -> Path:
     out = Path(out)
     ensure_dir(out.parent)
-    if out.exists() and not force:
-        return out
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video), "-frames:v", "1", "-q:v", "2", str(out)],
-        check=True,
-    )
+    def _extract(ts: float, target: Path) -> None:
+        cmd = [
+            "ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", str(video),
+            "-frames:v", "1", "-q:v", "2",
+        ]
+        if target.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            cmd += ["-f", "image2"]
+        cmd.append(str(target))
+        subprocess.run(cmd, check=True)
+
+    if not (out.exists() and not force):
+        _extract(timestamp, out)
+        # Seeking to the exact end of a video frequently yields no frame
+        # (e.g. clip.mp4 of 6.0s at ts=6.0). Retry slightly earlier so a
+        # boundary state still gets a valid still instead of an empty file.
+        if not out.exists() or out.stat().st_size == 0:
+            try:
+                from datavideo.media import ffprobe
+                duration = float(ffprobe(video)["format"]["duration"])
+                retry = max(0.0, min(timestamp, duration - 0.25))
+                if retry != timestamp:
+                    _extract(retry, out)
+            except Exception:
+                pass
+    # ffmpeg may honour the container's codec over the requested extension
+    # (e.g. a JPEG payload written to a .png path). Verify the payload
+    # matches the extension and re-encode when it does not.
+    if out.suffix.lower() == ".png" and out.exists():
+        header = out.read_bytes()[:8]
+        if header != b"\x89PNG\r\n\x1a\n":
+            fixed = out.with_suffix(".png.tmp")
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(out),
+                    "-frames:v", "1", "-pix_fmt", "rgba", "-f", "image2", str(fixed),
+                ],
+                check=True,
+            )
+            fixed.replace(out)
     if not out.exists() or out.stat().st_size == 0:
         raise RuntimeError(f"Failed to extract still at {timestamp:.3f}s from {video}")
     return out

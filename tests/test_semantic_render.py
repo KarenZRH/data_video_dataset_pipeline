@@ -4,7 +4,9 @@ from datavideo.semantic_render import (
     _infer_unit,
     _timestamp_evidenced,
     metadata_from_dynamic,
+    prefer_frame_visible_title,
     render_data_driven,
+    render_data_driven_line,
     resolve_render_title,
 )
 
@@ -107,6 +109,32 @@ def test_resolve_render_title_keeps_original_unless_year_conflicts():
     assert resolve_render_title("Illiteracy Rate 1990", "Illiteracy Rate (2017)") == "Illiteracy Rate (2017)"
     assert resolve_render_title("Illiteracy Rate 2017", "Illiteracy Rate (2017)") == "Illiteracy Rate 2017"
     assert resolve_render_title("", "Value") == "Value"
+    assert resolve_render_title("Monthly price of Sovaldi, hepatitis C drug", "Price (2017)") == "Monthly price of Sovaldi, hepatitis C drug"
+
+
+def test_prefer_frame_visible_title_uses_printed_chart_title():
+    visible = ["Total", "Prescription drugs", "Over-the-counter drugs", "Adults who skipped prescriptions or doses because of cost", "Commonwealth Fund, 2016", "40%", "United Kingdom"]
+    assert prefer_frame_visible_title("Why drugs cost more in America", visible) == "Adults who skipped prescriptions or doses because of cost"
+    assert prefer_frame_visible_title("Monthly price of Humira, arthritis drug", ["Monthly price of Humira, ", "Commonwealth Fund, 2017", "Norway"]) == "Monthly price of Humira, arthritis drug"
+    assert prefer_frame_visible_title("Why drugs cost more in America", ["Advair", "Humira Pen", "United Kingdom"]) == "Why drugs cost more in America"
+
+
+def test_render_data_driven_line_outputs_polyline(tmp_path):
+    metadata = {
+        "title": "Net additions in England",
+        "unit": "",
+        "chart_type": "line",
+        "series": [{"name": "Net additions", "values": [133600, 221600, 147000, 129100]}],
+    }
+    report = render_data_driven_line("line_4", metadata, tmp_path)
+    assert report["success"] is True
+    assert report["point_count"] == 4
+    svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+    assert 'data-role="polyline"' in svg
+    assert svg.count('data-role="data-point"') == 4
+    assert svg.count('data-role="value-label"') == 4
+    assert (tmp_path / "semantic_components.json").exists()
+    assert (tmp_path / "semantic_preview.png").exists()
 
 
 def test_metadata_from_dynamic_prefers_cv_aligned_state():

@@ -8,7 +8,13 @@ from typing import Any
 
 from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
-from datavideo.cv_align import _detect_tick_label_blocks, bar_layout_regularity, detect_axis_tick_marks, detect_bars, detect_lines
+from datavideo.cv_align import (
+    _detect_tick_label_blocks,
+    bar_layout_regularity,
+    detect_axis_tick_marks,
+    detect_bars,
+    detect_lines,
+)
 from datavideo.media import ffprobe
 from datavideo.semantic import build_semantic_svg
 from datavideo.schemas import ensure_dir, read_json, read_jsonl, write_csv, write_json, write_jsonl
@@ -25,7 +31,11 @@ from .multichart_qwen import MultichartQwenClient
 
 
 def _clip_id(row: dict[str, Any]) -> str:
-    return str(row.get("output_stem") or f"{row['chart_type']}_{row['chart_index']}")
+    return str(
+        row.get("output_stem")
+        or row.get("clip_id")
+        or f"{row.get('chart_type') or 'chart'}_{row.get('chart_index') or 0}"
+    )
 
 
 def _keyframe_asset(keyframes: dict[str, Any]) -> Path:
@@ -430,7 +440,12 @@ def _write_semantic_state_inputs(
             if source_frame.exists():
                 asset = out_path
                 try:
-                    shutil.copyfile(source_frame, asset)
+                    # The source frame may be a JPEG/other format while the
+                    # semantic pipeline expects a real PNG payload (it
+                    # inspects the file signature, not just the extension).
+                    from PIL import Image
+
+                    Image.open(source_frame).convert("RGB").save(asset, "PNG")
                 except Exception:
                     asset = None
         if asset is None:
@@ -509,6 +524,10 @@ def build_semantic_state_svgs(
         if not isinstance(item, dict):
             continue
         image_path = Path(item.get("semantic_input") or "")
+        try:
+            image_path = _ensure_png_payload(image_path)
+        except Exception:
+            pass
         if not image_path.exists():
             rows.append({**item, "success": False, "failure_reason": "semantic input image missing"})
             continue
@@ -530,6 +549,25 @@ def build_semantic_state_svgs(
     }
     write_json(manifest_path, manifest)
     return manifest
+
+
+def _ensure_png_payload(path: Path) -> Path:
+    """Repair a .png file whose payload is not PNG (e.g. a JPEG still written
+    to a .png path by an older ffmpeg invocation or a copied source frame).
+
+    The semantic pipeline inspects the file signature (not just the
+    extension), so such files make every downstream step fail with "Not a PNG
+    image". Re-encode them in place with Pillow.
+    """
+    if not path.exists() or path.suffix.lower() != ".png":
+        return path
+    header = path.read_bytes()[:8]
+    if header == b"\x89PNG\r\n\x1a\n":
+        return path
+    from PIL import Image
+
+    Image.open(path).convert("RGB").save(path, "PNG")
+    return path
 
 
 def _source_fps(video: str | Path) -> float | None:
@@ -697,6 +735,10 @@ def select_keyframe(
                 item["cv_bar_count"] = 0
                 item["cv_tick_count"] = 0
                 item["bar_regularity"] = 0.0
+            # A frame with more bars is more complete, a frame with the
+            # value-axis tick marks drawn is far more usable for value
+            # estimation, and a regular bar layout excludes cross-fade frames
+            # where two charts are superimposed.
             item["combined_score"] = round(
                 item["combined_score"]
                 + 0.4 * item["cv_bar_count"]
@@ -704,13 +746,23 @@ def select_keyframe(
                 - 3.0 * (1.0 - item["bar_regularity"]),
                 4,
             )
+    # Line/area charts draw both the polylines and the axis ticks
+    # progressively: completeness is the drawing progress (rightmost point
+    # of the slowest line, normalised by frame width) plus how many value
+    # ticks have been drawn (a frame with a complete axis is usable for value
+    # estimation). Point counts and the raw number of detected lines are NOT
+    # used: illustrations / title cards / annotation arrows produce spurious
+    # lines and points, and finished vs near-finished frames often have
+    # identical counts.
     if "line" in chart_type or "area" in chart_type or "timeline" in chart_type:
         for item in scored_rows:
             try:
                 detected_lines = detect_lines(item["path"])
                 frame = cv2.imread(str(item["path"]))
                 frame_w = frame.shape[1] if frame is not None else 1
-                has_value_axis = bool(frame is not None and len(_detect_tick_label_blocks(frame, "vertical")) >= 2)
+                has_value_axis = bool(
+                    frame is not None and len(_detect_tick_label_blocks(frame, "vertical")) >= 2
+                )
                 item["line_point_count"] = (
                     sum(len(line.get("points", [])) for line in detected_lines)
                     if has_value_axis
@@ -778,6 +830,11 @@ def select_keyframe(
                     cnt = 0
                     tick_cnt = 0
                     regularity = 0.0
+                # The tail frame must be at least as complete as the best clip
+                # frame *and* still carry the axis tick marks; a frame where
+                # the bars have grown but the grid lines already faded out is
+                # not usable for tick-based estimation, and a cross-fade frame
+                # (irregular bar layout) must never be selected.
                 if cnt >= best_clip_bars and tick_cnt >= 2 and regularity >= 0.7:
                     chosen_tail = (t, cnt, str(path))
                 t += 0.3

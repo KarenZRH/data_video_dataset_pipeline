@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,12 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def _numeric_year(value: Any) -> float | None:
+    """Extract a 4-digit year (e.g. ``2000`` from ``2000-01``) if present."""
+    match = re.search(r"(?:19|20)\d{2}", str(value or ""))
+    return float(match.group(0)) if match else None
+
+
 def reconcile_intent_with_data(
     animation: dict[str, Any],
     dynamic: dict[str, Any],
@@ -102,7 +109,18 @@ def reconcile_intent_with_data(
         start = _as_float(row.get("state_start"))
         order[key] = min(order.get(key, start if start is not None else 0.0), start if start is not None else 0.0)
         groups.setdefault(key, []).append(row)
-    keys = sorted(groups, key=lambda item: (order[item], item))
+    # State keys may be year labels ("2000-01") or plain indices/timestamps.
+    # Sort by parsed year first so "2010-11" cannot sort before "2000-01";
+    # non-year keys fall back to their state start timestamp.
+    keys = sorted(
+        groups,
+        key=lambda item: (
+            _numeric_year(item) is None,
+            _numeric_year(item) or 0.0,
+            order[item],
+            item,
+        ),
+    )
     if len(keys) < 2:
         return animation
     first_key, last_key = keys[0], keys[-1]
@@ -151,6 +169,8 @@ def reconcile_intent_with_data(
 
     metric = str(first_map[common[0]].get("metric") or "指标")
     unit = str(first_map[common[0]].get("unit") or "")
+    placeholder_metrics = {"", "指标", "value", "Value", "metric", "Metric", "unknown"}
+    has_metric = metric.strip() not in placeholder_metrics
 
     def group_start(rows: list[dict[str, Any]]) -> float | None:
         starts = [start for start in (_as_float(row.get("state_start")) for row in rows) if start is not None]
@@ -171,16 +191,18 @@ def reconcile_intent_with_data(
     def describe(items: list[dict[str, Any]], action: str, verb: str) -> dict[str, Any]:
         if len(items) == 1:
             item = items[0]
+            metric_part = f"的{metric}" if has_metric else ""
             description = (
                 f"从{state_label(first_key)}到{state_label(last_key)}，"
-                f"{item['entity']}的{metric}由{item['first_value']:g}{unit}"
+                f"{item['entity']}{metric_part}由{item['first_value']:g}{unit}"
                 f"变为{item['last_value']:g}{unit}（{verb}）。"
             )
         else:
             names = "、".join(item["entity"] for item in items)
+            metric_part = f"的{metric}" if has_metric else ""
             description = (
                 f"从{state_label(first_key)}到{state_label(last_key)}，"
-                f"{names}的{metric}整体{verb}。"
+                f"{names}{metric_part}整体{verb}。"
             )
         return {"action": action, "description": description, "evidence_timestamps": evidence}
 
@@ -194,7 +216,12 @@ def reconcile_intent_with_data(
     if not actions:
         return animation
 
-    if upward and downward:
+    unique_entities = {item["entity"] for item in deltas}
+    if len(unique_entities) == 1:
+        subject = next(iter(unique_entities))
+        verb = "上升" if upward else "下降"
+        overall = f"从{state_label(first_key)}到{state_label(last_key)}，{subject}整体{verb}。"
+    elif upward and downward:
         overall = f"从{state_label(first_key)}到{state_label(last_key)}，{metric}的变化方向不一致：部分实体上升、部分实体下降。"
     elif upward:
         overall = f"从{state_label(first_key)}到{state_label(last_key)}，{metric}整体上升。"
