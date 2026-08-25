@@ -7,9 +7,18 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+import cv2
+
 from datavideo.context import create_context_media
 from .animation import detect_animation, reconcile_intent_with_data
-from datavideo.cv_align import _looks_like_value_label, detect_bar_states, run_cv_align
+from datavideo.cv_align import (
+    _looks_like_value_label,
+    analyze_chart,
+    detect_bar_states,
+    estimate_missing_bar_values,
+    run_cv_align,
+    supplement_bars_from_vision,
+)
 from datavideo.cv_align import run_cv_align_line
 from datavideo.cv_align import reconcile_line_dynamic
 from datavideo.cv_align import read_frame_title
@@ -839,13 +848,20 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
 
                 shutil.copy2(visual_clip, candidate_clip)
 
+            # ``keyframes.reuse_existing`` keeps an already-verified keyframe
+            # (the slowest pipeline stage: per-frame VLM scoring + vision
+            # completeness checks) while still re-running animation, data
+            # recovery, CV alignment and rendering on top of it.
             keyframes = select_keyframe(
                 candidate_clip,
                 _reference_clip_metadata(row),
                 clip_root / "keyframes",
                 {**cfg, "processed_root": str(processed_root)},
                 client=client,
-                force=asset_force,
+                force=(
+                    asset_force
+                    and not bool(cfg.get("keyframes", {}).get("reuse_existing", False))
+                ),
                 context_video=media.get("context_video"),
                 context_visual_end=(media.get("intervals") or {}).get("visual_clip_context", {}).get("end"),
             )
@@ -968,6 +984,51 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 # labels, and tick estimation can then recover the values.
                 chart_kind = str(row.get("chart_type") or "")
                 if selected_keyframe is not None and (entities or "bar" in chart_kind or "combined" in chart_kind):
+                    # One vision call understands the chart's fundamentals
+                    # (type / orientation / style) right after the keyframe is
+                    # chosen.  The orientation routes CV detection to the
+                    # correct component (a pictograph chart is horizontal even
+                    # if its flag icons look like bars), and the style spec is
+                    # reused when rendering -- no second style call.
+                    chart_analysis: dict[str, Any] = {}
+                    try:
+                        chart_analysis = analyze_chart(selected_keyframe, cfg)
+                    except Exception:
+                        chart_analysis = {}
+                    # Fill bars without a printed value from the printed ones
+                    # via bar-length calibration (faithful values are kept).
+                    try:
+                        estimate_missing_bar_values(chart_analysis.get("bars") or [])
+                    except Exception:
+                        pass
+                    # The vision pass sees every bar label on the frame while
+                    # the VLM data table often recovered only a subset.  Add
+                    # the vision labels as matchable entities so CV alignment
+                    # keeps all detected bars (e.g. bar_27's seven income
+                    # bands where Qwen recovered only three).
+                    existing_labels = {str(e.get("label") or "").strip().lower() for e in entities}
+                    for b in (chart_analysis.get("bars") or []):
+                        if not isinstance(b, dict):
+                            continue
+                        label = str(b.get("label") or "").strip()
+                        if not label or label.lower() in existing_labels:
+                            continue
+                        eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "item"
+                        entities.append({"id": eid, "label": label})
+                        existing_labels.add(label.lower())
+                    orient_hint = str(chart_analysis.get("orientation") or "").strip()
+                    if orient_hint not in {"vertical", "horizontal"}:
+                        orient_hint = None
+                    supplemental_values = [
+                        {
+                            "label": b.get("label"),
+                            "value": b.get("value"),
+                            "value_text": str(b.get("value")) if b.get("value") is not None else None,
+                            "estimated": bool(b.get("value_estimated")),
+                        }
+                        for b in (chart_analysis.get("bars") or [])
+                        if isinstance(b, dict) and b.get("value") is not None and str(b.get("label") or "").strip()
+                    ]
                     cv_report = run_cv_align(
                         _clip_id(row),
                         selected_keyframe,
@@ -975,25 +1036,128 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                         clip_root,
                         client=client,
                         cfg=cfg,
+                        prefer_orientation=orient_hint,
+                        supplemental_values=supplemental_values,
                     )
                     semantic["cv_align"] = cv_report
+                    # The CV detector can miss low-contrast bars (e.g. the
+                    # grey "Unsure" bar in bar_86) or drop a bar whose label
+                    # is absent from the recovered entities (bar_74's
+                    # unlabelled top bar).  The vision pass sees every bar, so
+                    # when it reports more bars than CV, append the missing
+                    # ones (values + geometry) as the authority.
+                    try:
+                        added_bars = supplement_bars_from_vision(
+                            cv_report,
+                            chart_analysis.get("bars") or [],
+                            selected_keyframe,
+                        )
+                        if added_bars:
+                            cv_report["supplemented_bar_count"] = added_bars
+                    except Exception:
+                        pass
                     # Plan B rendering: CV-detected bar boxes give the real
                     # geometry; the vision model supplies the visual style
                     # spec; values still come from the data table.
-                    chart_style: dict[str, Any] = {}
-                    if selected_keyframe is not None:
+                    chart_style = chart_analysis.get("style") if isinstance(chart_analysis.get("style"), dict) else {}
+                    if not chart_style and selected_keyframe is not None:
                         try:
                             chart_style = match_chart_style(selected_keyframe, cfg)
                         except Exception:
                             chart_style = {}
+                    # The vision analysis supplies per-bar pixel boxes (the
+                    # authoritative layout of the original frame).  CV boxes
+                    # are the fallback when the vision layout is missing or
+                    # too sparse.  Boxes are scaled from frame pixels to the
+                    # 1280x720 canvas so the bars keep their original
+                    # relative positions/distribution.
+                    vision_bars = chart_analysis.get("bars") if isinstance(chart_analysis.get("bars"), list) else []
+                    vision_geometry = [
+                        {
+                            "label": str(b.get("label") or "").strip(),
+                            "x": b.get("x"),
+                            "y": b.get("y"),
+                            "w": b.get("w"),
+                            "h": b.get("h"),
+                        }
+                        for b in vision_bars
+                        if b.get("x") is not None and b.get("w") is not None and str(b.get("label") or "").strip()
+                    ]
                     cv_geometry = _cv_geometry(cv_report)
-                    if cv_geometry:
+                    geometry = vision_geometry if len(vision_geometry) >= 2 else cv_geometry
+                    geometry_scale = None
+                    geometry_offset = (120.0, 140.0)  # LEFT, TOP of the plot area
+                    using_vision_geometry = geometry is vision_geometry
+                    if using_vision_geometry:
+                        # Vision bars are 0~1 fractions of the frame; map them
+                        # onto the plot area (LEFT..RIGHT, TOP..BOTTOM) so the
+                        # bars always stay above the value axis.
+                        geometry_scale = (1220.0 - 120.0, 600.0 - 140.0)
+                    elif geometry and selected_keyframe is not None:
+                        frame = cv2.imread(str(selected_keyframe))
+                        if frame is not None:
+                            img_h, img_w = frame.shape[:2]
+                            if img_w > 0 and img_h > 0:
+                                geometry_scale = ((1220.0 - 120.0) / img_w, (600.0 - 140.0) / img_h)
+                    # The CV-aligned bars carry clean frame-text labels and
+                    # exact/estimated values, so they are the authoritative
+                    # render source: rebuild the metadata from them and use
+                    # the CV boxes as geometry.  (The vision layout is only
+                    # preferred when CV recovered fewer than two valued bars.)
+                    # This keeps every detected bar in the SVG -- e.g.
+                    # bar_74's four chains -- instead of whatever subset the
+                    # VLM metadata happened to name correctly.
+                    cv_bars = cv_report.get("bars") if isinstance(cv_report.get("bars"), list) else []
+                    cv_render_entities = [
+                        {
+                            "label": str(b.get("label") or "").strip(),
+                            "entity_id": str(b.get("entity_id") or ""),
+                            "value": b.get("value"),
+                            "value_type": b.get("value_type")
+                            or ("exact" if b.get("value_read_verified") else None),
+                            "value_read_verified": bool(b.get("value_read_verified")),
+                        }
+                        for b in cv_bars
+                        if b.get("value") is not None and str(b.get("label") or "").strip()
+                    ]
+                    cv_geometry = _cv_geometry(cv_report)
+                    if len(cv_render_entities) >= 2 and len(cv_geometry) >= 2:
+                        render_meta = chart_data.get("metadata") or {}
+                        render_meta = {
+                            **render_meta,
+                            "series": [
+                                {
+                                    "name": e["label"],
+                                    "entity_id": e["entity_id"],
+                                    "values": [e["value"]],
+                                    "value_type": e.get("value_type"),
+                                    "value_read_verified": e.get("value_read_verified"),
+                                }
+                                for e in cv_render_entities
+                            ],
+                            "entities": cv_render_entities,
+                        }
+                        if cv_report.get("orientation"):
+                            render_meta["orientation"] = cv_report["orientation"]
+                        geometry = cv_geometry
+                        geometry_scale = None
+                        geometry_offset = (120.0, 140.0)
+                        if selected_keyframe is not None:
+                            frame = cv2.imread(str(selected_keyframe))
+                            if frame is not None:
+                                img_h, img_w = frame.shape[:2]
+                                if img_w > 0 and img_h > 0:
+                                    geometry_scale = ((1220.0 - 120.0) / img_w, (600.0 - 140.0) / img_h)
+                        chart_data = {**chart_data, "metadata": render_meta}
+                    if geometry:
                         semantic = render_data_driven(
                             _clip_id(row),
                             chart_data.get("metadata") or {},
                             clip_root,
-                            geometry=cv_geometry,
+                            geometry=geometry,
                             style=chart_style,
+                            geometry_scale=geometry_scale,
+                            geometry_offset=geometry_offset,
                         )
                     implausible = cv_report.get("implausible_bars") or []
                     reconciled = None
@@ -1057,8 +1221,10 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                                 _clip_id(row),
                                 corrected_metadata,
                                 clip_root,
-                                geometry=cv_geometry,
+                                geometry=geometry,
                                 style=chart_style,
+                                geometry_scale=geometry_scale,
+                                geometry_offset=geometry_offset,
                             )
                         semantic["cv_align"] = cv_report
                         semantic["reconciled"] = {

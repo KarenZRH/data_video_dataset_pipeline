@@ -157,7 +157,10 @@ def _estimate_background_mask(hsv: np.ndarray) -> np.ndarray:
     bg_hue = int(np.searchsorted(cum, max(1, cum[-1] // 2)))
     return _hue_near(h, bg_hue, 18) | (s < 30) | border
 
-def _detect_bars_color(image_path: str | Path) -> list[dict[str, Any]]:
+def _detect_bars_color(
+    image_path: str | Path,
+    prefer_orientation: str | None = None,
+) -> list[dict[str, Any]]:
     """Detect bar regions via saturated-color segmentation (the robust,
     selective path).  Only pixels with real color saturation are kept, which
     naturally excludes black/gray grid lines, axis text and labels.
@@ -180,7 +183,7 @@ def _detect_bars_color(image_path: str | Path) -> list[dict[str, Any]]:
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel)
     n, _, stats, _ = cv2.connectedComponentsWithStats(fg, 8)
 
-    candidates: list[dict[str, Any]] = []
+    raw_candidates: list[dict[str, Any]] = []
     for i in range(1, n):
         x, y, w, hh, area = stats[i]
         if y < 100 or w < 25 or hh < 3:
@@ -190,9 +193,18 @@ def _detect_bars_color(image_path: str | Path) -> list[dict[str, Any]]:
         region = fg[y : y + hh, x : x + w]
         if region.sum() < area * 0.2:
             continue
-        candidates.append({"x": int(x), "y": int(y), "w": int(w), "h": int(hh)})
+        raw_candidates.append({"x": int(x), "y": int(y), "w": int(w), "h": int(hh)})
 
-    orientation = _classify_bar_orientation(candidates)
+    candidates: list[dict[str, Any]] = []
+    for b in raw_candidates:
+        pieces = _split_merged_bar(fg, b["x"], b["y"], b["w"], b["h"])
+        candidates.extend(pieces)
+
+    # Vision (analyze_chart) is authoritative for the chart's orientation;
+    # the CV geometry classifier is the fallback.  Forcing the right
+    # orientation keeps flag/label icons out (they never sit on the bar
+    # chart's start axis for that orientation).
+    orientation = prefer_orientation or _classify_bar_orientation(candidates)
     if orientation == "horizontal":
         candidates = _keep_horizontal_bars(candidates)
     elif orientation == "vertical":
@@ -202,7 +214,10 @@ def _detect_bars_color(image_path: str | Path) -> list[dict[str, Any]]:
     return candidates
 
 
-def _detect_bars_contrast(image_path: str | Path) -> list[dict[str, Any]]:
+def _detect_bars_contrast(
+    image_path: str | Path,
+    prefer_orientation: str | None = None,
+) -> list[dict[str, Any]]:
     """Detect bars by luminance contrast against the background.
 
     Fallback for light-gray / white bars on dark (or mid-tone) panels, which
@@ -257,7 +272,7 @@ def _detect_bars_contrast(image_path: str | Path) -> list[dict[str, Any]]:
         pieces = _split_merged_bar(fg, b["x"], b["y"], b["w"], b["h"])
         split_candidates.extend(pieces)
 
-    orientation = _classify_bar_orientation(split_candidates)
+    orientation = prefer_orientation or _classify_bar_orientation(split_candidates)
     if orientation == "horizontal":
         candidates = _keep_horizontal_bars(split_candidates)
         # Recover an unaligned but bar-shaped component dropped by the shared
@@ -288,7 +303,10 @@ def _detect_bars_contrast(image_path: str | Path) -> list[dict[str, Any]]:
     return candidates
 
 
-def detect_bars(image_path: str | Path) -> list[dict[str, Any]]:
+def detect_bars(
+    image_path: str | Path,
+    prefer_orientation: str | None = None,
+) -> list[dict[str, Any]]:
     """Detect bar regions, preferring the selective color path.
 
     The color path is robust for ordinary charts (saturated bars on a light
@@ -297,11 +315,11 @@ def detect_bars(image_path: str | Path) -> list[dict[str, Any]]:
     (e.g. light-gray bars on a dark panel), so noisy contrast signals cannot
     poison charts the color path handles correctly.
     """
-    color_bars = _detect_bars_color(image_path)
+    color_bars = _detect_bars_color(image_path, prefer_orientation)
     if len(color_bars) >= 3:
         return color_bars
     try:
-        contrast_bars = _detect_bars_contrast(image_path)
+        contrast_bars = _detect_bars_contrast(image_path, prefer_orientation)
     except Exception:
         contrast_bars = []
     if len(contrast_bars) > len(color_bars):
@@ -405,23 +423,41 @@ def _classify_bar_orientation(candidates: list[dict[str, Any]]) -> str:
 
 
 def _keep_vertical_bars(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep components sitting on the dominant bottom baseline (vertical bars),
-    dropping value circles / label text / other floating components."""
+    """Keep components sitting on the majority start line (vertical bars).
+
+    Every bar of one vertical chart starts on the same x-axis (its bottom
+    edge).  We find the start line shared by the most candidates and drop
+    anything that does not sit on it -- floating text, value circles and
+    pictograph icons that are not anchored to the axis are not bars.
+    """
     if not candidates:
         return []
+    # The majority start line is voted by TALL components only (real bars are
+    # tall; text/labels are short and must never pull the axis line).  Every
+    # bar of one vertical chart starts on that same x-axis (its bottom edge);
+    # anything off the line -- floating text, value circles, pictograph icons
+    # -- is not a bar and is dropped.  Short bars stay because their bottom is
+    # still on the line.
     tall = [b for b in candidates if b["h"] >= 25]
     if tall:
-        # Use the most common bottom position (rounded to 10 px) as the
-        # baseline instead of the median: a median can be pulled away by a
-        # couple of non-bar components (e.g. value circles above bars).
         bottoms = np.array([b["y"] + b["h"] for b in tall])
-        rounded = np.round(bottoms / 10.0).astype(np.int64)
+        rounded = np.round(bottoms / 8.0).astype(np.int64)
         counts = np.bincount(rounded - rounded.min())
         peak = rounded.min() + int(np.argmax(counts))
-        baseline = float(peak * 10)
-        candidates = [
-            b for b in candidates if abs((b["y"] + b["h"]) - baseline) <= 15
-        ]
+        start_line = float(peak * 8)
+        candidates = [b for b in candidates if abs((b["y"] + b["h"]) - start_line) <= 8]
+    if not candidates:
+        return []
+    # Real vertical bars in one chart share a similar width; a wildly wider
+    # blob next to narrow ones is a merged group / pictograph row (e.g. flag
+    # icons on bar_92), not a bar.  Drop it when a consistent majority exists.
+    if len(candidates) >= 3:
+        widths = np.array([b["w"] for b in candidates])
+        med_w = float(np.median(widths))
+        if med_w > 0:
+            consistent = [b for b in candidates if med_w * 0.45 <= b["w"] <= med_w * 2.0]
+            if len(consistent) >= 2:
+                candidates = consistent
     candidates.sort(key=lambda b: b["x"])
     return candidates
 
@@ -436,10 +472,10 @@ def _keep_horizontal_bars(candidates: list[dict[str, Any]]) -> list[dict[str, An
     kept = []
     for key in ("left", "right"):
         values = np.array([b["x"] if key == "left" else b["x"] + b["w"] for b in wide])
-        rounded = np.round(values / 10.0).astype(np.int64)
+        rounded = np.round(values / 8.0).astype(np.int64)
         counts = np.bincount(rounded - rounded.min())
         peak = rounded.min() + int(np.argmax(counts))
-        members = [b for b in wide if abs(round((b["x"] if key == "left" else b["x"] + b["w"]) / 10.0) - peak) <= 2]
+        members = [b for b in wide if abs(round((b["x"] if key == "left" else b["x"] + b["w"]) / 8.0) - peak) <= 1]
         if len(members) > len(kept):
             kept = members
     if len(kept) < 2:
@@ -726,16 +762,20 @@ def _labels_match(want: str, label: str) -> bool:
 
 def _looks_like_value_label(text: str) -> bool:
     """Whether a vision "label" is really a printed VALUE misread as a
-    category (e.g. "43,000", "36.1%", "43000") rather than a numeric
-    category such as a year ("2019").  Years are bare 2-4 digit tokens;
-    values carry group separators, decimals, unit symbols, or are longer.
+    category (e.g. "43,000", "$3,000", "36.1%", "43000") rather than a real
+    category label.  A token that contains letters is a label even when it
+    embeds a number ("Less than $20,000", "5-17"); a bare 2-4 digit token is
+    a year-like category ("2019").  Values carry group separators, decimals,
+    unit symbols, or are 5+ digits.
     """
     token = str(text or "").strip()
     if not token:
         return True
-    if re.search(r"[,\.%$]", token):
-        return True
-    if re.fullmatch(r"[0-9]{5,}", token):
+    cleaned = re.sub(r"[,\.%$€£\s]", "", token)
+    if not re.fullmatch(r"[0-9]+", cleaned):
+        return False
+    had_symbol = any(ch in token for ch in ",.%$€£")
+    if had_symbol or len(cleaned) >= 5:
         return True
     return False
 
@@ -849,6 +889,220 @@ def match_entities(
     if len(boxes) > len(entities):
         warnings.append(f"detected {len(boxes)} bars but only {len(entities)} entities recovered")
     return [a for a in aligned if a is not None], warnings
+
+
+def analyze_chart(
+    image_path: str | Path,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One vision call that understands the chart's fundamentals and style.
+
+    Returns ``{"chart_type", "orientation", "bar_count_hint", "axis_unit",
+    "style": {...}}`` so the pipeline can route to the correct component
+    (vertical/horizontal bar, line...) and reuse the style spec when
+    rendering -- no second style call.  Best effort: {} on any failure.
+    """
+    frame = cv2.imread(str(image_path))
+    size_hint = ""
+    if frame is not None:
+        img_h, img_w = frame.shape[:2]
+        size_hint = f"（图片实际尺寸为 {img_w}x{img_h} 像素，坐标请严格按此比例）"
+    prompt = (
+        "这是一张图表的视频关键帧。请用视觉分析并只返回一个 JSON 对象（不要解释）："
+        '{"chart_type": "bar"|"line"|"area"|"pie"|"other", '
+        '"orientation": "vertical"|"horizontal"|"none", '
+        '"bar_count": 图中柱子的总数量（整数，务必准确）, '
+        '"axis_unit": "数值轴单位符号（如 $、%、k、B USD；没有就空字符串）", '
+        '"bars": [{"label": "类别名，看不清就填 null，不要编造", '
+        '"value": 画面印刷的数字或 null, "value_text": "印刷的原始文本如 51.6B/43,000，没有就空字符串", '
+        '"color": "#rrggbb", '
+        '"x": 左上角x比例0~1, "y": 左上角y比例0~1, "w": 宽比例, "h": 高比例}, ...], '
+        '"style": {"colors": {"类别名": "#rrggbb", ...}, "background": "#rrggbb", '
+        '"gridlines": true/false, "rounded_corners": 圆角像素数, '
+        '"show_values": true/false, "value_position": "above"|"inside"|"right", '
+        '"legend": "none"|"top"|"right", "title": "标题原文或空字符串"}}。'
+        "规则：1) 必须列出图中所有柱子，一根都不能漏，bars 数组的长度必须等于 bar_count；"
+        "2) 柱子是图中表示数据量的主体图形，可以是纯色、渐变、纹理或由重复图标组成的象形柱；"
+        "标注箭头、装饰图标、国旗、人物、文字框、图例、网格线等不是柱子——"
+        "请你根据图表语义自己判断，不要把非数据图形当成柱子，也不要漏掉任何真正的柱子；"
+        "3) 类别名与画面完全一致；看不清就填 null，不能因为没有名字而漏掉这根柱子；"
+        "4) value 必须是画面中实际印刷的数字（如 53、51.6B），没有印刷数值就填 null，绝不编造；"
+        "5) x/y/w/h 用 0~1 的比例表示（相对图片宽高的比例），x=左缘、y=顶缘、w=宽、h=高，"
+        "每根条形只给一个框，框必须正好包住柱体本身；6) 颜色按画面实际给出，不能编造。"
+        + size_hint
+    )
+    try:
+        text = _call_vision(image_path, prompt, cfg, temperature=0.0)
+        obj = _extract_json_object(text)
+        if not isinstance(obj, dict):
+            return {}
+        bars = obj.get("bars") if isinstance(obj.get("bars"), list) else []
+        cleaned = []
+        for b in bars:
+            if not isinstance(b, dict):
+                continue
+            try:
+                x, y, w, h = (float(b.get(k)) for k in ("x", "y", "w", "h"))
+            except (TypeError, ValueError):
+                continue
+            if min(x, y, w, h) < 0 or max(x, y, w, h) > 1.2:
+                continue
+            b = dict(b)
+            b["x"], b["y"], b["w"], b["h"] = (
+                min(max(x, 0.0), 1.0),
+                min(max(y, 0.0), 1.0),
+                min(max(w, 0.0), 1.0),
+                min(max(h, 0.0), 1.0),
+            )
+            # Normalize printed values: vision may return "51.6B", "43,000"
+            # or a bare number.  Prefer the raw ``value_text`` when the model
+            # provided it, and keep both the original text and a numeric value
+            # so downstream estimation/rendering can use either.
+            raw_value = b.get("value")
+            value_text = str(b.get("value_text") or "").strip()
+            if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+                b["value"] = float(raw_value)
+                b["value_text"] = value_text or f"{b['value']:g}"
+            elif value_text or (isinstance(raw_value, str) and raw_value.strip()):
+                if not value_text:
+                    value_text = str(raw_value).strip()
+                match = _NUMBER_TOKEN_RE.search(value_text)
+                if match:
+                    token = match.group(0).strip()
+                    try:
+                        b["value"] = float(token.replace(",", "").rstrip("%"))
+                    except ValueError:
+                        b["value"] = None
+                else:
+                    b["value"] = None
+                b["value_text"] = value_text
+            else:
+                b["value"] = None
+                b["value_text"] = ""
+            cleaned.append(b)
+        obj["bars"] = cleaned
+        # Keep the vision's explicit count when present; otherwise trust the
+        # number of valid bars actually returned (never fewer than the list).
+        raw_count = obj.get("bar_count")
+        try:
+            raw_count = int(raw_count)
+        except (TypeError, ValueError):
+            raw_count = None
+        if raw_count is None or raw_count < len(cleaned):
+            obj["bar_count"] = len(cleaned)
+        return obj
+    except Exception:
+        return {}
+
+
+def estimate_missing_bar_values(bars: list[dict[str, Any]]) -> int:
+    """Estimate bars without a printed value from the printed ones.
+
+    Uses a linear fit between bar length (``w``) and value over all bars with
+    printed values, then fills the rest.  Faithful printed values are never
+    touched.  Returns the number of bars estimated.
+    """
+    printed = sorted(
+        (
+            (float(b["w"]), float(b["value"]))
+            for b in bars
+            if isinstance(b.get("value"), (int, float))
+            and isinstance(b.get("w"), (int, float))
+            and b["w"] > 0
+        ),
+        key=lambda pair: pair[0],
+    )
+    if len(printed) < 2:
+        return 0
+    w0, v0 = printed[0]
+    w1, v1 = printed[-1]
+    slope = (v1 - v0) / (w1 - w0) if w1 != w0 else 0.0
+    intercept = v0 - slope * w0
+    count = 0
+    for b in bars:
+        if b.get("value") is not None:
+            continue
+        if not isinstance(b.get("w"), (int, float)) or b["w"] <= 0:
+            continue
+        b["value"] = max(0.0, slope * float(b["w"]) + intercept)
+        b["value_text"] = ""
+        b["value_estimated"] = True
+        count += 1
+    return count
+
+
+def supplement_bars_from_vision(
+    cv_report: dict[str, Any],
+    vision_bars: list[dict[str, Any]],
+    image_path: str | Path,
+) -> int:
+    """Append bars the CV detector missed, using the vision read as authority.
+
+    ``detect_bars`` can miss low-contrast bars (e.g. a grey bar) and
+    ``match_entities`` can drop a detected bar whose label is absent.  The
+    vision pass sees every bar, so when it reports more bars than CV, the
+    extra bars are appended with their values and pixel geometry.  A bar
+    without a readable label keeps its printed value text as the label (never
+    an invented name).  Returns the number of bars appended.
+    """
+    cv_bars = cv_report.get("bars") if isinstance(cv_report.get("bars"), list) else []
+    if not vision_bars:
+        return 0
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        return 0
+    img_h, img_w = frame.shape[:2]
+    if img_w <= 0 or img_h <= 0:
+        return 0
+    cv_labels = {str(b.get("label") or "").strip().lower() for b in cv_bars}
+    used_ids = {str(b.get("entity_id") or "") for b in cv_bars}
+    added = 0
+    for b in vision_bars:
+        if not isinstance(b, dict):
+            continue
+        try:
+            x, y, w, h = (float(b[k]) for k in ("x", "y", "w", "h"))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if min(x, y, w, h) < 0 or max(x, y, w, h) > 1.2:
+            continue
+        label = str(b.get("label") or "").strip()
+        value = b.get("value")
+        if value is None:
+            continue
+        if label and label.lower() in cv_labels:
+            continue
+        value_text = str(b.get("value_text") or "").strip()
+        if not label and value_text:
+            label = value_text
+        if not label:
+            label = f"Bar {len(cv_bars) + added + 1}"
+        eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or f"bar-{len(cv_bars) + added + 1}"
+        if eid in used_ids:
+            eid = f"{eid}-{len(cv_bars) + added + 1}"
+        used_ids.add(eid)
+        value_type = "estimated" if b.get("value_estimated") else "exact"
+        cv_bars.append(
+            {
+                "x": round(x * img_w, 1),
+                "y": round(y * img_h, 1),
+                "w": round(w * img_w, 1),
+                "h": round(h * img_h, 1),
+                "orientation": cv_report.get("orientation"),
+                "entity_id": eid,
+                "label": label,
+                "entity_source": "vision",
+                "value": value,
+                "value_text": value_text,
+                "value_read_verified": bool(value_text),
+                "value_estimated": bool(b.get("value_estimated")),
+                "value_type": value_type,
+                "value_plausible": True,
+                "plausibility_message": "vision supplemental",
+            }
+        )
+        added += 1
+    return added
 
 
 def read_entity_order(
@@ -3302,9 +3556,11 @@ def run_cv_align(
     out_dir: str | Path,
     client: Any = None,
     cfg: dict[str, Any] | None = None,
+    prefer_orientation: str | None = None,
+    supplemental_values: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
-    boxes = detect_bars(image_path)
+    boxes = detect_bars(image_path, prefer_orientation)
     orientation = boxes[0].get("orientation") if boxes else "vertical"
     # Standard data source: one structured table read per keyframe.  It
     # returns labels + printed values + in-frame title/unit in one shot, so
@@ -3367,6 +3623,33 @@ def run_cv_align(
                         }
             except Exception:
                 pass
+    # Supplemental printed values from the vision chart analysis: when the
+    # standard-table read misses a value (model variance), the analyze_chart
+    # bars may still carry it.  Merging it here lets the relative estimation
+    # below calibrate the remaining unlabeled bars.
+    if supplemental_values:
+        by_label: dict[str, dict[str, Any]] = {}
+        for row in supplemental_values:
+            norm = _normalize_label(row.get("label"))
+            if norm:
+                by_label.setdefault(norm, row)
+        for item in values:
+            if item.get("value") is not None:
+                continue
+            row = by_label.get(_normalize_label(item.get("label")))
+            if not row:
+                continue
+            value = row.get("value")
+            if not isinstance(value, (int, float)):
+                continue
+            item["value"] = float(value)
+            item["value_text"] = str(row.get("value_text") or f"{value:g}")
+            if row.get("estimated"):
+                item["value_estimated"] = True
+                item["value_type"] = "estimated"
+                item["value_read_verified"] = False
+            else:
+                item["value_read_verified"] = True
     # A zero read on a visible bar is almost always a misread of an unlabeled
     # bar (or an axis tick), not a genuine zero; let the scale estimation
     # fill it in instead.

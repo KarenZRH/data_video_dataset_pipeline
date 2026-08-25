@@ -29,35 +29,6 @@ def _slug(text: str) -> str:
     return slug or "item"
 
 
-_GENERIC_METRICS = {
-    "value",
-    "values",
-    "metric",
-    "metrics",
-    "amount",
-    "count",
-    "quantity",
-    "total",
-    "数值",
-    "值",
-    "数量",
-    "总计",
-}
-
-
-def _display_label(label: str, metric: str) -> str:
-    """Category label for a bar entity.
-
-    The metric is appended only when it is a meaningful, non-generic name
-    (e.g. "revenue"); generic placeholders such as "value" would otherwise
-    render as "McDonald's - value" instead of "McDonald's".
-    """
-    metric = str(metric or "").strip()
-    if not metric or metric.lower() in _GENERIC_METRICS:
-        return label
-    return f"{label} - {metric}"
-
-
 def _entity_id(entity: dict[str, Any]) -> str:
     return _slug(str(entity.get("entity_id") or entity["label"]))
 
@@ -94,10 +65,16 @@ def _to_float(value: Any) -> float | None:
 
 
 def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    """Prefer semantic render metadata series; fall back to entities."""
+    """Prefer semantic render metadata series; fall back to entities.
+
+    Category labels are kept faithful to the original chart: a metric suffix
+    is appended ONLY to disambiguate grouped bars (the same category name
+    appears with several metrics).  Spurious metrics echoed by the VLM
+    (e.g. "Australia" as metric) never show up in the rendered label.
+    """
+    raw: list[dict[str, Any]] = []
     series = metadata.get("series") if isinstance(metadata.get("series"), list) else []
     if series:
-        entities: list[dict[str, Any]] = []
         for item in series:
             if not isinstance(item, dict):
                 continue
@@ -105,43 +82,65 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
             if not label:
                 continue
             metric = str(item.get("metric") or "").strip()
-            display_label = _display_label(label, metric)
             values = item.get("values") if isinstance(item.get("values"), list) else []
             value = _to_float(values[0]) if values else None
             if value is None:
                 continue
-            row = {"label": display_label, "value": value}
-            if item.get("entity_id"):
-                row["entity_id"] = str(item["entity_id"])
-            if metric:
-                row["metric"] = metric
-            entities.append(row)
-        if entities:
-            return entities
+            raw.append(
+                {
+                    "label": label,
+                    "metric": metric,
+                    "value": value,
+                    "value_type": item.get("value_type"),
+                    "value_read_verified": item.get("value_read_verified"),
+                    "entity_id": str(item["entity_id"]) if item.get("entity_id") else None,
+                }
+            )
+    if not raw:
+        for item in metadata.get("entities") if isinstance(metadata.get("entities"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not label or label.startswith("entity_"):
+                continue
+            value = _to_float(item.get("value"))
+            if value is None:
+                continue
+            metric = str(item.get("metric") or "").strip()
+            raw.append(
+                {
+                    "label": label,
+                    "metric": metric,
+                    "value": value,
+                    "value_type": item.get("value_type"),
+                    "value_read_verified": item.get("value_read_verified"),
+                    "entity_id": str(item["entity_id"]) if item.get("entity_id") else None,
+                }
+            )
 
-    entities = []
-    seen = set()
-    for item in metadata.get("entities") if isinstance(metadata.get("entities"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("label") or "").strip()
-        if not label or label.startswith("entity_"):
-            continue
-        value = _to_float(item.get("value"))
-        if value is None:
-            continue
-        metric = str(item.get("metric") or "").strip()
-        display_label = _display_label(label, metric)
-        key = (label.lower(), metric.lower())
+    metric_counts: dict[str, set[str]] = {}
+    for row in raw:
+        metric_counts.setdefault(row["label"].lower(), set()).add(row["metric"].lower())
+    entities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in raw:
+        key = (row["label"].lower(), row["metric"].lower())
         if key in seen:
             continue
         seen.add(key)
-        row = {"label": display_label, "value": value}
-        if item.get("entity_id"):
-            row["entity_id"] = str(item["entity_id"])
-        if metric:
-            row["metric"] = metric
-        entities.append(row)
+        label = row["label"]
+        if len(metric_counts[row["label"].lower()]) > 1 and row["metric"]:
+            label = f"{label} - {row['metric']}"
+        entity = {"label": label, "value": row["value"]}
+        if row.get("entity_id"):
+            entity["entity_id"] = row["entity_id"]
+        if row.get("metric"):
+            entity["metric"] = row["metric"]
+        if row.get("value_type"):
+            entity["value_type"] = row["value_type"]
+        if row.get("value_read_verified") is not None:
+            entity["value_read_verified"] = row["value_read_verified"]
+        entities.append(entity)
     return entities
 
 
@@ -164,6 +163,67 @@ def _nice_ticks(maxv: float) -> list[float]:
         ticks.append(round(v, 6))
         v += step
     return ticks
+
+
+def _nice_step(span: float, min_count: int = 3, max_count: int = 6) -> float:
+    """A 1/2/5x10^k step that yields ``min_count..max_count`` ticks in span."""
+    import math
+
+    if span <= 0:
+        return 1.0
+    exp = math.floor(math.log10(span)) - 1
+    best_step: float | None = None
+    best_score: int | None = None
+    for e in (exp, exp + 1):
+        raw = 10 ** e
+        for mult in (1, 2, 5, 10):
+            candidate = mult * raw
+            count = int(span / candidate) + 1
+            if min_count <= count <= max_count:
+                score = 0
+            elif count < min_count:
+                score = min_count - count
+            else:
+                score = count - max_count
+            if best_score is None or score < best_score or (
+                score == best_score and (best_step is None or candidate < best_step)
+            ):
+                best_score = score
+                best_step = candidate
+    return best_step if best_step is not None else 10 ** exp
+
+
+def _value_ticks(baseline: float, maxv: float) -> list[float]:
+    """Ticks on ``[baseline, maxv]`` with a nice step (mirrors _nice_ticks)."""
+    baseline = max(0.0, float(baseline))
+    span = max(0.0, float(maxv) - baseline)
+    if span <= 0:
+        return [baseline]
+    step = _nice_step(span)
+    ticks = []
+    v = baseline
+    while v <= maxv * 1.02 and len(ticks) < 10:
+        ticks.append(round(v, 6))
+        v += step
+    return ticks
+
+
+def _nice_baseline(baseline: float, span: float) -> float:
+    """Round a fitted axis baseline to a multiple of the tick step.
+
+    The bars' widths imply the real axis origin (e.g. SAT scores start at
+    400, not 0).  Rounding to a multiple of the tick step keeps tick labels
+    clean (400/600/800/...) while staying close to the fitted origin.  A
+    baseline close to zero is treated as 0.
+    """
+    baseline = float(baseline)
+    span = float(span)
+    if baseline <= 0 or span <= 0:
+        return 0.0
+    if baseline < 0.05 * (baseline + span):
+        return 0.0
+    step = _nice_step(span)
+    return max(0.0, round(baseline / step) * step)
 
 
 _YEAR_RE = re.compile(r"^\d{2,4}$")
@@ -411,28 +471,64 @@ def _geometry_value_scale(
     Vertical bars encode the value with their height (baseline = bar bottom),
     horizontal bars with their width (start = shared left edge).  When bars
     sit at real pixel positions, ticks must be calibrated from the geometry,
-    otherwise the axis floats independently and contradicts the bars.
-    Returns {"scale", "baseline"/"start"} or None.
+    otherwise the axis floats independently and contradicts the bars.  The
+    axis origin is *not* assumed to be 0: a regression over (value, length)
+    pairs recovers the real baseline (e.g. a SAT-score axis that starts at
+    400), rounded to a multiple of the tick step.
+    Returns {"scale", "anchor", "baseline"} or None.
     """
-    scales: list[float] = []
+    pairs: list[tuple[float, float]] = []
     anchors: list[float] = []
     for e in layout:
         value = float(e["value"])
-        if value <= 0:
+        length = float(e["w"]) if horizontal else float(e["h"])
+        if value <= 0 or length <= 0:
             continue
-        if horizontal:
-            scales.append(float(e["w"]) / value)
-            anchors.append(float(e["x"]))
-        else:
-            scales.append(float(e["h"]) / value)
-            anchors.append(float(e["y"]) + float(e["h"]))
-    if not scales:
+        pairs.append((value, length))
+        anchors.append(float(e["x"]) if horizontal else (float(e["y"]) + float(e["h"])))
+    if not pairs:
         return None
-    scales.sort()
     anchors.sort()
+    anchor = anchors[len(anchors) // 2]
+    # Exact (directly printed) values are the trustworthy calibration points;
+    # estimated values may come from a different scale (vision length
+    # calibration) and would skew the fitted axis origin.
+    def _is_exact(e: dict[str, Any]) -> bool:
+        vt = str(e.get("value_type") or "")
+        if vt == "exact":
+            return True
+        if vt in ("", "None") and e.get("value_read_verified"):
+            return True
+        return False
+
+    exact_pairs = []
+    for e in layout:
+        if not _is_exact(e):
+            continue
+        value = float(e["value"])
+        length = float(e["w"]) if horizontal else float(e["h"])
+        if value > 0 and length > 0:
+            exact_pairs.append((value, length))
+    fit_pairs = exact_pairs if len(exact_pairs) >= 2 else pairs
+    if len(fit_pairs) >= 2:
+        vs = [p[0] for p in fit_pairs]
+        ls = [p[1] for p in fit_pairs]
+        mean_v = sum(vs) / len(vs)
+        mean_l = sum(ls) / len(ls)
+        denom = sum((v - mean_v) ** 2 for v in vs)
+        if denom > 0:
+            scale = sum((v - mean_v) * (l - mean_l) for v, l in fit_pairs) / denom
+            intercept = mean_l - scale * mean_v
+            if scale > 0:
+                baseline = -intercept / scale
+                span = max(vs) - baseline
+                nice = _nice_baseline(baseline, span) if span > 0 else 0.0
+                return {"scale": scale, "anchor": anchor, "baseline": nice}
+    scales = sorted(l / v for v, l in fit_pairs if v > 0) or sorted(l / v for v, l in pairs if v > 0)
     return {
         "scale": scales[len(scales) // 2],
-        "anchor": anchors[len(anchors) // 2],
+        "anchor": anchor,
+        "baseline": 0.0,
     }
 
 
@@ -940,27 +1036,41 @@ def _build_svg(
     show_values = bool(style.get("show_values", True))
     value_position = str(style.get("value_position") or ("right" if horizontal else "above"))
     legend = str(style.get("legend") or "none")
+    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
+    geo_scale = _geometry_value_scale(layout, horizontal)
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
         f'<rect id="scene-background-fill" data-role="background-fill" x="0" y="0" width="{W}" height="{H}" fill="{html.escape(background)}"/>',
         f'<text id="chart-title" data-role="title" x="{W / 2}" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="36" font-weight="700" fill="#222222">{html.escape(title)}</text>',
         '<g id="chart-plot" data-role="plot">',
-        f'<line data-role="axis" x1="{LEFT}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
-        f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>',
     ]
-    maxv = max((e["value"] for e in layout), default=1.0) or 1.0
-    geo_scale = _geometry_value_scale(layout, horizontal)
-    for tv in _nice_ticks(maxv * 1.08):
+    if geo_scale is not None:
+        # Geometry mode: the bars carry the real positions, so the value axis
+        # (and its baseline tick) sits exactly at the bars' common start line
+        # instead of the canvas edge.
         if horizontal:
-            tx = (geo_scale["anchor"] + tv * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
-            if gridlines and tv > 0:
+            anchor_x = geo_scale["anchor"]
+            lines.append(f'<line data-role="axis" x1="{anchor_x:.1f}" y1="{TOP}" x2="{anchor_x:.1f}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
+            lines.append(f'<line data-role="axis" x1="{anchor_x:.1f}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
+        else:
+            anchor_y = geo_scale["anchor"]
+            lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{anchor_y:.1f}" x2="{RIGHT}" y2="{anchor_y:.1f}" stroke="#666666" stroke-width="3"/>')
+            lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{anchor_y:.1f}" stroke="#666666" stroke-width="3"/>')
+    else:
+        lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
+        lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
+    baseline = float(geo_scale.get("baseline") or 0.0) if geo_scale else 0.0
+    for tv in _value_ticks(baseline, maxv * 1.08):
+        if horizontal:
+            tx = (geo_scale["anchor"] + (tv - baseline) * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
+            if gridlines and tv > baseline:
                 lines.append(f'<line data-role="gridline" x1="{tx:.1f}" y1="{TOP}" x2="{tx:.1f}" y2="{BOTTOM}" stroke="#cccccc" stroke-width="1" stroke-dasharray="4,4"/>')
             lines.append(f'<line data-role="tick" x1="{tx:.1f}" y1="{BOTTOM}" x2="{tx:.1f}" y2="{BOTTOM + 8}" stroke="#666666" stroke-width="2"/>')
             lines.append(f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
         else:
-            ty = (geo_scale["anchor"] - tv * geo_scale["scale"]) if geo_scale else BOTTOM - tv / maxv * (BOTTOM - TOP)
-            if gridlines and tv > 0:
+            ty = (geo_scale["anchor"] - (tv - baseline) * geo_scale["scale"]) if geo_scale else BOTTOM - tv / maxv * (BOTTOM - TOP)
+            if gridlines and tv > baseline:
                 lines.append(f'<line data-role="gridline" x1="{LEFT}" y1="{ty:.1f}" x2="{RIGHT}" y2="{ty:.1f}" stroke="#cccccc" stroke-width="1" stroke-dasharray="4,4"/>')
             lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
             lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
@@ -987,26 +1097,45 @@ def _build_svg(
             value_label_x = e["x"] + e["w"] / 2
             value_label_y = e["y"] - 14
             value_anchor = "middle"
-        category_label_x = (e["x"] + 2) if horizontal else (e["x"] + e["w"] / 2)
-        category_label_y = (e["y"] - 14) if horizontal else (BOTTOM + 30)
-        category_anchor = "start" if horizontal else "middle"
+        if horizontal:
+            # Horizontal-bar charts label each bar to the LEFT of the value
+            # axis, vertically centred on the bar -- not above the bar.
+            category_label_x = e["x"] - 14
+            category_label_y = e["y"] + e["h"] / 2 - 8
+            category_anchor = "end"
+        else:
+            category_label_x = e["x"] + e["w"] / 2
+            category_label_y = BOTTOM + 30
+            category_anchor = "middle"
+        # Keep the label font constant; wrap to multiple lines when the label
+        # would overflow its slot instead of shrinking the text.
+        if horizontal:
+            label_lines = _wrap_text(e["label"], max(40.0, category_label_x - 12))
+        else:
+            label_lines = _wrap_text(e["label"], max(40.0, _bar_slot(layout, i) * 0.95))
         label_font_size = 20
-        if not horizontal and _estimate_text_width(e["label"], 20) > _bar_slot(layout, i) * 0.9:
-            # Keep the label in place but shrink it so neighbours never
-            # overlap (rotating long labels looks worse).
-            label_font_size = max(
-                10,
-                min(20, int(_bar_slot(layout, i) * 0.9 / (0.55 * max(1, len(str(e["label"])))))),
-            )
         if show_values:
             lines.append(
                 f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
                 f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{html.escape(_format_value(e["value"], unit))}</text>'
             )
-        lines.append(
-            f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
-            f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="#333333">{html.escape(e["label"])}</text>'
-        )
+        label_parts = [html.escape(part) for part in label_lines[:3]]
+        if len(label_lines) > 3:
+            label_parts[2] = label_parts[2][: max(1, len(label_parts[2]) - 1)] + "&#8230;"
+        if len(label_parts) == 1:
+            lines.append(
+                f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
+                f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="#333333">{label_parts[0]}</text>'
+            )
+        else:
+            tspans = "".join(
+                f'<tspan x="{category_label_x:.1f}" dy="{20 if idx else 0:.1f}">{part}</tspan>'
+                for idx, part in enumerate(label_parts)
+            )
+            lines.append(
+                f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
+                f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="#333333">{tspans}</text>'
+            )
         lines.append("</g>")
     if legend in {"top", "right"} and layout:
         legend_y = 92
@@ -1028,6 +1157,32 @@ def _build_svg(
 def _estimate_text_width(text: str, font_size: float) -> float:
     """Rough text width estimate (average glyph ~0.55em) for box sizing."""
     return max(10.0, len(str(text)) * 0.55 * font_size)
+
+
+def _wrap_text(text: str, max_width: float, font_size: float = 20) -> list[str]:
+    """Wrap a label into lines that each fit within ``max_width`` px.
+
+    Word boundaries are preferred; a long unbroken token (e.g. "$140,000") is
+    kept whole rather than chopped mid-token.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return [""]
+    words = text.split()
+    if len(words) == 1:
+        return [words[0]]
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        if not current or _estimate_text_width(trial, font_size) <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _build_components_svg(
@@ -1241,13 +1396,15 @@ def _render_preview(
     d.line([(LEFT, BOTTOM), (RIGHT, BOTTOM)], fill=(100, 100, 100), width=3)
     d.line([(LEFT, TOP), (LEFT, BOTTOM)], fill=(100, 100, 100), width=3)
     maxv = max((e["value"] for e in layout), default=1.0) or 1.0
-    for tv in _nice_ticks(maxv):
+    geo_scale = _geometry_value_scale(layout, horizontal)
+    baseline = float(geo_scale.get("baseline") or 0.0) if geo_scale else 0.0
+    for tv in _value_ticks(baseline, maxv):
         if horizontal:
-            tx = LEFT + tv / maxv * (RIGHT - LEFT)
+            tx = (geo_scale["anchor"] + (tv - baseline) * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
             d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
             d.text((tx - 20, BOTTOM + 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
         else:
-            ty = BOTTOM - tv / maxv * (BOTTOM - TOP)
+            ty = (geo_scale["anchor"] - (tv - baseline) * geo_scale["scale"]) if geo_scale else BOTTOM - tv / maxv * (BOTTOM - TOP)
             d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
             d.text((LEFT - 70, ty - 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
     for i, e in enumerate(layout):
@@ -1255,24 +1412,27 @@ def _render_preview(
         text = _format_value(e["value"], unit)
         if horizontal:
             d.text((e["x"] + e["w"] + 10, e["y"] + e["h"] / 2 - 16), text, fill=(30, 30, 30), font=font_v)
-            d.text((e["x"] + 2, e["y"] - 28), e["label"], fill=(50, 50, 50), font=font_l)
+            label_lines = _wrap_text(e["label"], max(40.0, e["x"] - 26))
+            line_count = min(3, len(label_lines))
+            for li, ln in enumerate(label_lines[:line_count]):
+                d.text(
+                    (e["x"] - 14, e["y"] + e["h"] / 2 - 8 - (line_count - 1) * 9 + li * 18),
+                    ln,
+                    fill=(50, 50, 50),
+                    font=font_l,
+                    anchor="rs",
+                )
         else:
             d.text((e["x"] + e["w"] / 2 - d.textlength(text, font=font_v) / 2, e["y"] - 28), text, fill=(30, 30, 30), font=font_v)
-            label = str(e["label"])
-            if d.textlength(label, font=font_l) > _bar_slot(layout, i) * 0.9:
-                small_size = max(10, min(20, int(_bar_slot(layout, i) * 0.9 / (0.55 * max(1, len(label))))))
-                try:
-                    font_ls = ImageFont.truetype("arial.ttf", small_size)
-                except Exception:
-                    font_ls = font_l
+            label_lines = _wrap_text(e["label"], max(40.0, _bar_slot(layout, i) * 0.95))
+            line_count = min(3, len(label_lines))
+            for li, ln in enumerate(label_lines[:line_count]):
                 d.text(
-                    (e["x"] + e["w"] / 2 - d.textlength(label, font=font_ls) / 2, BOTTOM + 12),
-                    label,
+                    (e["x"] + e["w"] / 2 - d.textlength(ln, font=font_l) / 2, BOTTOM + 8 + li * 18),
+                    ln,
                     fill=(50, 50, 50),
-                    font=font_ls,
+                    font=font_l,
                 )
-            else:
-                d.text((e["x"] + e["w"] / 2 - d.textlength(label, font=font_l) / 2, BOTTOM + 8), label, fill=(50, 50, 50), font=font_l)
     img.save(out)
     return out.exists()
 
@@ -1283,6 +1443,8 @@ def render_data_driven(
     out_dir: str | Path,
     geometry: list[dict[str, Any]] | None = None,
     style: dict[str, Any] | None = None,
+    geometry_scale: tuple[float, float] | None = None,
+    geometry_offset: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
     entities = entities_from_metadata(metadata)
@@ -1290,6 +1452,14 @@ def render_data_driven(
     layout = _layout_from_geometry(entities, geometry) if geometry else _layout(entities, orientation)
     if not layout:
         layout = _layout(entities, orientation)
+    if geometry_scale and layout:
+        sx, sy = geometry_scale
+        ox, oy = geometry_offset or (0.0, 0.0)
+        for e in layout:
+            e["x"] = ox + float(e["x"]) * sx
+            e["y"] = oy + float(e["y"]) * sy
+            e["w"] = float(e["w"]) * sx
+            e["h"] = float(e["h"]) * sy
     title = str(metadata.get("title") or "Data Chart").replace("\r", " ")
     # A VLM title may join the main title and the source line with a newline
     # ("Monthly price of Humira, arthritis drug\nCommonwealth Fund, 2017");

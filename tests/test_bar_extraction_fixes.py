@@ -18,6 +18,7 @@ from datavideo.cv_align import (
     _extract_json_object,
     _looks_like_value_label,
     _segment_bar_plateaus,
+    detect_bars,
     match_entities,
     read_chart_table,
 )
@@ -35,8 +36,9 @@ def test_entities_from_metadata_skips_generic_metric_in_label():
     entities = entities_from_metadata(metadata)
     labels = [e["label"] for e in entities]
     assert "McDonald's" in labels
-    assert "McDonald's - value" not in labels
-    assert "Subway - locations" in labels
+    assert "Subway" in labels
+    # Bar category labels are always plain -- never append a metric suffix.
+    assert all(" - " not in label for label in labels)
 
 
 def test_clean_states_drops_keyless_duplicate_of_aligned_entity():
@@ -207,6 +209,9 @@ def test_looks_like_value_label_distinguishes_years_from_values():
     assert _looks_like_value_label("43,000")
     assert _looks_like_value_label("36.1%")
     assert _looks_like_value_label("43000")
+    assert not _looks_like_value_label("Less than $20,000")
+    assert not _looks_like_value_label("5-17")
+    assert _looks_like_value_label("$3,000")
 
 
 def test_match_entities_matches_numeric_year_label():
@@ -311,15 +316,16 @@ def test_segment_bar_plateaus_merges_brief_dip():
     assert plateaus[0][0]["vector"] == [0.5, 1.0]
 
 
-def test_selection_rank_prefers_modal_full_count_later_frame():
+def test_selection_rank_prefers_regular_full_count_later_frame():
     from datavideo.multichart_assets import _selection_rank
 
-    def mk(ts, count, full, combined=1.0):
+    def mk(ts, count, full, combined=1.0, regularity=1.0):
         return {
             "timestamp": ts,
             "clip_duration": 10.0,
             "cv_bar_count": count,
             "_bar_full_count": full,
+            "bar_regularity": regularity,
             "combined_score": combined,
             "score": {
                 "target_chart_type_match": True,
@@ -334,7 +340,7 @@ def test_selection_rank_prefers_modal_full_count_later_frame():
         }
 
     cfg = {"keyframes": {"prefer_late_chart_types": ["bar"]}}
-    noisy = mk(1.0, 8, 7)  # over-counted early frame (8 != modal 7)
+    noisy = mk(1.0, 8, 7, regularity=0.0)  # over-counted / cross-fade early frame
     early_full = mk(1.25, 7, 7)
     late_full = mk(6.75, 7, 7)
     assert _selection_rank(late_full, "bar", cfg) > _selection_rank(noisy, "bar", cfg)
@@ -368,6 +374,37 @@ def test_render_data_driven_uses_cv_geometry_and_style(tmp_path):
     assert report["success"] is True
 
 
+def test_render_data_driven_scales_geometry(tmp_path):
+    from datavideo.semantic_render import render_data_driven
+
+    metadata = {
+        "title": "T",
+        "unit": "",
+        "orientation": "horizontal",
+        "series": [{"name": "A", "values": [10.0]}],
+    }
+    geometry = [{"label": "A", "x": 100, "y": 50, "w": 200, "h": 30}]
+    render_data_driven("bar_x", metadata, tmp_path, geometry=geometry, geometry_scale=(2.0, 2.0))
+    svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+    assert 'x="200.0" y="100.0" width="400.0" height="60.0"' in svg
+
+
+def test_render_data_driven_value_position_left(tmp_path):
+    from datavideo.semantic_render import render_data_driven
+
+    metadata = {
+        "title": "T",
+        "unit": "B",
+        "orientation": "horizontal",
+        "series": [{"name": "A", "values": [51.6]}],
+    }
+    style = {"show_values": True, "value_position": "left"}
+    render_data_driven("bar_x", metadata, tmp_path, style=style)
+    svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+    assert 'data-role="value-label"' in svg
+    assert 'text-anchor="end"' in svg
+
+
 def test_match_chart_style_parses_vision_json(monkeypatch):
     import datavideo.semantic_render as semantic_render
 
@@ -382,3 +419,72 @@ def test_match_chart_style_parses_vision_json(monkeypatch):
     assert style["colors"]["A"] == "#ff0000"
     assert style["rounded_corners"] == 4
     assert style["value_position"] == "inside"
+
+
+def test_analyze_chart_parses_vision_json(monkeypatch):
+    import datavideo.cv_align as cv_align
+
+    responses = iter(
+        [
+            '{"chart_type": "bar", "orientation": "horizontal", "axis_unit": "$", '
+            '"bars": [{"label": "A", "value": "51.6B", "x": 0.1, "y": 0.2, "w": 0.4, "h": 0.5}, '
+            '{"label": "B", "value": 20, "x": 0.6, "y": 0.2, "w": 0.4, "h": 0.6}], '
+            '"style": {"colors": {"A": "#ff0000"}, "background": "#ffffff", "gridlines": true, '
+            '"rounded_corners": 0, "show_values": false, "value_position": "right", '
+            '"legend": "none", "title": "T"}}'
+        ]
+    )
+    monkeypatch.setattr(cv_align, "_call_vision", lambda *args, **kwargs: next(responses))
+    result = cv_align.analyze_chart("frame.png", {})
+    assert result["orientation"] == "horizontal"
+    assert len(result["bars"]) == 2
+    assert result["bars"][0]["label"] == "A" and result["bars"][0]["x"] == 0.1
+    assert result["bars"][0]["value"] == 51.6
+    assert result["bars"][0]["value_text"] == "51.6B"
+    assert result["style"]["colors"]["A"] == "#ff0000"
+
+
+def test_supplement_bars_from_vision_appends_missing_bars(tmp_path):
+    import cv2
+    import numpy as np
+    from datavideo.cv_align import supplement_bars_from_vision
+
+    img = np.full((200, 400, 3), 255, dtype=np.uint8)
+    frame_path = tmp_path / "frame.png"
+    cv2.imwrite(str(frame_path), img)
+    cv_report = {
+        "orientation": "vertical",
+        "bars": [
+            {"entity_id": "rise", "label": "Rise", "value": 7.0, "x": 10, "y": 100, "w": 40, "h": 100},
+            {"entity_id": "fall", "label": "Fall", "value": 42.0, "x": 60, "y": 100, "w": 40, "h": 100},
+        ],
+    }
+    vision_bars = [
+        {"label": "Rise", "value": 7.0, "x": 0.1, "y": 0.2, "w": 0.1, "h": 0.3},
+        {"label": "Fall", "value": 42.0, "x": 0.3, "y": 0.2, "w": 0.1, "h": 0.3},
+        {"label": "Unsure", "value": 22.0, "value_text": "22%", "x": 0.5, "y": 0.2, "w": 0.1, "h": 0.3},
+        {"label": None, "value": 43000.0, "value_text": "43,000", "x": 0.7, "y": 0.2, "w": 0.1, "h": 0.3},
+    ]
+    added = supplement_bars_from_vision(cv_report, vision_bars, frame_path)
+    assert added == 2
+    labels = [b["label"] for b in cv_report["bars"]]
+    assert "Unsure" in labels
+    assert "43,000" in labels  # unlabelled bar keeps its printed value text
+    uns = [b for b in cv_report["bars"] if b["label"] == "Unsure"][0]
+    assert uns["value"] == 22.0
+    assert uns["value_text"] == "22%"
+    assert uns["x"] == 200 and uns["w"] == 40  # 0.5*400, 0.1*400
+
+
+def test_detect_bars_respects_preferred_orientation(tmp_path):
+    import cv2
+    import numpy as np
+
+    img = np.full((360, 640, 3), 255, dtype=np.uint8)
+    cv2.rectangle(img, (100, 100), (160, 300), (30, 144, 255), -1)
+    cv2.rectangle(img, (200, 150), (260, 300), (255, 165, 0), -1)
+    cv2.rectangle(img, (300, 200), (360, 300), (220, 20, 60), -1)
+    path = tmp_path / "v.png"
+    cv2.imwrite(str(path), img)
+    assert len(detect_bars(str(path), prefer_orientation="vertical")) >= 3
+    assert len(detect_bars(str(path), prefer_orientation="horizontal")) < 3

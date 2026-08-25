@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cv2
+import json
 import re
 import shutil
 from pathlib import Path
@@ -10,6 +11,7 @@ from datavideo.frames import extract_frames, write_frame_manifest
 from datavideo.keyframes import _clamp01, _image_motion_scores, extract_still
 from datavideo.cv_align import (
     _detect_tick_label_blocks,
+    _call_vision,
     bar_layout_regularity,
     detect_axis_tick_marks,
     detect_bars,
@@ -36,6 +38,58 @@ def _clip_id(row: dict[str, Any]) -> str:
         or row.get("clip_id")
         or f"{row.get('chart_type') or 'chart'}_{row.get('chart_index') or 0}"
     )
+
+
+_VISION_BAR_VALUES_PROMPT = (
+    "这是视频中的柱状图画面。请只统计柱状图的柱子：输出 JSON "
+    '{"bar_count": 柱子总数, "bars":[{"label":"柱子的类别标签","value_printed":true/false}]}。'
+    "value_printed 表示该柱子上方/旁边是否印有数值（如 42%）。"
+    "必须列出所有柱子，一根都不能漏；类别名看不清就填 null，不能因此漏柱。"
+    '如果画面里没有柱子，输出 {"bar_count": 0, "bars":[]}。不要输出 JSON 以外的内容。'
+)
+
+
+def _vision_printed_value_count(image_path: str | Path, cfg: dict[str, Any]) -> tuple[int, int]:
+    """(printed-value bar count, total bar count) of ``image_path``.
+
+    Bars are drawn before their value labels pop in, so a frame can look
+    complete while its data is still unusable.  CV bar counts cannot see the
+    labels, so keyframe selection uses this compact vision pass on the top
+    candidates and prefers the frame with the most printed values (then the
+    most bars, so a frame with all bars present wins even when some labels are
+    missing).  Returns (-1, -1) when the vision call or parse fails (the
+    caller then falls back to the CV-based ranking).
+    """
+    try:
+        raw = _call_vision(str(image_path), _VISION_BAR_VALUES_PROMPT, cfg, temperature=0.0)
+    except Exception:
+        return -1, -1
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return -1, -1
+    try:
+        data = json.loads(match.group(0))
+    except Exception:
+        return -1, -1
+    bars = data.get("bars") if isinstance(data, dict) else None
+    if not isinstance(bars, list):
+        return -1, -1
+    try:
+        bar_count = int(data.get("bar_count"))
+    except (TypeError, ValueError):
+        bar_count = len(bars)
+    bar_count = max(bar_count, len(bars))
+    count = 0
+    for bar in bars:
+        if not isinstance(bar, dict):
+            continue
+        label = str(bar.get("label") or "")
+        printed = bool(bar.get("value_printed"))
+        if not printed and re.search(r"\d", label):
+            printed = True
+        if printed:
+            count += 1
+    return count, bar_count
 
 
 def _keyframe_asset(keyframes: dict[str, Any]) -> Path:
@@ -194,13 +248,13 @@ def _prefer_late_chart_types(cfg: dict[str, Any]) -> set[str]:
     return {str(value).lower() for value in _as_list(values)}
 
 
-def _selection_rank(row: dict[str, Any], chart_type: str, cfg: dict[str, Any]) -> tuple[bool, bool, bool, bool, bool, float, float, bool, float, float]:
+def _selection_rank(row: dict[str, Any], chart_type: str, cfg: dict[str, Any]) -> tuple[Any, ...]:
     score = row["score"]
     duration = float(row.get("clip_duration", 0.0))
     timestamp = float(row["timestamp"])
     time_position = timestamp / duration if duration else 0.0
     late_priority = time_position if chart_type.lower() in _prefer_late_chart_types(cfg) else 0.0
-    return (
+    base = (
         bool(score.get("target_chart_type_match", score.get("same_chart"))),
         not bool(score.get("scene_change_or_title_card", score.get("scene_change"))),
         bool(score.get("structure_complete", score.get("complete_chart"))),
@@ -209,9 +263,60 @@ def _selection_rank(row: dict[str, Any], chart_type: str, cfg: dict[str, Any]) -
         _clamp01(score.get("completeness")),
         _clamp01(score.get("state_finality")),
         bool(score.get("data_marks_readable")),
-        late_priority,
-        float(row["combined_score"]),
     )
+    if "bar" in chart_type.lower() or "combined" in chart_type.lower():
+        # For bar charts the completeness signal is (1) how many bars carry a
+        # directly printed value (values pop in after the bars finish
+        # drawing), then (2) the number of bars with a *regular* layout: an
+        # over-counted frame (text blobs, cross-fade) has near-zero regularity
+        # and must never rank above a genuinely complete frame.  Among equally
+        # complete frames prefer the later timestamp, then the raw
+        # CV-augmented score.  (Qwen's per-frame completeness fields still
+        # gate the rank above this, so a scene-change or partial chart never
+        # wins on bar count alone.)  ``_printed_value_count`` is only set for
+        # the top candidates by the vision pass; -1 keeps the remaining rows
+        # below them so the vision signal decides among the finalists only.
+        printed = float(row.get("_printed_value_count", -1.0))
+        vision_bars = float(row.get("_vision_bar_count", -1.0))
+        count = float(row.get("cv_bar_count") or 0.0)
+        regularity = float(row.get("bar_regularity") or 0.0)
+        effective_count = count if regularity >= 0.5 else 0.0
+        # Value completeness (printed values, then total bars) is the primary
+        # signal; among equally complete frames the later one is preferred
+        # (values pop in after the bars finish drawing), then the CV bar count
+        # breaks remaining ties.
+        return (*base, printed, vision_bars, late_priority, effective_count, regularity, float(row["combined_score"]))
+    return (*base, late_priority, float(row["combined_score"]))
+
+
+def _bar_scan_rank(row: dict[str, Any], chart_type: str, cfg: dict[str, Any]) -> tuple[Any, ...]:
+    """Rank bar candidates for the *vision scan order* only.
+
+    The scan must look at the most complete-looking frames first (by CV bar
+    count + regularity), NOT the latest ones: putting "later" first would send
+    the vision check to clip-end frames where the chart is already leaving the
+    screen.  The final selection rank (``_selection_rank``) still prefers the
+    later frame among equally value-complete candidates.
+    """
+    score = row["score"]
+    duration = float(row.get("clip_duration", 0.0))
+    timestamp = float(row["timestamp"])
+    time_position = timestamp / duration if duration else 0.0
+    late_priority = time_position if chart_type.lower() in _prefer_late_chart_types(cfg) else 0.0
+    base = (
+        bool(score.get("target_chart_type_match", score.get("same_chart"))),
+        not bool(score.get("scene_change_or_title_card", score.get("scene_change"))),
+        bool(score.get("structure_complete", score.get("complete_chart"))),
+        not bool(score.get("edge_crop_or_occlusion")),
+        bool(score.get("final_or_most_complete_state")),
+        _clamp01(score.get("completeness")),
+        _clamp01(score.get("state_finality")),
+        bool(score.get("data_marks_readable")),
+    )
+    count = float(row.get("cv_bar_count") or 0.0)
+    regularity = float(row.get("bar_regularity") or 0.0)
+    effective_count = count if regularity >= 0.5 else 0.0
+    return (*base, effective_count, regularity, late_priority, float(row["combined_score"]))
 
 
 def _add_tail_candidate_frames(
@@ -837,6 +942,40 @@ def select_keyframe(
                 + 1.5 * item["line_tick_count"],
                 4,
             )
+    # A chart is only usable for the dataset once its values are printed:
+    # value labels usually pop in *after* the bars finish drawing, so the
+    # CV-complete frame is not necessarily value-complete.  Run one compact
+    # vision pass over the top candidates and prefer the frame with the most
+    # printed values (falls back to the CV ranking when vision fails or when
+    # the chart has no printed values at all).
+    if "bar" in chart_type or "combined" in chart_type:
+        topk = int(cfg.get("keyframes", {}).get("vision_value_topk", 3))
+        if topk > 0:
+            pre_ranked = sorted(
+                scored_rows,
+                key=lambda item: _bar_scan_rank(item, chart_type, cfg),
+                reverse=True,
+            )
+            cap = int(cfg.get("keyframes", {}).get("vision_value_scan_cap", 8))
+            scan_n = min(max(topk, 1), len(pre_ranked))
+            for candidate in pre_ranked[:scan_n]:
+                printed, vbars = _vision_printed_value_count(candidate["path"], cfg)
+                candidate["_printed_value_count"] = printed
+                candidate["_vision_bar_count"] = vbars
+            # Values often pop in *after* the bars finish drawing, so the top
+            # candidates can all report 0 printed values while a slightly
+            # later frame is already value-complete.  Extend the scan
+            # (bounded) when none of the top candidates shows a printed value,
+            # so a complete later frame is not excluded by the top-3 cutoff.
+            scanned = pre_ranked[:scan_n]
+            if cap > scan_n and scanned and max(
+                (int(c.get("_printed_value_count", -1)) for c in scanned), default=-1
+            ) <= 0:
+                extra_n = min(cap, len(pre_ranked))
+                for candidate in pre_ranked[scan_n:extra_n]:
+                    printed, vbars = _vision_printed_value_count(candidate["path"], cfg)
+                    candidate["_printed_value_count"] = printed
+                    candidate["_vision_bar_count"] = vbars
     selected = max(scored_rows, key=lambda item: _selection_rank(item, chart_type, cfg))
     keyframe_source_role = "visual_clip"
     boundary_reason = ""
@@ -850,18 +989,26 @@ def select_keyframe(
         and Path(context_video).exists()
         and context_visual_end is not None
         and ("bar" in chart_type or "combined" in chart_type)
+        and bool(cfg.get("keyframes", {}).get("context_tail_scan", False))
     ):
         try:
             ctx_duration = _duration_seconds(context_video)
-            # Use the clip-wide modal full count as the tail gate, not the
-            # noisy per-frame maximum (a single over-counted frame would
-            # otherwise raise the bar and block a genuinely complete tail).
+            # The tail is only worth taking when it is strictly more complete
+            # than the best in-clip frame.  The clip's own best count is the
+            # max over frames with a *regular* layout; the modal count (which
+            # early partial frames dominate) would set the bar too low and
+            # let an equally complete tail frame steal the selection for no
+            # benefit.
             best_clip_bars = max(
-                (int(item.get("_bar_full_count") or 0) for item in scored_rows),
+                (
+                    int(item.get("cv_bar_count") or 0)
+                    for item in scored_rows
+                    if float(item.get("bar_regularity") or 0.0) >= 0.7
+                ),
                 default=0,
             )
             if best_clip_bars <= 0:
-                best_clip_bars = max((item.get("cv_bar_count") or 0) for item in scored_rows)
+                best_clip_bars = max((int(item.get("cv_bar_count") or 0) for item in scored_rows), default=0)
             scan_dir = ensure_dir(Path(cfg.get("processed_root", "data/processed")) / clip_id / "context_tail_frames")
             # Take the first frame *after* the annotated interval that is more
             # complete than anything inside it.  This catches charts that
@@ -887,12 +1034,13 @@ def select_keyframe(
                     cnt = 0
                     tick_cnt = 0
                     regularity = 0.0
-                # The tail frame must be at least as complete as the best clip
-                # frame *and* still carry the axis tick marks; a frame where
-                # the bars have grown but the grid lines already faded out is
-                # not usable for tick-based estimation, and a cross-fade frame
-                # (irregular bar layout) must never be selected.
-                if cnt >= best_clip_bars and tick_cnt >= 2 and regularity >= 0.7:
+                # The tail frame must be strictly more complete than the best
+                # clip frame *and* still carry the axis tick marks; a frame
+                # where the bars have grown but the grid lines already faded
+                # out is not usable for tick-based estimation, and a
+                # cross-fade frame (irregular bar layout) must never be
+                # selected.
+                if cnt > best_clip_bars and tick_cnt >= 2 and regularity >= 0.7:
                     chosen_tail = (t, cnt, str(path))
                 t += 0.3
             if chosen_tail:
@@ -942,34 +1090,43 @@ def select_keyframe(
         asset = str(extract_still(context_video, context_ts, out_dir / "selected.png", force=True))
         state_rows: list[dict[str, Any]] = []
     else:
-        # Verify the chosen frame at the final (full-resolution) extraction:
-        # the scoring-time bar count comes from scaled candidate frames and
-        # can differ (e.g. an early frame that detected text blobs as bars
-        # but has no chart at full resolution).  Walk the ranked candidates
-        # until one actually yields bars.
-        ranked = sorted(
-            scored_rows,
-            key=lambda item: _selection_rank(item, chart_type, cfg),
-            reverse=True,
-        )
-        asset = None
-        for candidate in ranked:
-            candidate_ts = _safe_still_timestamp(float(candidate["timestamp"]), duration, cfg)
-            probe_path = out_dir / "keyframe_probe.png"
-            try:
-                extract_still(normalized_video, candidate_ts, probe_path, force=True)
-                probe_bars = detect_bars(str(probe_path))
-            except Exception:
-                probe_bars = []
-            if len(probe_bars) >= 2:
-                selected = candidate
-                timestamp = candidate_ts
-                asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
-                break
-        if asset is None:
-            timestamp = _safe_still_timestamp(float(selected["timestamp"]), duration, cfg)
-            asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
-        state_rows = _select_state_rows(scored_rows, selected, cfg, chart_type)
+          ranked = sorted(
+              scored_rows,
+              key=lambda item: _selection_rank(item, chart_type, cfg),
+              reverse=True,
+          )
+          asset = None
+          if "bar" in chart_type or "combined" in chart_type:
+              # The ranked selection already encodes value/bar completeness
+              # (vision) plus CV regularity.  A full-resolution bar-count
+              # re-verification is unreliable -- short bars vanish at some
+              # resolutions -- and would kick out the best frame, so the
+              # ranked pick is used directly.
+              selected = ranked[0]
+          else:
+              # Verify the chosen frame at the final extraction.  Bar
+              # detection is resolution-sensitive: a short bar can vanish
+              # (or a text block appear) between the scaled candidate and the
+              # final still, so the probe is a sanity gate -- at least one bar
+              # must survive -- rather than a strict ">= 2" re-verification.
+              # Walk the ranked candidates until one yields bars.
+              for candidate in ranked:
+                  candidate_ts = _safe_still_timestamp(float(candidate["timestamp"]), duration, cfg)
+                  probe_path = out_dir / "keyframe_probe.png"
+                  try:
+                      extract_still(normalized_video, candidate_ts, probe_path, force=True)
+                      probe_bars = detect_bars(str(probe_path))
+                  except Exception:
+                      probe_bars = []
+                  if len(probe_bars) >= 1:
+                      selected = candidate
+                      timestamp = candidate_ts
+                      asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
+                      break
+          if asset is None:
+              timestamp = _safe_still_timestamp(float(selected["timestamp"]), duration, cfg)
+              asset = str(extract_still(normalized_video, timestamp, out_dir / "selected.png", force=True))
+          state_rows = _select_state_rows(scored_rows, selected, cfg, chart_type)
     states_dir = ensure_dir(out_dir / "states")
     if force:
         for stale_state in states_dir.glob("state_*.png"):

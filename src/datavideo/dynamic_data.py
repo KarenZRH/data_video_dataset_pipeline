@@ -121,14 +121,20 @@ def entity_id_from_row(row: dict[str, Any]) -> str:
 
 
 def metric_from_row(row: dict[str, Any], default: str | None = None) -> str:
+    def _is_category_name(value: Any) -> bool:
+        # A "metric" that equals the row's own category name (label / x /
+        # series) is the VLM echoing the entity name (e.g. bar charts where
+        # series == entity), not a real metric.  Treat it as missing.
+        return value in {row.get("label"), row.get("x"), row.get("series")}
+
     for key in ("metric", "y"):
         value = row.get(key)
-        if value not in (None, "") and numeric_value(value) is None:
+        if value not in (None, "") and numeric_value(value) is None and not _is_category_name(value):
             return str(value)
     if default not in (None, "") and numeric_value(default) is None:
         return str(default)
     value = row.get("series")
-    if value not in (None, "") and numeric_value(value) is None:
+    if value not in (None, "") and numeric_value(value) is None and not _is_category_name(value):
         return str(value)
     return "value"
 
