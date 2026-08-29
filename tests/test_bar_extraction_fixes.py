@@ -464,16 +464,93 @@ def test_supplement_bars_from_vision_appends_missing_bars(tmp_path):
         {"label": "Fall", "value": 42.0, "x": 0.3, "y": 0.2, "w": 0.1, "h": 0.3},
         {"label": "Unsure", "value": 22.0, "value_text": "22%", "x": 0.5, "y": 0.2, "w": 0.1, "h": 0.3},
         {"label": None, "value": 43000.0, "value_text": "43,000", "x": 0.7, "y": 0.2, "w": 0.1, "h": 0.3},
+        # A no-value chart (e.g. pyramid): the bar must still be appended so
+        # the relative-length fallback can assign values later.
+        {"label": "0-4", "value": None, "x": 0.2, "y": 0.5, "w": 0.15, "h": 0.05},
     ]
     added = supplement_bars_from_vision(cv_report, vision_bars, frame_path)
-    assert added == 2
+    assert added == 3
     labels = [b["label"] for b in cv_report["bars"]]
     assert "Unsure" in labels
     assert "43,000" in labels  # unlabelled bar keeps its printed value text
+    assert "0-4" in labels  # value-less bars are kept for relative fallback
     uns = [b for b in cv_report["bars"] if b["label"] == "Unsure"][0]
     assert uns["value"] == 22.0
     assert uns["value_text"] == "22%"
     assert uns["x"] == 200 and uns["w"] == 40  # 0.5*400, 0.1*400
+
+
+def test_apply_relative_bar_values_normalizes_longest_to_one():
+    from datavideo.cv_align import apply_relative_bar_values
+
+    report = {
+        "bars": [
+            {"label": "A", "orientation": "horizontal", "x": 10, "y": 10, "w": 100, "h": 20},
+            {"label": "B", "orientation": "horizontal", "x": 10, "y": 40, "w": 50, "h": 20},
+            {"label": "C", "orientation": "horizontal", "x": 10, "y": 70, "w": 25, "h": 20},
+        ]
+    }
+    n = apply_relative_bar_values(report)
+    assert n == 3
+    assert report["value_axis"] is False
+    vals = {b["label"]: b["value"] for b in report["bars"]}
+    assert vals["A"] == 1.0
+    assert vals["B"] == 0.5
+    assert vals["C"] == 0.25
+    assert all(b["value_type"] == "relative" for b in report["bars"])
+    # Idempotent: bars that already carry a value are left untouched.
+    report["bars"][0]["value"] = 42.0
+    assert apply_relative_bar_values(report) == 0
+    assert report["bars"][0]["value"] == 42.0
+
+
+def test_supplement_bars_skips_geometric_duplicates_and_count_gate(tmp_path):
+    import cv2
+    import numpy as np
+    from datavideo.cv_align import supplement_bars_from_vision
+
+    img = np.full((200, 400, 3), 255, dtype=np.uint8)
+    path = tmp_path / "f.png"
+    cv2.imwrite(str(path), img)
+    report = {
+        "orientation": "vertical",
+        "bars": [
+            {"entity_id": "a", "label": "A", "value": 10.0, "x": 40, "y": 40, "w": 60, "h": 100},
+        ],
+    }
+    vision = [
+        {"label": None, "value": None, "x": 0.1, "y": 0.2, "w": 0.15, "h": 0.5},  # overlaps CV bar -> skip
+        {"label": "B", "value": 5.0, "x": 0.7, "y": 0.2, "w": 0.1, "h": 0.4},  # genuinely new -> add
+    ]
+    assert supplement_bars_from_vision(report, vision, path) == 1
+    assert len(report["bars"]) == 2
+    # Count gate: vision reports no more bars than CV -> nothing to add.
+    report2 = {"bars": [{"label": "X", "value": 1.0, "x": 0, "y": 0, "w": 10, "h": 10}]}
+    assert supplement_bars_from_vision(report2, [{"label": "Y", "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}], path) == 0
+
+
+def test_analyze_chart_normalizes_pixel_coordinates(tmp_path, monkeypatch):
+    import cv2
+    import numpy as np
+    import datavideo.cv_align as cv_align
+
+    img = np.full((200, 400, 3), 255, dtype=np.uint8)
+    frame = tmp_path / "frame400x200.png"
+    cv2.imwrite(str(frame), img)
+    responses = iter(
+        [
+            '{"chart_type":"bar","orientation":"horizontal","bar_count":1,'
+            '"bars":[{"label":"A","value":null,"x":200,"y":50,"w":100,"h":40}]}'
+        ]
+    )
+    monkeypatch.setattr(cv_align, "_call_vision", lambda *a, **k: next(responses))
+    result = cv_align.analyze_chart(str(frame), {})
+    assert len(result["bars"]) == 1
+    b = result["bars"][0]
+    assert b["x"] == 0.5  # 200 / 400
+    assert b["y"] == 0.25  # 50 / 200
+    assert b["w"] == 0.25  # 100 / 400
+    assert b["h"] == 0.2  # 40 / 200
 
 
 def test_detect_bars_respects_preferred_orientation(tmp_path):

@@ -42,6 +42,58 @@ VISION_DEFAULTS = {
 }
 
 
+_PYRAMID_LENGTH_PROMPT = (
+    "这是一个人口金字塔/双向条形图的关键帧：左侧条形、右侧条形，中间一条竖直中轴"
+    "（蓝色条与粉色条的交界处；灰色行同样以这条轴为准）。"
+    "请只返回一个 JSON 对象（不要解释）："
+    '{"axis_x": 中轴的 x 像素坐标, '
+    '"rows": [{"label": "0-4", "left_x": 该行左侧条形最左端的 x 像素, '
+    '"right_x": 该行右侧条形最右端的 x 像素}, ...]}。'
+    "必须包含全部行（每个年龄组一行）。每一行都要独立测量像素位置，"
+    "不要假设它们成等差数列或平滑变化，照实读图；看不清就填相近估计。"
+)
+
+
+def _parse_pyramid_lengths(
+    text: str, img_w: int, img_h: int
+) -> list[dict[str, Any]]:
+    """Parse the pyramid measurement JSON into normalized per-side lengths."""
+    obj = _extract_json_object(text)
+    if not isinstance(obj, dict):
+        return []
+    try:
+        axis = float(obj.get("axis_x"))
+    except (TypeError, ValueError):
+        return []
+    rows = obj.get("rows") if isinstance(obj.get("rows"), list) else []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        label = str(r.get("label") or "").strip()
+        try:
+            lx = float(r.get("left_x"))
+            rx = float(r.get("right_x"))
+        except (TypeError, ValueError):
+            continue
+        if axis <= 1.5 and lx <= 1.5 and rx <= 1.5:
+            axis_px, lx, rx = axis * img_w, lx * img_w, rx * img_w
+        else:
+            axis_px = axis
+        left_len = axis_px - lx
+        right_len = rx - axis_px
+        if left_len < 0 or right_len < 0:
+            continue
+        out.append({"label": label, "left": left_len, "right": right_len})
+    if not out:
+        return []
+    max_len = max(max(e["left"], e["right"]) for e in out) or 1.0
+    for e in out:
+        e["left"] = round(e["left"] / max_len, 4)
+        e["right"] = round(e["right"] / max_len, 4)
+    return out
+
+
 def _call_vision(
     image_path: str | Path,
     prompt: str,
@@ -57,6 +109,7 @@ def _call_vision(
     """
     cfg = cfg or {}
     v = {**VISION_DEFAULTS, **(cfg.get("cv_align") or {})}
+    timeout = int(v.get("timeout") or 240)
     attempts = [None]
     if v.get("proxy"):
         attempts.append(v["proxy"])
@@ -83,7 +136,7 @@ def _call_vision(
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                timeout=120,
+                timeout=timeout,
                 env=env,
             )
             text = (result.stdout or "").strip() or (result.stderr or "").strip()
@@ -912,8 +965,16 @@ def analyze_chart(
         '{"chart_type": "bar"|"line"|"area"|"pie"|"other", '
         '"orientation": "vertical"|"horizontal"|"none", '
         '"bar_count": 图中柱子的总数量（整数，务必准确）, '
+        '"diverging": true/false（柱子是否从中间轴线向左右两侧延伸，如人口金字塔/双向条形图）, '
+        '"center_x": 中轴x比例0~1（仅发散图给出，其他为 null）, '
         '"axis_unit": "数值轴单位符号（如 $、%、k、B USD；没有就空字符串）", '
+        '"value_axis": {"unit":"单位符号或空", '
+        '"ticks":[{"value":刻度数值, "label":"刻度原始文本如 0%", '
+        '"pos": 纵轴时=刻度线y比例0~1，横轴时=刻度线x比例0~1}], '
+        '"start": 数值轴起点比例（纵轴y/横轴x）} 或 null（无数值轴时）, '
         '"bars": [{"label": "类别名，看不清就填 null，不要编造", '
+        '"label_icon": "类别标签如果是国旗/商标等图形，给出它代表的名字（如 Ghana 或品牌名），不是图形就填 null", '
+        '"side": "left"|"right"|null（发散图/人口金字塔时必填：该柱在中轴左侧还是右侧）, '
         '"value": 画面印刷的数字或 null, "value_text": "印刷的原始文本如 51.6B/43,000，没有就空字符串", '
         '"color": "#rrggbb", '
         '"x": 左上角x比例0~1, "y": 左上角y比例0~1, "w": 宽比例, "h": 高比例}, ...], '
@@ -925,19 +986,58 @@ def analyze_chart(
         "2) 柱子是图中表示数据量的主体图形，可以是纯色、渐变、纹理或由重复图标组成的象形柱；"
         "标注箭头、装饰图标、国旗、人物、文字框、图例、网格线等不是柱子——"
         "请你根据图表语义自己判断，不要把非数据图形当成柱子，也不要漏掉任何真正的柱子；"
-        "3) 类别名与画面完全一致；看不清就填 null，不能因为没有名字而漏掉这根柱子；"
+        "3) 类别标签可以是文字，也可以是国家国旗/公司商标等图形；图形标签不是柱子，"
+        "把它们识别为标签并给出英文名称（国旗如 Ghana，商标如 McDonald），不认识就填 null；"
+        "看不清就填 null，不能因为没有名字而漏掉这根柱子；"
+        "3.6) 必须为每一根柱子逐一给出 label：检查该柱周围（上方/下方/左侧/右侧/内部）实际存在的文字或图形标签，"
+        "有就一定要读出（例如首尾两根的 POOREST/RICHEST），只有确认没有标签时才填 null；"
+        "不要把所有 label 都填 null。"
+        "3.5) 如果有数值轴刻度（如 0%、50%、100% 或 $0/$1000），在 value_axis.ticks 里列出每个刻度的数值、原始文本和位置；"
+        "没有数值轴刻度就 value_axis=null；"
         "4) value 必须是画面中实际印刷的数字（如 53、51.6B），没有印刷数值就填 null，绝不编造；"
         "5) x/y/w/h 用 0~1 的比例表示（相对图片宽高的比例），x=左缘、y=顶缘、w=宽、h=高，"
-        "每根条形只给一个框，框必须正好包住柱体本身；6) 颜色按画面实际给出，不能编造。"
+        "每根条形只给一个框，框必须正好包住柱体本身；6) 颜色按画面实际给出，不能编造；"
+        "7) 如果柱子从中间轴线向左右两侧延伸（人口金字塔/双向条形图），diverging=true 并给出 center_x，"
+        "bar_count 必须等于左右两侧柱子总数；每根柱子都要标注 side=left 或 side=right，"
+        "两侧的柱子全部列出，不能只列一侧；颜色按实际给出（如左侧蓝、右侧粉）。"
         + size_hint
     )
     try:
-        text = _call_vision(image_path, prompt, cfg, temperature=0.0)
-        obj = _extract_json_object(text)
+        obj = None
+        for _attempt in range(2):
+            try:
+                text = _call_vision(image_path, prompt, cfg, temperature=0.0)
+                candidate = _extract_json_object(text)
+                if isinstance(candidate, dict) and (candidate.get("bars") or candidate.get("chart_type")):
+                    obj = candidate
+                    break
+            except Exception:
+                continue
+        if obj is None:
+            # The full style schema can time out on dense frames (e.g. a
+            # 40-bar population pyramid).  Retry once with a minimal bars-only
+            # prompt so the chart still gets its bars.
+            try:
+                light_prompt = (
+                    "这是图表关键帧。只返回 JSON（不要解释）："
+                    '{"chart_type":"bar|line|area|pie|other","orientation":"vertical|horizontal|none",'
+                    '"bar_count":柱子总数,"diverging":true/false,'
+                    '"bars":[{"label":"类别名（国旗/商标给英文名如 Ghana）或 null",'
+                    '"side":"left"|"right"|null（发散图必填）,'
+                    '"value":画面印刷数字或 null,"value_text":"原始文本或空",'
+                    '"x":左缘比例0~1,"y":顶缘比例0~1,"w":宽比例,"h":高比例}]}。'
+                    "必须列出所有柱子（人口金字塔/双向条形图左右两侧都要，bar_count=两侧总数，每根标注 side），"
+                    "并且为每根柱子逐一给出 label：该柱周围有文字或图形标签就一定要读出（如 POOREST/RICHEST），"
+                    "没有才填 null，不要全部填 null；看不清标签填 null，不要编造。"
+                )
+                text = _call_vision(image_path, light_prompt, cfg, temperature=0.0)
+                obj = _extract_json_object(text)
+            except Exception:
+                obj = None
         if not isinstance(obj, dict):
             return {}
         bars = obj.get("bars") if isinstance(obj.get("bars"), list) else []
-        cleaned = []
+        raw_bars: list[tuple[dict[str, Any], float, float, float, float]] = []
         for b in bars:
             if not isinstance(b, dict):
                 continue
@@ -945,6 +1045,21 @@ def analyze_chart(
                 x, y, w, h = (float(b.get(k)) for k in ("x", "y", "w", "h"))
             except (TypeError, ValueError):
                 continue
+            raw_bars.append((b, x, y, w, h))
+        # The model occasionally returns pixel coordinates instead of 0~1
+        # fractions; detect that (any x/y/w/h far above 1) and normalize
+        # against the frame size so scaling to the canvas stays in-bounds.
+        px_scale: tuple[float, float] | None = None
+        if frame is not None and img_w > 0 and img_h > 0:
+            max_xy = max((max(abs(x), abs(y)) for _, x, y, _, _ in raw_bars), default=0.0)
+            max_wh = max((max(abs(w), abs(h)) for _, _, _, w, h in raw_bars), default=0.0)
+            if max_xy > 1.5 or max_wh > 1.5:
+                px_scale = (float(img_w), float(img_h))
+        cleaned = []
+        for b, x, y, w, h in raw_bars:
+            if px_scale is not None:
+                x, w = x / px_scale[0], w / px_scale[0]
+                y, h = y / px_scale[1], h / px_scale[1]
             if min(x, y, w, h) < 0 or max(x, y, w, h) > 1.2:
                 continue
             b = dict(b)
@@ -980,7 +1095,47 @@ def analyze_chart(
                 b["value"] = None
                 b["value_text"] = ""
             cleaned.append(b)
+        # Normalize "no label" answers from the model (null / none / 无 / -)
+        # to a real empty label so downstream never renders placeholder text.
+        for b in cleaned:
+            for key in ("label", "label_icon"):
+                val = str(b.get(key) or "").strip()
+                if val.lower() in {"无", "none", "null", "n/a", "na", "unknown", "-", "—", "–"}:
+                    b[key] = ""
         obj["bars"] = cleaned
+        # Parse the value-axis ticks read in the same call: each tick carries a
+        # numeric value, its raw label and its position (0~1; pixel values are
+        # normalized against the frame).  Downstream can then calibrate bars
+        # without re-detecting the tick marks.
+        value_axis = obj.get("value_axis")
+        if isinstance(value_axis, dict):
+            orient = str(obj.get("orientation") or "")
+            denom = float(img_w) if orient == "horizontal" else float(img_h)
+            ticks = []
+            for t in value_axis.get("ticks") or []:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    pos = float(t.get("pos"))
+                except (TypeError, ValueError):
+                    continue
+                label = str(t.get("label") or "").strip()
+                val = t.get("value")
+                if val is None:
+                    m = _NUMBER_TOKEN_RE.search(label)
+                    if m:
+                        try:
+                            val = float(m.group(0).replace(",", "").rstrip("%"))
+                        except ValueError:
+                            val = None
+                if val is None:
+                    continue
+                if abs(pos) > 1.5 and frame is not None and img_w > 0 and img_h > 0:
+                    pos = pos / denom
+                pos = min(max(pos, 0.0), 1.0)
+                ticks.append({"value": float(val), "label": label, "pos": round(pos, 4)})
+            value_axis["ticks"] = ticks
+            obj["tick_unit"] = str(value_axis.get("unit") or "").strip()
         # Keep the vision's explicit count when present; otherwise trust the
         # number of valid bars actually returned (never fewer than the list).
         raw_count = obj.get("bar_count")
@@ -990,6 +1145,18 @@ def analyze_chart(
             raw_count = None
         if raw_count is None or raw_count < len(cleaned):
             obj["bar_count"] = len(cleaned)
+        # Diverging / population-pyramid charts: the generic bar boxes are
+        # unreliable for pyramids and a plain "length" ask tends to hallucinate
+        # a smooth gradient.  Run a dedicated prompt that measures each row's
+        # left/right bar separately as a distance from the center axis.
+        if obj.get("diverging"):
+            try:
+                pyr_text = _call_vision(image_path, _PYRAMID_LENGTH_PROMPT, cfg, temperature=0.0)
+                pyramid_lengths = _parse_pyramid_lengths(pyr_text, img_w, img_h)
+                if len(pyramid_lengths) >= 2:
+                    obj["pyramid_lengths"] = pyramid_lengths
+            except Exception:
+                pass
         return obj
     except Exception:
         return {}
@@ -1048,12 +1215,35 @@ def supplement_bars_from_vision(
     cv_bars = cv_report.get("bars") if isinstance(cv_report.get("bars"), list) else []
     if not vision_bars:
         return 0
+    # CV already found at least as many bars: the vision read adds nothing
+    # but duplicate boxes (same bars, slightly different coordinates).
+    if len(vision_bars) <= len(cv_bars):
+        return 0
     frame = cv2.imread(str(image_path))
     if frame is None:
         return 0
     img_h, img_w = frame.shape[:2]
     if img_w <= 0 or img_h <= 0:
         return 0
+
+    def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+        ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        inter = ix * iy
+        area_a = max(1.0, (a[2] - a[0]) * (a[3] - a[1]))
+        area_b = max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+        return inter / (area_a + area_b - inter)
+
+    existing_boxes = [
+        (
+            float(b.get("x") or 0.0),
+            float(b.get("y") or 0.0),
+            float(b.get("x") or 0.0) + float(b.get("w") or 0.0),
+            float(b.get("y") or 0.0) + float(b.get("h") or 0.0),
+        )
+        for b in cv_bars
+        if float(b.get("w") or 0.0) > 0 and float(b.get("h") or 0.0) > 0
+    ]
     cv_labels = {str(b.get("label") or "").strip().lower() for b in cv_bars}
     used_ids = {str(b.get("entity_id") or "") for b in cv_bars}
     added = 0
@@ -1066,18 +1256,39 @@ def supplement_bars_from_vision(
             continue
         if min(x, y, w, h) < 0 or max(x, y, w, h) > 1.2:
             continue
-        label = str(b.get("label") or "").strip()
+        label = str(b.get("label") or "").strip() or str(b.get("label_icon") or "").strip()
         value = b.get("value")
-        if value is None:
-            continue
+        eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") if label else ""
         if label and label.lower() in cv_labels:
+            # Same named bar already exists; never add a duplicate.
             continue
+        box = (
+            round(x * img_w, 1),
+            round(y * img_h, 1),
+            round((x + w) * img_w, 1),
+            round((y + h) * img_h, 1),
+        )
+        overlap_idx = next(
+            (i for i, existing in enumerate(existing_boxes) if _iou(box, existing) >= 0.3),
+            None,
+        )
+        if overlap_idx is not None:
+            # Same physical bar as an existing CV bar (labels disagree): trust
+            # the vision label when the CV label is a placeholder.
+            if label:
+                target = cv_bars[overlap_idx]
+                current = str(target.get("label") or "").strip()
+                if not current or current.lower().startswith("bar "):
+                    target["label"] = label
+                    if eid:
+                        target["entity_id"] = eid
+            continue
+        existing_boxes.append(box)
         value_text = str(b.get("value_text") or "").strip()
         if not label and value_text:
             label = value_text
-        if not label:
-            label = f"Bar {len(cv_bars) + added + 1}"
-        eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or f"bar-{len(cv_bars) + added + 1}"
+        if not eid:
+            eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or f"bar-{len(cv_bars) + added + 1}"
         if eid in used_ids:
             eid = f"{eid}-{len(cv_bars) + added + 1}"
         used_ids.add(eid)
@@ -1103,6 +1314,48 @@ def supplement_bars_from_vision(
         )
         added += 1
     return added
+
+
+def apply_relative_bar_values(cv_report: dict[str, Any]) -> int:
+    """Assign relative values (longest bar = 1.0) to a chart with no scale.
+
+    Covers bar charts without printed values and without a numeric value
+    axis (e.g. GDP-by-country with flags, pirate-attack counts, population
+    pyramids): the bar length is the only data signal, so values are
+    normalized to the longest bar.  Bars keep their real geometry for
+    rendering; values are marked ``value_type="relative"`` and the report
+    gets ``value_axis=False`` so the renderer suppresses the (nonexistent)
+    axis ticks.  Idempotent: bars that already carry a value are untouched.
+    """
+    bars = cv_report.get("bars") if isinstance(cv_report.get("bars"), list) else []
+    if not bars:
+        return 0
+    lengths = [_bar_length(b) for b in bars if _bar_length(b) > 0]
+    if not lengths:
+        return 0
+    max_len = max(lengths)
+    if max_len <= 0:
+        return 0
+    count = 0
+    for b in bars:
+        if b.get("value") is not None:
+            continue
+        length = _bar_length(b)
+        if length <= 0:
+            continue
+        b["value"] = round(length / max_len, 4)
+        b["value_text"] = ""
+        b["value_type"] = "relative"
+        b["value_estimated"] = True
+        b["value_read_verified"] = False
+        b["value_plausible"] = True
+        b["plausibility_message"] = "relative length (longest bar = 1)"
+        count += 1
+    if count:
+        cv_report["relative_value_count"] = int(cv_report.get("relative_value_count") or 0) + count
+        cv_report["value_axis"] = False
+        cv_report["value_read_method"] = "relative_length"
+    return count
 
 
 def read_entity_order(
@@ -3558,6 +3811,7 @@ def run_cv_align(
     cfg: dict[str, Any] | None = None,
     prefer_orientation: str | None = None,
     supplemental_values: list[dict[str, Any]] | None = None,
+    vision_axis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_dir = ensure_dir(out_dir)
     boxes = detect_bars(image_path, prefer_orientation)
@@ -3687,14 +3941,37 @@ def run_cv_align(
     tick_estimated_count = 0
     verified_count = sum(1 for item in values if item.get("value_read_verified"))
     if verified_count < 2:
-        # Not enough printed values for the labeled-bar scale: try calibrating
-        # from the value-axis tick marks instead (e.g. unlabeled bar charts
-        # that still draw a "$0/$100/$200" axis).
-        try:
-            tick_marks = detect_axis_tick_marks(image_path, orientation)
-        except Exception:
-            tick_marks = []
-        if tick_marks:
+        # Prefer the tick marks read by the first big vision call
+        # (analyze_chart): they carry value+position directly, so no separate
+        # CV tick detection / label read is needed.
+        vision_paired: list[dict[str, Any]] = []
+        if vision_axis and isinstance(vision_axis.get("ticks"), list) and vision_axis["ticks"]:
+            img = cv2.imread(str(image_path))
+            ih = float(img.shape[0]) if img is not None else 1.0
+            iw = float(img.shape[1]) if img is not None else 1.0
+            denom = iw if orientation == "horizontal" else ih
+            for t in vision_axis["ticks"]:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    coord = float(t.get("pos", 0.0)) * denom
+                    value = float(t["value"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                vision_paired.append({"coord": coord, "value": value})
+        if vision_paired:
+            tick_marks = vision_paired
+            tick_unit = str(vision_axis.get("unit") or "").strip()
+            tick_estimated_count = estimate_unlabeled_values_from_ticks(values, tick_marks)
+        else:
+            # Not enough printed values for the labeled-bar scale: try
+            # calibrating from CV-detected tick marks instead (e.g. unlabeled
+            # bar charts that still draw a "$0/$100/$200" axis).
+            try:
+                tick_marks = detect_axis_tick_marks(image_path, orientation)
+            except Exception:
+                tick_marks = []
+        if tick_marks and not vision_paired:
             try:
                 tick_labels, tick_unit = read_tick_labels(image_path, cfg, orientation)
             except Exception:
@@ -3730,6 +4007,12 @@ def run_cv_align(
                             item["value_text"] = None
                             item["value_read_verified"] = False
     estimated_count += tick_estimated_count
+    # No printed values and no usable axis scale: the bar length itself is
+    # the only data signal, so normalize the longest bar to 1.0 (works for
+    # horizontal/vertical bars and diverging/pyramid layouts alike).
+    relative_count = 0
+    if not any(item.get("value") is not None for item in values) and estimated_count == 0:
+        relative_count = apply_relative_bar_values({"bars": values})
     for item in values:
         item["value_plausible"], item["plausibility_message"] = _value_plausibility(item, values)
     implausible = [
@@ -3762,6 +4045,8 @@ def run_cv_align(
         "detected_bar_count": len(boxes),
         "matched_count": len(values),
         "estimated_value_count": estimated_count,
+        "relative_value_count": relative_count,
+        "value_axis": not bool(relative_count),
         "tick_estimated_value_count": tick_estimated_count,
         "tick_mark_count": len(tick_marks),
         "tick_unit": tick_unit,

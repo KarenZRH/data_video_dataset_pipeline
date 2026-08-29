@@ -17,6 +17,7 @@ from datavideo.cv_align import (
     detect_bar_states,
     estimate_missing_bar_values,
     run_cv_align,
+    apply_relative_bar_values,
     supplement_bars_from_vision,
 )
 from datavideo.cv_align import run_cv_align_line
@@ -553,6 +554,62 @@ def _cv_geometry(cv_report: dict[str, Any] | None) -> list[dict[str, Any]]:
     return out
 
 
+def _relative_dynamic_from_bars(
+    cv_report: dict[str, Any],
+    *,
+    clip_id: str,
+    keyframe_timestamp: float | None,
+    image_path: str | Path,
+) -> dict[str, Any]:
+    """Build dynamic states from the aligned bars for a no-value-axis chart.
+
+    When a chart has no printed values and no tick scale (GDP flags, pirate
+    attacks, pyramids), the bars themselves are the entities: the VLM's
+    recovered table is usually junk here (stray labels such as "Pirate
+    Attacks 100") and must not shadow the detected bars.  Each bar becomes a
+    ``relative`` row (longest bar = 1) so the data table, render and dataset
+    all stay consistent with the actual bars.
+    """
+    states: list[dict[str, Any]] = []
+    for b in cv_report.get("bars") or []:
+        label = str(b.get("label") or "").strip()
+        if b.get("value") is None:
+            continue
+        eid = str(b.get("entity_id") or "")
+        if not eid:
+            eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "item"
+        states.append(
+            {
+                "clip_id": clip_id,
+                "state_id": "state_001",
+                "state_key": None,
+                "state_label": None,
+                "entity_id": eid,
+                "entity": label or eid,
+                "metric": "Value",
+                "value": b["value"],
+                "unit": "",
+                "state_start": 0.0,
+                "state_end": 0.0,
+                "source_type": "visual_frame_align",
+                "evidence_frames": [
+                    {
+                        "frame_id": "selected",
+                        "time_seconds": keyframe_timestamp,
+                        "path": str(image_path),
+                    }
+                ],
+                "confidence": 0.7,
+                "review_status": "machine",
+                "raw_text": "",
+                "evidence_text": "",
+                "value_type": "relative",
+                "needs_review": True,
+            }
+        )
+    return {"clip_id": clip_id, "chart_type": "bar", "states": states}
+
+
 def _copy_if_exists(src: Path, dst: Path, written: dict[str, str], dst_name: str) -> None:
     if src.exists() and src.stat().st_size > 0:
         shutil.copy2(src, dst)
@@ -1038,8 +1095,20 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                         cfg=cfg,
                         prefer_orientation=orient_hint,
                         supplemental_values=supplemental_values,
+                        vision_axis=chart_analysis.get("value_axis"),
                     )
                     semantic["cv_align"] = cv_report
+                    # The vision read is authoritative for orientation: a
+                    # diverging/pyramid chart is horizontal even when the few
+                    # bars CV detected got tagged vertical.  Propagate it so
+                    # bar lengths (w vs h) and rendering match the frame.
+                    if orient_hint in {"horizontal", "vertical"}:
+                        cv_orient = str(cv_report.get("orientation") or "")
+                        if cv_orient != orient_hint:
+                            cv_report["orientation"] = orient_hint
+                            for b in cv_report.get("bars") or []:
+                                if isinstance(b, dict):
+                                    b["orientation"] = orient_hint
                     # The CV detector can miss low-contrast bars (e.g. the
                     # grey "Unsure" bar in bar_86) or drop a bar whose label
                     # is absent from the recovered entities (bar_74's
@@ -1056,6 +1125,140 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             cv_report["supplemented_bar_count"] = added_bars
                     except Exception:
                         pass
+                    # No-value-axis charts (GDP flags, pirate attacks,
+                    # pyramids) get relative values on every bar, including
+                    # any bars the vision pass just supplemented.
+                    if not cv_report.get("value_axis", True):
+                        try:
+                            apply_relative_bar_values(cv_report)
+                        except Exception:
+                            pass
+                    # No-value-axis charts (flags, pirate attacks, pyramids):
+                    # the vision read is the authority for labels, geometry
+                    # AND relative values -- CV boxes are unreliable when
+                    # logos/flags sit next to the bars.  Replace the bar set
+                    # with the vision bars (relative = length / longest) when
+                    # vision is at least as complete as CV.
+                    vision_bars = chart_analysis.get("bars") if isinstance(chart_analysis.get("bars"), list) else []
+                    vision_geo_raw = [
+                        {
+                            **b,
+                            "label": str(b.get("label") or "").strip() or str(b.get("label_icon") or "").strip(),
+                        }
+                        for b in vision_bars
+                        if b.get("x") is not None and b.get("w") is not None and b.get("h") is not None
+                    ]
+                    relative_mode = bool(cv_report.get("relative_value_count")) or cv_report.get("value_axis") is False
+                    cv_detected = int(cv_report.get("detected_bar_count") or len(cv_report.get("bars") or []))
+                    if relative_mode and len(vision_geo_raw) >= 2 and len(vision_geo_raw) >= cv_detected:
+                        h_orient = str(chart_analysis.get("orientation") or "").strip() == "horizontal"
+                        frame = cv2.imread(str(selected_keyframe)) if selected_keyframe is not None else None
+                        img_h = frame.shape[0] if frame is not None else 1
+                        img_w = frame.shape[1] if frame is not None else 1
+                        lengths = [
+                            float(b["w"]) if h_orient else float(b["h"])
+                            for b in vision_geo_raw
+                            if (float(b["w"]) if h_orient else float(b["h"])) > 0
+                        ]
+                        max_len = max(lengths) if lengths else 1.0
+                        rel_bars = []
+                        for i, b in enumerate(vision_geo_raw):
+                            # Keep an unnamed bar's label empty: only the labels
+                            # vision actually read (e.g. the two end labels of
+                            # a poorest/richest chart) are rendered -- never
+                            # fabricate "Bar N" placeholders.
+                            label = b["label"]
+                            length = float(b["w"]) if h_orient else float(b["h"])
+                            side = str(b.get("side") or "").strip().lower()
+                            eid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or f"bar-{i + 1}"
+                            if side in ("left", "right"):
+                                eid = f"{eid}-{side}"
+                            rel_bars.append(
+                                {
+                                    "x": round(float(b["x"]) * img_w, 1),
+                                    "y": round(float(b["y"]) * img_h, 1),
+                                    "w": round(float(b["w"]) * img_w, 1),
+                                    "h": round(float(b["h"]) * img_h, 1),
+                                    "orientation": "horizontal" if h_orient else "vertical",
+                                    "entity_id": eid,
+                                    "label": label,
+                                    "entity_source": "vision",
+                                    "color": b.get("color"),
+                                    "side": b.get("side"),
+                                    "value": round(length / max_len, 4) if max_len > 0 else 1.0,
+                                    "value_text": "",
+                                    "value_type": "relative",
+                                    "value_estimated": True,
+                                    "value_read_verified": False,
+                                    "value_plausible": True,
+                                    "plausibility_message": "relative length (longest bar = 1)",
+                                }
+                            )
+                        cv_report["bars"] = rel_bars
+                        cv_report["orientation"] = "horizontal" if h_orient else "vertical"
+                        cv_report["relative_value_count"] = len(rel_bars)
+                        cv_report["value_axis"] = False
+                        cv_report["value_read_method"] = "vision_relative_length"
+                        # Diverging charts (population pyramids) distinguish
+                        # the two sides by color; fall back to blue/pink when
+                        # the vision read did not provide per-bar colors.
+                        side_color = {"left": "#4C78A8", "right": "#E45756"}
+                        for rb in rel_bars:
+                            if not rb.get("color") and rb.get("side") in side_color:
+                                rb["color"] = side_color[rb["side"]]
+                    # Pyramids: the dedicated axis-distance measurement is the
+                    # authoritative per-side value.  Build even rows around the
+                    # center axis with the classic blue/pink instead of relying
+                    # on the generic bar boxes.
+                    pyr_lengths = chart_analysis.get("pyramid_lengths")
+                    if (
+                        pyr_lengths
+                        and relative_mode
+                        and cv_report.get("value_axis") is False
+                    ):
+                        rows_n = len(pyr_lengths)
+                        top = 0.15 * img_h
+                        bottom = 0.82 * img_h
+                        pitch = (bottom - top) / rows_n
+                        bar_h = pitch * 0.55
+                        axis_px = img_w / 2.0
+                        max_len_px = min(axis_px - 0.18 * img_w, 0.92 * img_w - axis_px)
+                        rel_bars = []
+                        for i, row in enumerate(pyr_lengths):
+                            label = str(row.get("label") or "").strip() or f"row-{i + 1}"
+                            cy = top + pitch * (i + 0.5)
+                            for side, key, color in (
+                                ("left", "left", "#4C78A8"),
+                                ("right", "right", "#E45756"),
+                            ):
+                                length = max(0.0, float(row.get(key) or 0.0))
+                                w_px = max(4.0, length * max_len_px)
+                                rel_bars.append(
+                                    {
+                                        "x": round(axis_px - w_px, 1) if side == "left" else round(axis_px, 1),
+                                        "y": round(cy - bar_h / 2, 1),
+                                        "w": round(w_px, 1),
+                                        "h": round(bar_h, 1),
+                                        "orientation": "horizontal",
+                                        "entity_id": f"{label}-{side}",
+                                        "label": label,
+                                        "entity_source": "vision",
+                                        "color": color,
+                                        "side": side,
+                                        "value": length,
+                                        "value_text": "",
+                                        "value_type": "relative",
+                                        "value_estimated": True,
+                                        "value_read_verified": False,
+                                        "value_plausible": True,
+                                        "plausibility_message": "pyramid axis-distance (longest bar = 1)",
+                                    }
+                                )
+                        cv_report["bars"] = rel_bars
+                        cv_report["orientation"] = "horizontal"
+                        cv_report["relative_value_count"] = len(rel_bars)
+                        cv_report["value_axis"] = False
+                        cv_report["value_read_method"] = "vision_pyramid_axis_distance"
                     # Plan B rendering: CV-detected bar boxes give the real
                     # geometry; the vision model supplies the visual style
                     # spec; values still come from the data table.
@@ -1071,20 +1274,26 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                     # too sparse.  Boxes are scaled from frame pixels to the
                     # 1280x720 canvas so the bars keep their original
                     # relative positions/distribution.
-                    vision_bars = chart_analysis.get("bars") if isinstance(chart_analysis.get("bars"), list) else []
                     vision_geometry = [
                         {
-                            "label": str(b.get("label") or "").strip(),
+                            "label": str(b.get("label") or "").strip() or str(b.get("label_icon") or "").strip(),
                             "x": b.get("x"),
                             "y": b.get("y"),
                             "w": b.get("w"),
                             "h": b.get("h"),
                         }
-                        for b in vision_bars
-                        if b.get("x") is not None and b.get("w") is not None and str(b.get("label") or "").strip()
+                        for b in vision_geo_raw
                     ]
                     cv_geometry = _cv_geometry(cv_report)
-                    geometry = vision_geometry if len(vision_geometry) >= 2 else cv_geometry
+                    if relative_mode and len(vision_geometry) >= 2:
+                        # No-value-axis chart: trust the vision boxes -- they
+                        # are the real bar layout (CV boxes are unreliable on
+                        # flag/logo charts like bar_82).  Use the px geometry
+                        # carrying unique entity ids so left/right bars of a
+                        # diverging chart stay distinct.
+                        geometry = cv_geometry
+                    else:
+                        geometry = vision_geometry if len(vision_geometry) >= 2 else cv_geometry
                     geometry_scale = None
                     geometry_offset = (120.0, 140.0)  # LEFT, TOP of the plot area
                     using_vision_geometry = geometry is vision_geometry
@@ -1118,10 +1327,15 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             "value_read_verified": bool(b.get("value_read_verified")),
                         }
                         for b in cv_bars
-                        if b.get("value") is not None and str(b.get("label") or "").strip()
+                        if b.get("value") is not None
+                        and (str(b.get("label") or "").strip() or b.get("entity_id"))
                     ]
                     cv_geometry = _cv_geometry(cv_report)
-                    if len(cv_render_entities) >= 2 and len(cv_geometry) >= 2:
+                    if (
+                        not relative_mode
+                        and len(cv_render_entities) >= 2
+                        and len(cv_geometry) >= 2
+                    ):
                         render_meta = chart_data.get("metadata") or {}
                         render_meta = {
                             **render_meta,
@@ -1132,6 +1346,7 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                                     "values": [e["value"]],
                                     "value_type": e.get("value_type"),
                                     "value_read_verified": e.get("value_read_verified"),
+                                    "side": e.get("side"),
                                 }
                                 for e in cv_render_entities
                             ],
@@ -1139,6 +1354,14 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                         }
                         if cv_report.get("orientation"):
                             render_meta["orientation"] = cv_report["orientation"]
+                        if cv_report.get("value_axis") is False or cv_report.get("relative_value_count"):
+                            render_meta["value_axis"] = "none"
+                            chart_style = {
+                                **chart_style,
+                                "value_axis": "none",
+                                "show_values": False,
+                                "gridlines": False,
+                            }
                         geometry = cv_geometry
                         geometry_scale = None
                         geometry_offset = (120.0, 140.0)
@@ -1149,6 +1372,24 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                                 if img_w > 0 and img_h > 0:
                                     geometry_scale = ((1220.0 - 120.0) / img_w, (600.0 - 140.0) / img_h)
                         chart_data = {**chart_data, "metadata": render_meta}
+                    if relative_mode:
+                        # No value axis exists in the original chart: suppress
+                        # ticks / value labels no matter which metadata path
+                        # the render takes.
+                        render_meta = chart_data.get("metadata") or {}
+                        chart_data = {**chart_data, "metadata": {**render_meta, "value_axis": "none"}}
+                        chart_style = {
+                            **chart_style,
+                            "value_axis": "none",
+                            "show_values": False,
+                            "gridlines": False,
+                        }
+                        color_map = {}
+                        for rb in cv_report.get("bars") or []:
+                            if rb.get("color") and rb.get("entity_id"):
+                                color_map[str(rb["entity_id"])] = str(rb["color"])
+                        if color_map:
+                            chart_style = {**chart_style, "colors": color_map}
                     if geometry:
                         semantic = render_data_driven(
                             _clip_id(row),
@@ -1179,6 +1420,15 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                         }
                     if reconciled:
                         dynamic = reconciled["dynamic"]
+                        if cv_report.get("relative_value_count"):
+                            # No-value-axis chart: keep only the detected bars
+                            # (CV + vision); the VLM table is junk here.
+                            dynamic = _relative_dynamic_from_bars(
+                                cv_report,
+                                clip_id=_clip_id(row),
+                                keyframe_timestamp=_keyframe_timestamp(keyframes),
+                                image_path=selected_keyframe,
+                            )
                         chart_data = {**chart_data, "dynamic_data": dynamic}
                         corrected_metadata = metadata_from_dynamic(
                             dynamic,

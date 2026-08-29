@@ -79,7 +79,7 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(item, dict):
                 continue
             label = str(item.get("name") or "").strip()
-            if not label:
+            if not label and not item.get("entity_id"):
                 continue
             metric = str(item.get("metric") or "").strip()
             values = item.get("values") if isinstance(item.get("values"), list) else []
@@ -93,6 +93,7 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
                     "value": value,
                     "value_type": item.get("value_type"),
                     "value_read_verified": item.get("value_read_verified"),
+                    "side": item.get("side"),
                     "entity_id": str(item["entity_id"]) if item.get("entity_id") else None,
                 }
             )
@@ -101,7 +102,7 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(item, dict):
                 continue
             label = str(item.get("label") or "").strip()
-            if not label or label.startswith("entity_"):
+            if (not label and not item.get("entity_id")) or label.startswith("entity_"):
                 continue
             value = _to_float(item.get("value"))
             if value is None:
@@ -114,6 +115,7 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
                     "value": value,
                     "value_type": item.get("value_type"),
                     "value_read_verified": item.get("value_read_verified"),
+                    "side": item.get("side"),
                     "entity_id": str(item["entity_id"]) if item.get("entity_id") else None,
                 }
             )
@@ -122,14 +124,18 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     for row in raw:
         metric_counts.setdefault(row["label"].lower(), set()).add(row["metric"].lower())
     entities: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for row in raw:
-        key = (row["label"].lower(), row["metric"].lower())
+        key = (
+            str(row.get("entity_id") or row["label"]).lower(),
+            row["metric"].lower(),
+            str(row.get("side") or "").lower(),
+        )
         if key in seen:
             continue
         seen.add(key)
         label = row["label"]
-        if len(metric_counts[row["label"].lower()]) > 1 and row["metric"]:
+        if label and len(metric_counts.get(row["label"].lower(), set())) > 1 and row["metric"]:
             label = f"{label} - {row['metric']}"
         entity = {"label": label, "value": row["value"]}
         if row.get("entity_id"):
@@ -140,6 +146,8 @@ def entities_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:
             entity["value_type"] = row["value_type"]
         if row.get("value_read_verified") is not None:
             entity["value_read_verified"] = row["value_read_verified"]
+        if row.get("side"):
+            entity["side"] = row["side"]
         entities.append(entity)
     return entities
 
@@ -1061,7 +1069,8 @@ def _build_svg(
         lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{BOTTOM}" x2="{RIGHT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
         lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
     baseline = float(geo_scale.get("baseline") or 0.0) if geo_scale else 0.0
-    for tv in _value_ticks(baseline, maxv * 1.08):
+    suppress_axis = str(style.get("value_axis") or "") == "none"
+    for tv in ([] if suppress_axis else _value_ticks(baseline, maxv * 1.08)):
         if horizontal:
             tx = (geo_scale["anchor"] + (tv - baseline) * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
             if gridlines and tv > baseline:
@@ -1109,7 +1118,31 @@ def _build_svg(
             category_anchor = "middle"
         # Keep the label font constant; wrap to multiple lines when the label
         # would overflow its slot instead of shrinking the text.
-        if horizontal:
+        side = str(e.get("side") or "").strip().lower()
+        if horizontal and side == "left":
+            # Diverging / pyramid charts: the mirrored left+right bars share
+            # one category label, drawn once by the right-side bar, centered
+            # in the gap between the pair.
+            label_lines = []
+        elif horizontal and side == "right":
+            left_bar = next(
+                (
+                    x
+                    for x in layout
+                    if x.get("label") == e.get("label")
+                    and str(x.get("side") or "").strip().lower() == "left"
+                ),
+                None,
+            )
+            if left_bar is not None:
+                # Population pyramids label each row on the far left, with the
+                # mirrored bars extending from the center axis.
+                category_label_x = 150.0
+                category_anchor = "end"
+                label_lines = _wrap_text(e["label"], 130.0)
+            else:
+                label_lines = _wrap_text(e["label"], max(40.0, category_label_x - 12))
+        elif horizontal:
             label_lines = _wrap_text(e["label"], max(40.0, category_label_x - 12))
         else:
             label_lines = _wrap_text(e["label"], max(40.0, _bar_slot(layout, i) * 0.95))
@@ -1122,12 +1155,12 @@ def _build_svg(
         label_parts = [html.escape(part) for part in label_lines[:3]]
         if len(label_lines) > 3:
             label_parts[2] = label_parts[2][: max(1, len(label_parts[2]) - 1)] + "&#8230;"
-        if len(label_parts) == 1:
+        if label_parts and len(label_parts) == 1:
             lines.append(
                 f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
                 f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="#333333">{label_parts[0]}</text>'
             )
-        else:
+        elif label_parts:
             tspans = "".join(
                 f'<tspan x="{category_label_x:.1f}" dy="{20 if idx else 0:.1f}">{part}</tspan>'
                 for idx, part in enumerate(label_parts)
@@ -1377,6 +1410,7 @@ def _render_preview(
     unit: str,
     out: Path,
     orientation: str = "vertical",
+    suppress_axis: bool = False,
 ) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -1398,7 +1432,7 @@ def _render_preview(
     maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     geo_scale = _geometry_value_scale(layout, horizontal)
     baseline = float(geo_scale.get("baseline") or 0.0) if geo_scale else 0.0
-    for tv in _value_ticks(baseline, maxv):
+    for tv in ([] if suppress_axis else _value_ticks(baseline, maxv)):
         if horizontal:
             tx = (geo_scale["anchor"] + (tv - baseline) * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
             d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
@@ -1498,7 +1532,14 @@ def render_data_driven(
             "non_entity_components": [],
         },
     )
-    preview_success = _render_preview(layout, title, unit, preview_path, orientation)
+    preview_success = _render_preview(
+        layout,
+        title,
+        unit,
+        preview_path,
+        orientation,
+        suppress_axis=str((style or {}).get("value_axis") or "") == "none",
+    )
     components_preview_success = _render_components_preview(layout, title, unit, components_preview_path, orientation)
     return {
         "tool": "semantic_render",
