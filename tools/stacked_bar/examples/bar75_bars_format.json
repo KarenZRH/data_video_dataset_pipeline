@@ -1,0 +1,23 @@
+{
+  "clip_id": "bar_75_bars_format",
+  "title": "音乐介质收入构成 1982–2013（bars 格式）",
+  "series": [
+    {"name": "LP/EP/8-TRACK", "color": "#FFD700", "order": 0},
+    {"name": "CASSETTE", "color": "#6B7280", "order": 1},
+    {"name": "CD", "color": "#8ECAE6", "order": 2},
+    {"name": "DIGITAL", "color": "#FF6B9A", "order": 3}
+  ],
+  "unit": "",
+  "bars": [
+    {"label": "1982", "rel_len": 0.40, "segments": [
+      {"name": "CASSETTE", "fraction": 0.40}, {"name": "LP/EP/8-TRACK", "fraction": 0.60}]},
+    {"label": "1990", "rel_len": 0.70, "segments": [
+      {"name": "CD", "fraction": 0.45}, {"name": "CASSETTE", "fraction": 0.55}]},
+    {"label": "2000", "rel_len": 1.00, "segments": [
+      {"name": "CD", "fraction": 0.90}, {"name": "CASSETTE", "fraction": 0.10}]},
+    {"label": "2008", "rel_len": 0.55, "segments": [
+      {"name": "CD", "fraction": 0.60}, {"name": "DIGITAL", "fraction": 0.40}]},
+    {"label": "2013", "rel_len": 0.30, "segments": [
+      {"name": "CD", "fraction": 0.30}, {"name": "DIGITAL", "fraction": 0.70}]}
+  ]
+}
