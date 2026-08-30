@@ -540,6 +540,46 @@ def _geometry_value_scale(
     }
 
 
+def _enforce_value_geometry(
+    layout: list[dict[str, Any]],
+    horizontal: bool,
+    metadata: dict[str, Any],
+) -> None:
+    """Make each bar's value-encoding length match the fitted axis scale.
+
+    The detected geometry (CV/vision boxes) can disagree with the value axis
+    fitted from the same bars, so a bar's end does not line up with the tick
+    for its value (e.g. an SAT score of 1006 that ends before the 1000 tick).
+    When a numeric value axis exists, the value is authoritative: the bar's
+    length is recomputed from the fitted scale and its start is pinned to the
+    shared axis anchor, so bars, data table and ticks are always consistent.
+    Relative / no-axis charts and diverging (pyramid) layouts keep their
+    detected geometry.
+    """
+    if str(metadata.get("value_axis") or "") == "none":
+        return
+    if any(e.get("side") for e in layout):
+        return
+    geo_scale = _geometry_value_scale(layout, horizontal)
+    if not geo_scale:
+        return
+    scale = geo_scale["scale"]
+    baseline = geo_scale["baseline"]
+    anchor = geo_scale["anchor"]
+    for e in layout:
+        try:
+            value = float(e.get("value") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        length = max(0.0, (value - baseline) * scale)
+        if horizontal:
+            e["x"] = anchor
+            e["w"] = length
+        else:
+            e["y"] = anchor - length
+            e["h"] = length
+
+
 def _bar_slot(layout: list[dict[str, Any]], index: int) -> float:
     """Available horizontal space around one bar (nearest neighbour centres)."""
     centers = [float(e["x"]) + float(e["w"]) / 2 for e in layout]
@@ -1037,6 +1077,20 @@ def _build_svg(
     style = style or {}
     horizontal = orientation == "horizontal"
     background = str(style.get("background") or "#ffffff")
+
+    def _lum(hex_color: str) -> float:
+        try:
+            h = hex_color.lstrip("#")
+            r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+        except Exception:
+            return 255.0
+        return 0.299 * r + 0.587 * g + 0.114 * b
+
+    # Text color follows the background so dark-mode charts stay readable.
+    dark_bg = _lum(background) < 128
+    text_color = "#f2f2f2" if dark_bg else "#222222"
+    tick_color = "#c9c9c9" if dark_bg else "#444444"
+    label_color = "#e5e5e5" if dark_bg else "#333333"
     title = str(style.get("title") or title)
     colors = style.get("colors") if isinstance(style.get("colors"), dict) else {}
     gridlines = bool(style.get("gridlines", False))
@@ -1046,11 +1100,14 @@ def _build_svg(
     legend = str(style.get("legend") or "none")
     maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     geo_scale = _geometry_value_scale(layout, horizontal)
+    custom_ticks = style.get("custom_ticks")
+    if not isinstance(custom_ticks, list):
+        custom_ticks = None
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" data-role="semantic-chart" data-generator="datavideo.semantic_render_v1">',
         f'<rect id="scene-background-fill" data-role="background-fill" x="0" y="0" width="{W}" height="{H}" fill="{html.escape(background)}"/>',
-        f'<text id="chart-title" data-role="title" x="{W / 2}" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="36" font-weight="700" fill="#222222">{html.escape(title)}</text>',
+        f'<text id="chart-title" data-role="title" x="{W / 2}" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="36" font-weight="700" fill="{text_color}">{html.escape(title)}</text>',
         '<g id="chart-plot" data-role="plot">',
     ]
     if geo_scale is not None:
@@ -1070,19 +1127,33 @@ def _build_svg(
         lines.append(f'<line data-role="axis" x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{BOTTOM}" stroke="#666666" stroke-width="3"/>')
     baseline = float(geo_scale.get("baseline") or 0.0) if geo_scale else 0.0
     suppress_axis = str(style.get("value_axis") or "") == "none"
-    for tv in ([] if suppress_axis else _value_ticks(baseline, maxv * 1.08)):
+    tick_items = []
+    if custom_ticks:
+        for t in custom_ticks:
+            if not isinstance(t, dict):
+                continue
+            try:
+                tick_items.append((float(t["value"]), str(t.get("label") or t.get("value") or "")))
+            except (TypeError, ValueError, KeyError):
+                continue
+    else:
+        tick_items = [
+            (tv, _format_value(tv, unit))
+            for tv in ([] if suppress_axis else _value_ticks(baseline, maxv * 1.08))
+        ]
+    for tv, tick_label in tick_items:
         if horizontal:
             tx = (geo_scale["anchor"] + (tv - baseline) * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
             if gridlines and tv > baseline:
                 lines.append(f'<line data-role="gridline" x1="{tx:.1f}" y1="{TOP}" x2="{tx:.1f}" y2="{BOTTOM}" stroke="#cccccc" stroke-width="1" stroke-dasharray="4,4"/>')
             lines.append(f'<line data-role="tick" x1="{tx:.1f}" y1="{BOTTOM}" x2="{tx:.1f}" y2="{BOTTOM + 8}" stroke="#666666" stroke-width="2"/>')
-            lines.append(f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
+            lines.append(f'<text data-role="tick-label" x="{tx:.1f}" y="{BOTTOM + 30:.1f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="{tick_color}">{html.escape(tick_label)}</text>')
         else:
             ty = (geo_scale["anchor"] - (tv - baseline) * geo_scale["scale"]) if geo_scale else BOTTOM - tv / maxv * (BOTTOM - TOP)
             if gridlines and tv > baseline:
                 lines.append(f'<line data-role="gridline" x1="{LEFT}" y1="{ty:.1f}" x2="{RIGHT}" y2="{ty:.1f}" stroke="#cccccc" stroke-width="1" stroke-dasharray="4,4"/>')
             lines.append(f'<line data-role="tick" x1="{LEFT - 8}" y1="{ty:.1f}" x2="{LEFT}" y2="{ty:.1f}" stroke="#666666" stroke-width="2"/>')
-            lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="#444444">{html.escape(_format_value(tv, unit))}</text>')
+            lines.append(f'<text data-role="tick-label" x="{LEFT - 16}" y="{ty + 6:.1f}" text-anchor="end" font-family="Arial, sans-serif" font-size="22" fill="{tick_color}">{html.escape(tick_label)}</text>')
     for i, e in enumerate(layout):
         eid = _entity_id(e)
         mid = _mark_id(e)
@@ -1150,7 +1221,7 @@ def _build_svg(
         if show_values:
             lines.append(
                 f'<text id="{eid}-value-label" data-role="value-label" data-entity-id="{eid}" '
-                f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#222222">{html.escape(_format_value(e["value"], unit))}</text>'
+                f'x="{value_label_x:.1f}" y="{value_label_y:.1f}" text-anchor="{value_anchor}" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="{text_color}">{html.escape(_format_value(e["value"], unit))}</text>'
             )
         label_parts = [html.escape(part) for part in label_lines[:3]]
         if len(label_lines) > 3:
@@ -1158,7 +1229,7 @@ def _build_svg(
         if label_parts and len(label_parts) == 1:
             lines.append(
                 f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
-                f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="#333333">{label_parts[0]}</text>'
+                f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="{label_color}">{label_parts[0]}</text>'
             )
         elif label_parts:
             tspans = "".join(
@@ -1167,7 +1238,7 @@ def _build_svg(
             )
             lines.append(
                 f'<text id="{mid}-label" data-role="category-label" data-entity-id="{eid}" '
-                f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="#333333">{tspans}</text>'
+                f'x="{category_label_x:.1f}" y="{category_label_y:.1f}" text-anchor="{category_anchor}" font-family="Arial, sans-serif" font-size="{label_font_size}" fill="{label_color}">{tspans}</text>'
             )
         lines.append("</g>")
     if legend in {"top", "right"} and layout:
@@ -1179,7 +1250,25 @@ def _build_svg(
                 f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 36}" y2="{legend_y}" stroke="{html.escape(color)}" stroke-width="5"/>'
             )
             lines.append(
-                f'<text x="{legend_x + 44}" y="{legend_y + 8}" font-family="Arial, sans-serif" font-size="20" fill="#333333">{html.escape(e["label"])}</text>'
+                f'<text x="{legend_x + 44}" y="{legend_y + 8}" font-family="Arial, sans-serif" font-size="20" fill="{label_color}">{html.escape(e["label"])}</text>'
+            )
+            legend_y += 30
+    extra_legend = style.get("extra_legend")
+    if isinstance(extra_legend, list):
+        legend_y = 92
+        if legend in {"top", "right"} and layout:
+            legend_y = 92 + 30 * len(layout)
+        legend_x = W - 420
+        for item in extra_legend:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "")
+            color = str(item.get("color") or "#ffffff")
+            lines.append(
+                f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 36}" y2="{legend_y}" stroke="{html.escape(color)}" stroke-width="5"/>'
+            )
+            lines.append(
+                f'<text x="{legend_x + 44}" y="{legend_y + 8}" font-family="Arial, sans-serif" font-size="20" fill="{label_color}">{html.escape(label)}</text>'
             )
             legend_y += 30
     lines.append("</g>")
@@ -1411,6 +1500,8 @@ def _render_preview(
     out: Path,
     orientation: str = "vertical",
     suppress_axis: bool = False,
+    colors: dict[str, str] | None = None,
+    style: dict[str, Any] | None = None,
 ) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -1432,20 +1523,48 @@ def _render_preview(
     maxv = max((e["value"] for e in layout), default=1.0) or 1.0
     geo_scale = _geometry_value_scale(layout, horizontal)
     baseline = float(geo_scale.get("baseline") or 0.0) if geo_scale else 0.0
-    for tv in ([] if suppress_axis else _value_ticks(baseline, maxv)):
+    style = style or {}
+    custom_ticks = style.get("custom_ticks")
+    show_values = bool(style.get("show_values", True))
+    if isinstance(custom_ticks, list):
+        tick_items = [
+            (float(t["value"]), str(t.get("label") or ""))
+            for t in custom_ticks
+            if isinstance(t, dict) and t.get("value") is not None
+        ]
+    else:
+        tick_items = [
+            (tv, _format_value(tv, unit))
+            for tv in ([] if suppress_axis else _value_ticks(baseline, maxv))
+        ]
+    for tv, tick_label in tick_items:
         if horizontal:
             tx = (geo_scale["anchor"] + (tv - baseline) * geo_scale["scale"]) if geo_scale else LEFT + tv / maxv * (RIGHT - LEFT)
             d.line([(tx, BOTTOM), (tx, BOTTOM + 8)], fill=(100, 100, 100), width=2)
-            d.text((tx - 20, BOTTOM + 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
+            d.text((tx - 20, BOTTOM + 12), tick_label, fill=(80, 80, 80), font=font_a)
         else:
             ty = (geo_scale["anchor"] - (tv - baseline) * geo_scale["scale"]) if geo_scale else BOTTOM - tv / maxv * (BOTTOM - TOP)
             d.line([(LEFT - 8, ty), (LEFT, ty)], fill=(100, 100, 100), width=2)
-            d.text((LEFT - 70, ty - 12), _format_value(tv, unit), fill=(80, 80, 80), font=font_a)
+            d.text((LEFT - 70, ty - 12), tick_label, fill=(80, 80, 80), font=font_a)
+    extra_legend = style.get("extra_legend")
+    if isinstance(extra_legend, list):
+        legend_y = 92
+        legend_x = W - 420
+        for item in extra_legend:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "")
+            color = str(item.get("color") or "#ffffff")
+            d.line([(legend_x, legend_y), (legend_x + 36, legend_y)], fill=color, width=5)
+            d.text((legend_x + 44, legend_y - 8), label, fill=(230, 230, 230), font=font_l)
+            legend_y += 30
     for i, e in enumerate(layout):
-        d.rectangle([e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"]], fill=_color(i), outline=(0, 0, 0))
+        fill = (colors or {}).get(str(e.get("label") or "")) or (colors or {}).get(_entity_id(e)) or _color(i)
+        d.rectangle([e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"]], fill=fill, outline=(0, 0, 0))
         text = _format_value(e["value"], unit)
         if horizontal:
-            d.text((e["x"] + e["w"] + 10, e["y"] + e["h"] / 2 - 16), text, fill=(30, 30, 30), font=font_v)
+            if show_values:
+                d.text((e["x"] + e["w"] + 10, e["y"] + e["h"] / 2 - 16), text, fill=(30, 30, 30), font=font_v)
             label_lines = _wrap_text(e["label"], max(40.0, e["x"] - 26))
             line_count = min(3, len(label_lines))
             for li, ln in enumerate(label_lines[:line_count]):
@@ -1457,7 +1576,8 @@ def _render_preview(
                     anchor="rs",
                 )
         else:
-            d.text((e["x"] + e["w"] / 2 - d.textlength(text, font=font_v) / 2, e["y"] - 28), text, fill=(30, 30, 30), font=font_v)
+            if show_values:
+                d.text((e["x"] + e["w"] / 2 - d.textlength(text, font=font_v) / 2, e["y"] - 28), text, fill=(30, 30, 30), font=font_v)
             label_lines = _wrap_text(e["label"], max(40.0, _bar_slot(layout, i) * 0.95))
             line_count = min(3, len(label_lines))
             for li, ln in enumerate(label_lines[:line_count]):
@@ -1494,6 +1614,7 @@ def render_data_driven(
             e["y"] = oy + float(e["y"]) * sy
             e["w"] = float(e["w"]) * sx
             e["h"] = float(e["h"]) * sy
+    _enforce_value_geometry(layout, orientation == "horizontal", metadata)
     title = str(metadata.get("title") or "Data Chart").replace("\r", " ")
     # A VLM title may join the main title and the source line with a newline
     # ("Monthly price of Humira, arthritis drug\nCommonwealth Fund, 2017");
@@ -1539,6 +1660,8 @@ def render_data_driven(
         preview_path,
         orientation,
         suppress_axis=str((style or {}).get("value_axis") or "") == "none",
+        colors=style.get("colors") if isinstance((style or {}).get("colors"), dict) else None,
+        style=style,
     )
     components_preview_success = _render_components_preview(layout, title, unit, components_preview_path, orientation)
     return {

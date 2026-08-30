@@ -366,8 +366,11 @@ def test_render_data_driven_uses_cv_geometry_and_style(tmp_path):
     style = {"colors": {"A": "#112233", "B": "#445566"}, "background": "#000000", "rounded_corners": 4}
     report = render_data_driven("bar_x", metadata, tmp_path, geometry=geometry, style=style)
     svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
+    # The value axis is authoritative: when detected geometry contradicts the
+    # values, bar lengths are recomputed from the fitted scale so the bars,
+    # data table and ticks stay consistent (both bars share the baseline).
     assert 'x="100.0" y="200.0" width="60.0" height="120.0"' in svg
-    assert 'x="300.0" y="250.0" width="60.0" height="70.0"' in svg
+    assert 'x="300.0" y="80.0" width="60.0" height="240.0"' in svg
     assert 'fill="#112233"' in svg and 'fill="#445566"' in svg
     assert 'fill="#000000"' in svg
     assert 'rx="4.0"' in svg
