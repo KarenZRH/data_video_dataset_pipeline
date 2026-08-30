@@ -673,11 +673,12 @@ def build_dataset_folder(
 ) -> dict[str, Any]:
     """Assemble a self-contained ``dataset/`` folder for one clip.
 
-    For dynamic clips (multiple recovered data states) the folder contains a
-    top-level full dynamic data table + reconciled animation intent, and one
-    ``states/<state_key>/`` subfolder per state with that state's semantic.svg,
-    components svg, keyframe, data rows and a static intent. Static clips keep
-    a single flat sample (semantic.svg + data_table.csv + intent.json).
+    The dataset keeps exactly the four required artifacts: ``semantic.svg``
+    (the final chart render), ``keyframe.png`` (the selected source frame),
+    ``narration.jsonl`` (the narration) and ``data_table.csv`` (the values).
+    Multi-state clips additionally keep ``states/<state_key>/semantic.svg`` +
+    ``data_table.csv`` per state.  No intent/manifest/overlay/components files
+    are packaged.
     """
     clip_root = Path(clip_root)
     out = clip_root / "dataset"
@@ -725,10 +726,6 @@ def build_dataset_folder(
             intent = None
     if intent is not None and dynamic is not None:
         intent = reconcile_intent_with_data(intent, dynamic)
-    if intent is not None:
-        write_json(out / "intent.json", intent)
-        written["intent.json"] = str(out / "intent.json")
-
     if dynamic_packaging:
         table_src = clip_root / "dynamic_data.csv"
         if table_src.exists() and table_src.stat().st_size > 0:
@@ -755,8 +752,6 @@ def build_dataset_folder(
     if selected and Path(selected).exists():
         shutil.copy2(Path(selected), out / "keyframe.png")
         written["keyframe.png"] = str(out / "keyframe.png")
-    _copy_if_exists(clip_root / "aligned_overlay.png", out / "aligned_overlay.png", written, "aligned_overlay.png")
-
     primary_dir = None
     if dynamic_packaging:
         primary_key = _pick_primary_state(clip_report, groups)
@@ -765,11 +760,8 @@ def build_dataset_folder(
             primary_dir = _find_state_render_dir(clip_root, primary_key, primary_rows)
     if primary_dir is not None:
         _copy_if_exists(primary_dir / "semantic.svg", out / "semantic.svg", written, "semantic.svg")
-        _copy_if_exists(primary_dir / "semantic_components.svg", out / "semantic_components.svg", written, "semantic_components.svg")
     if "semantic.svg" not in written:
         _copy_if_exists(clip_root / "semantic.svg", out / "semantic.svg", written, "semantic.svg")
-    if "semantic_components.svg" not in written:
-        _copy_if_exists(clip_root / "semantic_components.svg", out / "semantic_components.svg", written, "semantic_components.svg")
 
     clip = clip_report.get("clip") or {}
     chart_type = str(clip.get("chart_type") or "")
@@ -792,24 +784,12 @@ def build_dataset_folder(
                 _copy_if_exists(render_dir / "semantic.svg", state_out / "semantic.svg", state_files, "semantic.svg")
             if plateau_mode:
                 # Plateau states carry their own data table + intent written
-                # by the pipeline (vision-verified per-state values).
+                # by the pipeline (vision-verified per-state values); only the
+                # table is packaged.
                 _copy_if_exists(render_dir / "data_table.csv", state_out / "data_table.csv", state_files, "data_table.csv")
-                _copy_if_exists(render_dir / "intent.json", state_out / "intent.json", state_files, "intent.json")
             else:
                 if _write_state_table(clip_root, rows, state_out / "data_table.csv"):
                     state_files["data_table.csv"] = str(state_out / "data_table.csv")
-                metric = str(rows[0].get("metric") or "指标") if rows else "指标"
-                static_intent = {
-                    "clip_id": clip_id,
-                    "state_key": state_key,
-                    "state_label": state_label,
-                    "chart_type": chart_type,
-                    "is_static": True,
-                    "static_description": f"渲染{state_label}年的{metric}图表（静态状态快照）。",
-                    "source": "static_state_snapshot",
-                }
-                write_json(state_out / "intent.json", static_intent)
-                state_files["intent.json"] = str(state_out / "intent.json")
             state_entries.append(
                 {
                     "state_key": state_key,
@@ -847,25 +827,6 @@ def build_dataset_folder(
                         }
                     )
 
-    manifest = {
-        "clip_id": clip_id,
-        "title": clip.get("raw_video_title"),
-        "chart_type": chart_type,
-        "source_time_range": {
-            "start": clip.get("start_seconds"),
-            "end": clip.get("end_seconds"),
-        },
-        "needs_review": bool(keyframes.get("needs_review")),
-        "boundary_reason": keyframes.get("boundary_reason"),
-        "animation_description": (intent or {}).get("overall_description"),
-        "intent_reconciled_with_data": bool((intent or {}).get("reconciled_with_data")),
-        "data_state_count": len(groups),
-        "states": state_entries,
-        "values": values,
-        "files": written,
-    }
-    write_json(out / "manifest.json", manifest)
-    written["manifest.json"] = str(out / "manifest.json")
     return {"dataset_dir": str(out), "files": written, "state_count": len(groups)}
 
 

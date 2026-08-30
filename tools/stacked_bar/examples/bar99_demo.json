@@ -1,0 +1,20 @@
+{
+  "clip_id": "bar_99_demo",
+  "title": "STATE VS STATE WARS 1900-2000",
+  "orientation": "horizontal",
+  "series": [
+    {"name": "其他战争", "color": "#D64541", "order": 0},
+    {"name": "WARS BETWEEN DEMOCRACIES", "color": "#3B9C9C", "order": 1}
+  ],
+  "unit": "",
+  "bars": [
+    {
+      "label": "1900-2000",
+      "rel_len": 1.0,
+      "segments": [
+        {"name": "其他战争", "fraction": 0.82},
+        {"name": "WARS BETWEEN DEMOCRACIES", "fraction": 0.18}
+      ]
+    }
+  ]
+}

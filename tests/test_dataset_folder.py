@@ -134,29 +134,20 @@ def test_build_dataset_folder_creates_per_state_subfolders(tmp_path):
     dataset = clip / "dataset"
     assert result["state_count"] == 2
     assert (dataset / "data_table.csv").exists()
-    assert (dataset / "intent.json").exists()
     assert (dataset / "keyframe.png").exists()
-    assert (dataset / "aligned_overlay.png").exists()
-    assert (dataset / "manifest.json").exists()
+    assert not (dataset / "intent.json").exists()
+    assert not (dataset / "aligned_overlay.png").exists()
+    assert not (dataset / "manifest.json").exists()
+    assert not (dataset / "semantic_components.svg").exists()
     # primary state follows the selected keyframe timestamp (2017)
     assert "<svg>2017</svg>" in (dataset / "semantic.svg").read_text(encoding="utf-8")
     for state_key in ["1990", "2017"]:
         state_dir = dataset / "states" / state_key
         assert (state_dir / "semantic.svg").exists()
         assert (state_dir / "data_table.csv").exists()
-        assert (state_dir / "intent.json").exists()
-        static_intent = json.loads((state_dir / "intent.json").read_text(encoding="utf-8"))
-        assert static_intent["is_static"] is True
-        assert static_intent["state_key"] == state_key
+        assert not (state_dir / "intent.json").exists()
     # stale old-naming dirs are never referenced
     assert not (dataset / "states" / "state_001_1990").exists()
-    # intent was reconciled against data: grow -> shrink
-    intent = json.loads((dataset / "intent.json").read_text(encoding="utf-8"))
-    assert intent["reconciled_with_data"] is True
-    assert intent["major_actions"][0]["action"] == "bar_shrink"
-    manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["data_state_count"] == 2
-    assert {state["state_key"] for state in manifest["states"]} == {"1990", "2017"}
 
 
 def test_build_dataset_folder_static_clip_keeps_flat_layout(tmp_path):
@@ -187,7 +178,10 @@ def test_build_dataset_folder_static_clip_keeps_flat_layout(tmp_path):
     assert result["state_count"] == 0
     assert (dataset / "semantic.svg").exists()
     assert (dataset / "data_table.csv").exists()
-    assert (dataset / "intent.json").exists()
+    assert (dataset / "keyframe.png").exists()
+    assert not (dataset / "intent.json").exists()
+    assert not (dataset / "manifest.json").exists()
+    assert not (dataset / "semantic_components.svg").exists()
     assert not (dataset / "states").exists()
 
 
@@ -233,6 +227,6 @@ def test_build_dataset_folder_uses_plateau_states_when_scan_exists(tmp_path):
         state_dir = dataset / "states" / state_key
         assert (state_dir / "semantic.svg").exists()
         assert (state_dir / "data_table.csv").exists()
-        assert (state_dir / "intent.json").exists()
+        assert not (state_dir / "intent.json").exists()
     # The primary semantic.svg still comes from the clip's final render.
     assert (dataset / "semantic.svg").read_text(encoding="utf-8") == "<svg>primary</svg>"
