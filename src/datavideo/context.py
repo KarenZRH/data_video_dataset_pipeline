@@ -212,11 +212,18 @@ def create_context_media(
         # The fallback raw video may be either an exact reference clip
         # (duration ~ reference) or a padded context download
         # (duration ~ context interval). Detect which one by its duration
-        # so the visual clip is cut from the correct offset.
-        if abs(duration - (ctx["end"] - ctx["start"])) < 1.0:
-            context_source = ctx
-        else:
+        # so the visual clip is cut from the correct offset.  The padded
+        # download can carry a few extra seconds (YouTube intro/alignment),
+        # so match against whichever interval is closest and within a
+        # relative tolerance; default to the padded context source.
+        ref_len = float(ref["end"] - ref["start"])
+        ctx_len = float(ctx["end"] - ctx["start"])
+        tol_ref = max(1.0, 0.1 * ref_len)
+        tol_ctx = max(3.0, 0.15 * ctx_len)
+        if abs(duration - ref_len) <= tol_ref:
             context_source = ref
+        else:
+            context_source = ctx
     else:
         context_source["end"] = min(context_source["end"], context_source["start"] + duration)
 

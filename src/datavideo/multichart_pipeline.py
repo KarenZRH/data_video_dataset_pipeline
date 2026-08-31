@@ -20,7 +20,7 @@ from datavideo.cv_align import (
     apply_relative_bar_values,
     supplement_bars_from_vision,
 )
-from datavideo.cv_align import run_cv_align_line
+from datavideo.line_processor import run_cv_align_line
 from datavideo.cv_align import reconcile_line_dynamic
 from datavideo.cv_align import read_frame_title
 from datavideo.cv_align import read_series_label
@@ -908,12 +908,29 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             dynamic = chart_data.get("dynamic_data") or {}
             recovered_type = (chart_data.get("metadata") or {}).get("chart_type") or row.get("chart_type")
             processor, declared_type, type_consistent = detect_chart_type(row.get("chart_type"), recovered_type)
+            # Qwen occasionally reports a line chart as "bar" (e.g. line_26);
+            # the CSV declaration plus a real CV-detected polyline is
+            # authoritative enough to route it back to the line processor.
+            if processor == "bar" and str(row.get("chart_type") or "").strip().lower() in {
+                "line", "area", "timeline",
+            }:
+                try:
+                    from datavideo.cv_align import detect_lines
+
+                    kf_path = _selected_keyframe_path(keyframes)
+                    if kf_path is not None and detect_lines(kf_path):
+                        processor = "line"
+                        type_consistent = False
+                except Exception:
+                    pass
             render_metadata = metadata_from_dynamic(
                 dynamic,
                 visible_text=(chart_data.get("metadata") or {}).get("visible_text"),
             )
             if processor == "line":
                 selected_keyframe = _selected_keyframe_path(keyframes)
+                if selected_keyframe is None:
+                    raise RuntimeError("missing_selected_keyframe")
                 line_report = run_cv_align_line(
                     _clip_id(row),
                     selected_keyframe,
@@ -937,6 +954,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             resolved_title = frame_title
                     except Exception:
                         pass
+                if not resolved_title and line_report.get("title"):
+                    resolved_title = str(line_report["title"])
                 series_label = None
                 qwen_series = (chart_data.get("metadata") or {}).get("series")
                 if isinstance(qwen_series, list) and qwen_series and isinstance(qwen_series[0], dict):
@@ -951,20 +970,23 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 if not series_label:
                     series_label = _series_label_from_title(resolved_title)
                 cv_has_values = int(line_report.get("point_count") or 0) > 0
+                unit = line_report.get("tick_unit") or ""
+                if not unit:
+                    unit = str((chart_data.get("metadata") or {}).get("unit") or "")
                 if cv_has_values:
                     dynamic = reconcile_line_dynamic(
                         line_report.get("lines") or [],
                         clip_id=_clip_id(row),
                         image_path=selected_keyframe,
                         keyframe_timestamp=_keyframe_timestamp(keyframes),
-                        unit=line_report.get("tick_unit") or "",
+                        unit=unit,
                         series_label=series_label,
                     )
                     chart_data = {**chart_data, "dynamic_data": dynamic}
                 line_metadata = _line_metadata_from_dynamic(
                     dynamic,
                     title=resolved_title,
-                    unit=line_report.get("tick_unit") or "",
+                    unit=unit,
                     x_labels=line_report.get("x_axis_labels") or None,
                 )
                 semantic = render_data_driven_line(_clip_id(row), line_metadata, clip_root)
