@@ -236,6 +236,16 @@ def create_context_media(
         boundary_reason="context download fallback to exact clip" if requires_context_redownload else "",
         needs_review=requires_context_redownload,
     )
+    # Keyframe-aligned ``-c copy`` downloads can shift the padded raw's real
+    # content earlier than the nominal context window.  When a fallback raw is
+    # used and the caller knows the head offset, shift the visual window so the
+    # cut matches the CSV reference interval.
+    head_offset = _seconds(cfg.get("context", {}).get("head_offset_seconds", 0.0))
+    if head_offset and requires_context_redownload:
+        v = intervals["visual_clip_context"]
+        v["start"] = round(float(v["start"]) + head_offset, 3)
+        v["end"] = round(float(v["end"]) + head_offset, 3)
+        intervals["head_offset_applied_seconds"] = round(float(head_offset), 3)
     visual = intervals["visual_clip_context"]
     visual_report = extract_clip_accurate(
         media["video"],

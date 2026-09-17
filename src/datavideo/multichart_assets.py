@@ -40,6 +40,16 @@ def _clip_id(row: dict[str, Any]) -> str:
     )
 
 
+def _video_fingerprint(path: str | Path) -> dict[str, int] | None:
+    """(mtime_ns, size) of the source video; used to invalidate the cached
+    keyframe manifest when the visual clip content changed."""
+    try:
+        st = Path(path).stat()
+        return {"mtime_ns": st.st_mtime_ns, "size": st.st_size}
+    except OSError:
+        return None
+
+
 _VISION_BAR_VALUES_PROMPT = (
     "这是视频中的柱状图画面。请只统计柱状图的柱子：输出 JSON "
     '{"bar_count": 柱子总数, "bars":[{"label":"柱子的类别标签","value_printed":true/false}]}。'
@@ -793,7 +803,11 @@ def select_keyframe(
     if manifest_path.exists() and not force:
         cached = read_json(manifest_path)
         selected = _keyframe_asset(cached)
-        if cached.get("clip_id") == clip_id and selected.exists():
+        if (
+            cached.get("clip_id") == clip_id
+            and selected.exists()
+            and cached.get("visual_clip_fingerprint") == _video_fingerprint(normalized_video)
+        ):
             return cached
 
     duration = _duration_seconds(normalized_video)
@@ -1279,6 +1293,7 @@ def select_keyframe(
     manifest = {
         "clip_id": clip_id,
         "chart_type": row["chart_type"],
+        "visual_clip_fingerprint": _video_fingerprint(normalized_video),
         "timestamps": {"selected": timestamp},
         "context_tail_timestamp": selected.get("context_tail_timestamp"),
         "assets": {"selected": asset, "states": [state["asset"] for state in states]},

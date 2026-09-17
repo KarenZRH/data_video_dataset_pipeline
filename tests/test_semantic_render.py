@@ -124,6 +124,7 @@ def test_render_data_driven_line_outputs_polyline(tmp_path):
         "title": "Net additions in England",
         "unit": "",
         "chart_type": "line",
+        "show_values": True,
         "series": [{"name": "Net additions", "values": [133600, 221600, 147000, 129100]}],
     }
     report = render_data_driven_line("line_4", metadata, tmp_path)
@@ -131,8 +132,10 @@ def test_render_data_driven_line_outputs_polyline(tmp_path):
     assert report["point_count"] == 4
     svg = (tmp_path / "semantic.svg").read_text(encoding="utf-8")
     assert 'data-role="polyline"' in svg
-    assert svg.count('data-role="data-point"') == 4
+    assert 'data-role="data-point"' not in svg
     assert svg.count('data-role="value-label"') == 4
+    hidden = render_data_driven_line("line_4", {**metadata, "show_values": False}, tmp_path / "no_labels")
+    assert 'data-role="value-label"' not in (tmp_path / "no_labels" / "semantic.svg").read_text(encoding="utf-8")
     assert (tmp_path / "semantic_components.json").exists()
     assert (tmp_path / "semantic_preview.png").exists()
 
