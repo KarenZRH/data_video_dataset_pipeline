@@ -27,6 +27,7 @@ def build_stacked_svg(
     unit: str = "",
     orders: dict[str, dict[str, int]] | None = None,
     orientation: str = "vertical",
+    max_value: float | None = None,
 ) -> str:
     """values[bar_label][series_name] = segment value.
 
@@ -39,6 +40,7 @@ def build_stacked_svg(
     plot_h = BOTTOM - TOP
     totals = {b: sum(values.get(b, {}).values()) for b in bar_labels}
     max_total = max(totals.values()) or 1.0
+    scale_max = max_value if max_value and max_value > 0 else max_total
     horizontal = orientation == "horizontal"
 
     lines = [
@@ -71,7 +73,7 @@ def build_stacked_svg(
             x_cursor = LEFT
             for s in ordered_series:
                 v = float(values.get(b, {}).get(s["name"], 0.0) or 0.0)
-                w_px = v / max_total * (RIGHT - LEFT)
+                w_px = v / scale_max * (RIGHT - LEFT)
                 if w_px <= 0:
                     continue
                 color = s.get("color") or "#888888"
@@ -90,7 +92,7 @@ def build_stacked_svg(
             y_cursor = BOTTOM
             for s in ordered_series:
                 v = float(values.get(b, {}).get(s["name"], 0.0) or 0.0)
-                h_px = v / max_total * plot_h
+                h_px = v / scale_max * plot_h
                 if h_px <= 0:
                     continue
                 y_top = y_cursor - h_px
@@ -160,6 +162,11 @@ def main(input_path: str, out_dir: str) -> None:
     unit = str(cfg.get("unit") or "")
     clip_id = str(cfg.get("clip_id") or "")
     orientation = str(cfg.get("orientation") or "vertical")
+    max_value = cfg.get("max_value")
+    try:
+        max_value = float(max_value) if max_value not in (None, "") else None
+    except (TypeError, ValueError):
+        max_value = None
     series_order = {s["name"]: int(s.get("order", i)) for i, s in enumerate(series)}
 
     # Two accepted input formats:
@@ -200,7 +207,16 @@ def main(input_path: str, out_dir: str) -> None:
                 writer.writerow([clip_id, b, s["name"], f"{v:g}", unit, series_order.get(s["name"], 0), pos, "exact"])
 
     # semantic.svg
-    svg = build_stacked_svg(title, bar_labels, series, values, unit, orders=orders, orientation=orientation)
+    svg = build_stacked_svg(
+        title,
+        bar_labels,
+        series,
+        values,
+        unit,
+        orders=orders,
+        orientation=orientation,
+        max_value=max_value,
+    )
     (out / "semantic.svg").write_text(svg, encoding="utf-8")
 
     # intent.json

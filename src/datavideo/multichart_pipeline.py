@@ -20,7 +20,7 @@ from datavideo.cv_align import (
     apply_relative_bar_values,
     supplement_bars_from_vision,
 )
-from datavideo.cv_align import run_cv_align_line
+from datavideo.line_processor import build_line_data_table, run_cv_align_line
 from datavideo.cv_align import reconcile_line_dynamic
 from datavideo.cv_align import read_frame_title
 from datavideo.cv_align import read_series_label
@@ -29,6 +29,7 @@ from datavideo.cv_reconcile import write_dynamic_outputs
 from datavideo.chart_processors import SUPPORTED_PROCESSORS, detect_chart_type
 from datavideo.metadata import read_clip_rows
 from datavideo.narration import transcribe_context_audio
+from datavideo.chart_vision import read_chart_spec
 from datavideo.semantic_render import (
     frame_title_status,
     match_chart_style,
@@ -39,6 +40,17 @@ from datavideo.semantic_render import (
     resolve_render_title,
 )
 from datavideo.schemas import ensure_dir, read_json, write_json, write_jsonl
+
+
+def _clip_needs_refresh(candidate: Path, source: Path) -> bool:
+    """True when the packaged clip.mp4 is missing or differs from the source
+    visual clip (mtime/size), so reruns never keep a stale clip.
+    """
+    try:
+        cs, ss = candidate.stat(), source.stat()
+        return cs.st_mtime_ns != ss.st_mtime_ns or cs.st_size != ss.st_size
+    except OSError:
+        return True
 
 from .multichart_assets import (
     _keyframe_timestamp,
@@ -239,6 +251,121 @@ def _line_metadata_from_dynamic(
             for name, values in series_values.items()
         ],
     }
+
+
+def _line_metadata_from_vision_spec(
+    spec: dict[str, Any],
+    keyframe_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Line metadata built from the single vision big call (chart_vision_spec).
+
+    The spec is the primary render source: points carry pixel x + absolute
+    value + relative height; style carries background/colors/line width.
+    """
+    image_width = None
+    if keyframe_path is not None and Path(keyframe_path).exists():
+        try:
+            from PIL import Image
+
+            with Image.open(keyframe_path) as im:
+                image_width = im.width
+        except Exception:
+            image_width = None
+    def _parse_series_list(source: dict[str, Any]) -> list[dict[str, Any]]:
+        parsed: list[dict[str, Any]] = []
+        for item in source.get("series") or []:
+            if not isinstance(item, dict):
+                continue
+            parsed.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "color": str(item.get("color") or ""),
+                    "curve_type": str(item.get("curve_type") or "polyline"),
+                    "line_style": str(item.get("line_style") or "solid"),
+                    "line_width": item.get("line_width") or 5,
+                    "points": [list(p) for p in item.get("points") or []],
+                }
+            )
+        return parsed
+
+    series = _parse_series_list(spec)
+    result = {
+        "title": str(spec.get("title") or ""),
+        "unit": str(spec.get("unit") or ""),
+        "x_axis_name": str(spec.get("x_axis_name") or ""),
+        "y_axis_name": str(spec.get("y_axis_name") or ""),
+        "chart_type": "line",
+        "relative": bool(spec.get("relative", False)),
+        "x_indexed": bool(spec.get("x_indexed", False)),
+        "x_labels": [str(x) for x in (spec.get("x_labels") or [])],
+        "ticks": spec.get("ticks") or [],
+        "show_values": bool(spec.get("show_values", False)),
+        "style": spec.get("style") or {},
+        "image_width": image_width,
+        "series": series,
+    }
+    plots = spec.get("plots")
+    if isinstance(plots, list) and plots:
+        parsed_plots: list[dict[str, Any]] = []
+        for p in plots:
+            if not isinstance(p, dict):
+                continue
+            p_series = _parse_series_list(p)
+            if not p_series:
+                continue
+            parsed_plots.append(
+                {
+                    "title": str(p.get("title") or ""),
+                    "unit": str(p.get("unit") or ""),
+                    "relative": bool(p.get("relative", False)),
+                    "x_indexed": bool(p.get("x_indexed", False)),
+                    "x_labels": [str(x) for x in (p.get("x_labels") or [])],
+                    "ticks": p.get("ticks") or [],
+                    "show_values": bool(p.get("show_values", False)),
+                    "style": p.get("style") or {},
+                    "series": p_series,
+                }
+            )
+        if parsed_plots:
+            result["plots"] = parsed_plots
+            result.pop("series", None)
+    return result
+
+
+def _write_line_data_table(
+    clip_root: str | Path,
+    spec: dict[str, Any],
+    clip_id: str,
+    keyframe_path: str | Path | None = None,
+) -> None:
+    """Write clip_root/line_data_table.csv from the line vision spec.
+
+    Smooth curves have no real data -> header-only placeholder; polylines
+    keep x pixel position + absolute value + relative height per turning
+    point.  build_dataset_folder prefers this file for line clips.
+    """
+    image_width = None
+    if keyframe_path is not None and Path(keyframe_path).exists():
+        try:
+            from PIL import Image
+
+            with Image.open(keyframe_path) as im:
+                image_width = im.width
+        except Exception:
+            image_width = None
+    if spec.get("plots"):
+        rows = []
+        for p in spec.get("plots") or []:
+            rows += build_line_data_table(
+                {**spec, "series": p.get("series") or []}, clip_id, image_width
+            )
+    else:
+        rows = build_line_data_table(spec, clip_id, image_width)
+    cols = ["clip_id", "entity", "entity_id", "x_px", "value", "relative_value", "unit", "source_type"]
+    header = ",".join(cols)
+    body = "\n".join(",".join(str(r.get(k, "")) for k in cols) for r in rows)
+    text = header + ("\n" + body if body else "") + "\n"
+    (Path(clip_root) / "line_data_table.csv").write_text(text, encoding="utf-8")
 
 
 def _safe_state_key(key: str) -> str:
@@ -732,6 +859,8 @@ def build_dataset_folder(
             shutil.copy2(table_src, out / "data_table.csv")
             written["data_table.csv"] = str(out / "data_table.csv")
     if "data_table.csv" not in written:
+        _copy_if_exists(clip_root / "line_data_table.csv", out / "data_table.csv", written, "data_table.csv")
+    if "data_table.csv" not in written:
         _copy_if_exists(clip_root / "final_data_table.csv", out / "data_table.csv", written, "data_table.csv")
 
     nar = None
@@ -861,7 +990,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
             prior_visual = read_json(prior_report_path).get("clip", {}).get("visual_clip_path") if prior_report_path.exists() else None
             asset_force = force or prior_visual != str(visual_clip)
             candidate_clip = clip_root / "clip.mp4"
-            if asset_force or not candidate_clip.exists():
+            clip_stale = _clip_needs_refresh(candidate_clip, visual_clip)
+            if asset_force or clip_stale:
                 import shutil
 
                 shutil.copy2(visual_clip, candidate_clip)
@@ -904,16 +1034,45 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 row.get("chart_type"),
                 recovered_type,
             )
+            # One type-aware vision read of the selected keyframe is the
+            # primary render source (bar: series/value/color/style; line:
+            # analysis spec; map: regions).  CV geometry stays auxiliary.
+            chart_vision_spec = None
+            try:
+                _kf = (keyframes.get("assets") or {}).get("selected")
+                if _kf and Path(_kf).exists():
+                    chart_vision_spec = read_chart_spec(processor, _kf, cfg)
+                    if chart_vision_spec:
+                        write_json(clip_root / "semantic_vision_spec.json", chart_vision_spec)
+            except Exception:
+                chart_vision_spec = None
             semantic = render_data_driven(_clip_id(row), chart_data.get("metadata") or {}, clip_root)
             dynamic = chart_data.get("dynamic_data") or {}
             recovered_type = (chart_data.get("metadata") or {}).get("chart_type") or row.get("chart_type")
             processor, declared_type, type_consistent = detect_chart_type(row.get("chart_type"), recovered_type)
+            # Qwen occasionally reports a line chart as "bar" (e.g. line_26);
+            # the CSV declaration plus a real CV-detected polyline is
+            # authoritative enough to route it back to the line processor.
+            if processor == "bar" and str(row.get("chart_type") or "").strip().lower() in {
+                "line", "area", "timeline",
+            }:
+                try:
+                    from datavideo.cv_align import detect_lines
+
+                    kf_path = _selected_keyframe_path(keyframes)
+                    if kf_path is not None and detect_lines(kf_path):
+                        processor = "line"
+                        type_consistent = False
+                except Exception:
+                    pass
             render_metadata = metadata_from_dynamic(
                 dynamic,
                 visible_text=(chart_data.get("metadata") or {}).get("visible_text"),
             )
             if processor == "line":
                 selected_keyframe = _selected_keyframe_path(keyframes)
+                if selected_keyframe is None:
+                    raise RuntimeError("missing_selected_keyframe")
                 line_report = run_cv_align_line(
                     _clip_id(row),
                     selected_keyframe,
@@ -937,6 +1096,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             resolved_title = frame_title
                     except Exception:
                         pass
+                if not resolved_title and line_report.get("title"):
+                    resolved_title = str(line_report["title"])
                 series_label = None
                 qwen_series = (chart_data.get("metadata") or {}).get("series")
                 if isinstance(qwen_series, list) and qwen_series and isinstance(qwen_series[0], dict):
@@ -951,32 +1112,53 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                 if not series_label:
                     series_label = _series_label_from_title(resolved_title)
                 cv_has_values = int(line_report.get("point_count") or 0) > 0
+                unit = line_report.get("tick_unit") or ""
+                if not unit:
+                    unit = str((chart_data.get("metadata") or {}).get("unit") or "")
                 if cv_has_values:
                     dynamic = reconcile_line_dynamic(
                         line_report.get("lines") or [],
                         clip_id=_clip_id(row),
                         image_path=selected_keyframe,
                         keyframe_timestamp=_keyframe_timestamp(keyframes),
-                        unit=line_report.get("tick_unit") or "",
+                        unit=unit,
                         series_label=series_label,
                     )
                     chart_data = {**chart_data, "dynamic_data": dynamic}
-                line_metadata = _line_metadata_from_dynamic(
-                    dynamic,
-                    title=resolved_title,
-                    unit=line_report.get("tick_unit") or "",
-                    x_labels=line_report.get("x_axis_labels") or None,
+                vision_line_spec = (
+                    chart_vision_spec
+                    if isinstance(chart_vision_spec, dict) and chart_vision_spec.get("series")
+                    else None
                 )
-                semantic = render_data_driven_line(_clip_id(row), line_metadata, clip_root)
-                semantic["cv_align"] = line_report
-                semantic["reconciled"] = {
-                    "line_count": line_report.get("line_count", 0),
-                    "point_count": line_report.get("point_count", 0),
-                    "used_cv_values": cv_has_values,
-                    "fallback_source": None if cv_has_values else "qwen_dynamic_data",
-                }
-                write_dynamic_outputs(clip_root, dynamic)
-                write_json(clip_root / "chart_metadata.json", line_metadata)
+                if vision_line_spec is not None:
+                    # The single vision big call is the primary render + data-table source.
+                    line_metadata = _line_metadata_from_vision_spec(vision_line_spec, selected_keyframe)
+                    semantic = render_data_driven_line(_clip_id(row), line_metadata, clip_root)
+                    semantic["reconciled"] = {
+                        "used_vision_spec": True,
+                        "point_count": sum(
+                            len(s.get("points") or []) for s in vision_line_spec.get("series") or []
+                        ),
+                    }
+                    _write_line_data_table(clip_root, vision_line_spec, _clip_id(row), selected_keyframe)
+                    write_json(clip_root / "chart_metadata.json", line_metadata)
+                if vision_line_spec is None:
+                    line_metadata = _line_metadata_from_dynamic(
+                        dynamic,
+                        title=resolved_title,
+                        unit=unit,
+                        x_labels=line_report.get("x_axis_labels") or None,
+                    )
+                    semantic = render_data_driven_line(_clip_id(row), line_metadata, clip_root)
+                    semantic["cv_align"] = line_report
+                    semantic["reconciled"] = {
+                        "line_count": line_report.get("line_count", 0),
+                        "point_count": line_report.get("point_count", 0),
+                        "used_cv_values": cv_has_values,
+                        "fallback_source": None if cv_has_values else "qwen_dynamic_data",
+                    }
+                    write_dynamic_outputs(clip_root, dynamic)
+                    write_json(clip_root / "chart_metadata.json", line_metadata)
             elif _cv_align_enabled(row, cfg) and processor == "bar":
                 selected_keyframe = _selected_keyframe_path(keyframes)
                 entities: list[dict[str, Any]] = []
@@ -1224,6 +1406,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                     # geometry; the vision model supplies the visual style
                     # spec; values still come from the data table.
                     chart_style = chart_analysis.get("style") if isinstance(chart_analysis.get("style"), dict) else {}
+                    if not chart_style and chart_vision_spec and chart_vision_spec.get("chart_type") == "bar":
+                        chart_style = dict(chart_vision_spec)
                     if not chart_style and selected_keyframe is not None:
                         try:
                             chart_style = match_chart_style(selected_keyframe, cfg)
@@ -1350,7 +1534,8 @@ def run_pipeline(cfg: dict[str, Any], force: bool = False) -> dict[str, Any]:
                             if rb.get("color") and rb.get("entity_id"):
                                 color_map[str(rb["entity_id"])] = str(rb["color"])
                         if color_map:
-                            chart_style = {**chart_style, "colors": color_map}
+                            # Vision colors are primary; CV only fills gaps.
+                            chart_style = {**chart_style, "colors": {**color_map, **chart_style.get("colors", {})}}
                     if geometry:
                         semantic = render_data_driven(
                             _clip_id(row),

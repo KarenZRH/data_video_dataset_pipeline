@@ -3097,7 +3097,7 @@ def _assign_x_labels(
     year_like = all(value is not None for value in year_values) and len(year_values) >= 2
     for point in points:
         px = float(point.get("x") or 0.0)
-        ratio = (px - anchor0) / span
+        ratio = min(1.0, max(0.0, (px - anchor0) / span))
         if year_like:
             year = year_values[0] + ratio * (year_values[-1] - year_values[0])
             point["x_label"] = _format_year_label(year, labels[0])

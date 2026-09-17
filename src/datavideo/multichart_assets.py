@@ -40,6 +40,16 @@ def _clip_id(row: dict[str, Any]) -> str:
     )
 
 
+def _video_fingerprint(path: str | Path) -> dict[str, int] | None:
+    """(mtime_ns, size) of the source video; used to invalidate the cached
+    keyframe manifest when the visual clip content changed."""
+    try:
+        st = Path(path).stat()
+        return {"mtime_ns": st.st_mtime_ns, "size": st.st_size}
+    except OSError:
+        return None
+
+
 _VISION_BAR_VALUES_PROMPT = (
     "这是视频中的柱状图画面。请只统计柱状图的柱子：输出 JSON "
     '{"bar_count": 柱子总数, "bars":[{"label":"柱子的类别标签","value_printed":true/false}]}。'
@@ -286,6 +296,15 @@ def _selection_rank(row: dict[str, Any], chart_type: str, cfg: dict[str, Any]) -
         # (values pop in after the bars finish drawing), then the CV bar count
         # breaks remaining ties.
         return (*base, printed, vision_bars, late_priority, effective_count, regularity, float(row["combined_score"]))
+    if "line" in chart_type.lower() or "area" in chart_type.lower() or "timeline" in chart_type.lower():
+        # For line charts the completeness signal is (1) how many printed
+        # values the frame already shows (values pop in after the line is
+        # drawn), then (2) the drawing progress of the slowest line and the
+        # value-axis tick count, then the later frame / raw score.
+        printed = float(row.get("_printed_value_count", -1.0))
+        progress = float(row.get("line_progress") or 0.0)
+        ticks = float(row.get("line_tick_count") or 0.0)
+        return (*base, printed, late_priority, progress, ticks, float(row["combined_score"]))
     return (*base, late_priority, float(row["combined_score"]))
 
 
@@ -784,7 +803,11 @@ def select_keyframe(
     if manifest_path.exists() and not force:
         cached = read_json(manifest_path)
         selected = _keyframe_asset(cached)
-        if cached.get("clip_id") == clip_id and selected.exists():
+        if (
+            cached.get("clip_id") == clip_id
+            and selected.exists()
+            and cached.get("visual_clip_fingerprint") == _video_fingerprint(normalized_video)
+        ):
             return cached
 
     duration = _duration_seconds(normalized_video)
@@ -942,6 +965,35 @@ def select_keyframe(
                 + 1.5 * item["line_tick_count"],
                 4,
             )
+    # Line/area charts: values and the axis usually pop in after the line has
+    # finished drawing, so run the same compact vision pass over the top
+    # candidates and prefer the frame with the most printed values (falls
+    # back to the CV progress ranking when vision fails / no printed values).
+    if "line" in chart_type or "area" in chart_type or "timeline" in chart_type:
+        topk = int(cfg.get("keyframes", {}).get("vision_value_topk", 3))
+        cap = int(cfg.get("keyframes", {}).get("vision_value_scan_cap", 8))
+        if topk > 0:
+            pre_ranked = sorted(
+                scored_rows,
+                key=lambda item: (
+                    float(item.get("line_progress") or 0.0),
+                    float(item.get("line_tick_count") or 0.0),
+                    float(item["combined_score"]),
+                ),
+                reverse=True,
+            )
+            scan_n = min(max(topk, 1), len(pre_ranked))
+            for candidate in pre_ranked[:scan_n]:
+                printed, _vbars = _vision_printed_value_count(candidate["path"], cfg)
+                candidate["_printed_value_count"] = printed
+            scanned = pre_ranked[:scan_n]
+            if cap > scan_n and scanned and max(
+                (int(c.get("_printed_value_count", -1)) for c in scanned), default=-1
+            ) <= 0:
+                extra_n = min(cap, len(pre_ranked))
+                for candidate in pre_ranked[scan_n:extra_n]:
+                    printed, _vbars = _vision_printed_value_count(candidate["path"], cfg)
+                    candidate["_printed_value_count"] = printed
     # A chart is only usable for the dataset once its values are printed:
     # value labels usually pop in *after* the bars finish drawing, so the
     # CV-complete frame is not necessarily value-complete.  Run one compact
@@ -1084,6 +1136,97 @@ def select_keyframe(
                 needs_review = True
         except Exception:
             pass
+    # Line/area charts: the annotated interval can also end mid-animation
+    # (the polyline still being drawn).  Scan a short window right after the
+    # visual interval and use the first frame where the slowest line has
+    # reached at least the clip's best drawing progress AND the value axis
+    # is present; the boundary is flagged for review.
+    if (
+        context_video
+        and Path(context_video).exists()
+        and context_visual_end is not None
+        and ("line" in chart_type or "area" in chart_type or "timeline" in chart_type)
+        and bool(cfg.get("keyframes", {}).get("context_tail_scan", False))
+    ):
+        try:
+            best_clip_progress = max(
+                (float(item.get("line_progress") or 0.0) for item in scored_rows),
+                default=0.0,
+            )
+            best_clip_ticks = max(
+                (float(item.get("line_tick_count") or 0.0) for item in scored_rows),
+                default=0.0,
+            )
+            scan_dir = ensure_dir(Path(cfg.get("processed_root", "data/processed")) / clip_id / "context_tail_frames")
+            chosen_tail = None
+            t = float(context_visual_end) + 0.1
+            tail_limit = min(_duration_seconds(context_video) - 0.05, float(context_visual_end) + 2.0)
+            while t < tail_limit and chosen_tail is None:
+                path = scan_dir / f"context_tail_{t:.2f}.png"
+                try:
+                    extract_still(context_video, t, path, force=True)
+                    tail_sharp = _image_sharpness(str(path))
+                    if med_sharp > 0 and tail_sharp < 0.35 * med_sharp:
+                        t += 0.3
+                        continue
+                    tail_lines = detect_lines(str(path))
+                    frame = cv2.imread(str(path))
+                    frame_w = frame.shape[1] if frame is not None else 1
+                    rightmost = [
+                        max(px for px, _ in line.get("points", []))
+                        for line in tail_lines
+                        if line.get("points")
+                    ]
+                    progress = min(rightmost) / frame_w if rightmost else 0.0
+                    tick_cnt = len(detect_axis_tick_marks(str(path), "vertical"))
+                except Exception:
+                    progress = 0.0
+                    tick_cnt = 0
+                if tail_lines and progress >= best_clip_progress and tick_cnt >= max(2.0, best_clip_ticks):
+                    chosen_tail = (t, len(tail_lines), str(path), progress)
+                t += 0.3
+            if chosen_tail:
+                t, cnt, path, progress = chosen_tail
+                clip_rel_ts = min(round(float(t) - float(context_visual_end) + duration, 3), max(0.0, duration - 0.05))
+                selected = {
+                    "timestamp": clip_rel_ts,
+                    "context_tail_timestamp": round(float(t), 3),
+                    "path": path,
+                    "frame_id": Path(path).stem,
+                    "clip_duration": duration,
+                    "score": {
+                        "target_chart_type_match": True,
+                        "same_chart": True,
+                        "scene_change_or_title_card": False,
+                        "scene_change": False,
+                        "structure_complete": True,
+                        "complete_chart": True,
+                        "final_or_most_complete_state": True,
+                        "data_marks_readable": True,
+                        "printed_text_readable": True,
+                        "labels_readable": True,
+                        "edge_crop_or_occlusion": False,
+                        "has_directly_printed_values": True,
+                        "completeness": 1.0,
+                        "state_finality": 1.0,
+                        "data_text_visibility": 1.0,
+                        "chart_identity_consistency": 1.0,
+                        "motion_score": 0.0,
+                        "state_summary": "context-tail frame with a complete line chart (CV verified)",
+                        "reason": "selected by CV line-progress completeness scan of the context tail",
+                    },
+                    "combined_score": round(10.0 + cnt + progress, 4),
+                    "raw_response": None,
+                    "model_status": "cv",
+                    "failure_reason": None,
+                    "line_point_count": cnt,
+                    "line_progress": round(progress, 4),
+                }
+                keyframe_source_role = "context_tail"
+                boundary_reason = "boundary_mid_animation"
+                needs_review = True
+        except Exception:
+            pass
     if keyframe_source_role == "context_tail":
         timestamp = float(selected["timestamp"])
         context_ts = float(selected["context_tail_timestamp"])
@@ -1150,6 +1293,7 @@ def select_keyframe(
     manifest = {
         "clip_id": clip_id,
         "chart_type": row["chart_type"],
+        "visual_clip_fingerprint": _video_fingerprint(normalized_video),
         "timestamps": {"selected": timestamp},
         "context_tail_timestamp": selected.get("context_tail_timestamp"),
         "assets": {"selected": asset, "states": [state["asset"] for state in states]},

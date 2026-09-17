@@ -708,6 +708,7 @@ def build_dynamic_records(
 ) -> dict[str, Any]:
     audit_rows = list(audit or [])
     visual = visual_records_from_clip_data(visual_data, frame_context, image_paths, clip_id)
+    visual = _drop_implausible_qwen_duplicates(visual, audit_rows)
     if isinstance(visual_data, dict):
         chart_context = {
             **chart_context,
@@ -878,6 +879,69 @@ def plan_dynamic_state_keyframes(
         for group in complete_groups
         for row in (_dynamic_keyframe_row(group),)
     }
+    if len(evidence_frames) <= 1:
+        return {"should_save": False, "reason": "static_chart_points_from_single_visual_frame", "states": []}
+
+    first = complete_groups[0]
+    last = complete_groups[-1]
+    if _state_signature(first[2]) == _state_signature(last[2]):
+        return {"should_save": False, "reason": "no_entity_or_value_change", "states": []}
+
+    # Keep every complete evidenced state as a keyframe, capped at max_states.
+    # When capped, always keep the first and last and sample the middle evenly.
+    limit = max(2, int(max_states) if int(max_states) > 0 else 8)
+    if len(complete_groups) > limit:
+        total = len(complete_groups)
+        picks = sorted({round(index * (total - 1) / (limit - 1)) for index in range(limit)})
+        complete_groups = [complete_groups[index] for index in picks]
+    planned = [_dynamic_keyframe_row(group) for group in complete_groups]
+    if any(row.get("timestamp") is None and not row.get("source_frame_path") for row in planned):
+        return {"should_save": False, "reason": "missing_visual_frame_evidence", "states": []}
+    return {
+        "should_save": True,
+        "reason": "complete_evidenced_data_states_selected",
+        "selection_rule": "all_complete_evidenced_data_states_as_state_keyframes",
+        "states": planned,
+    }
+
+
+def _drop_implausible_qwen_duplicates(
+    visual: list[dict[str, Any]],
+    audit: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop Qwen ``visual`` readings where several distinct entities all share
+    one identical value (the model repeating a single printed figure, e.g.
+    every bar read as 380,000).  CV geometry then becomes the source of truth.
+    """
+    from collections import defaultdict
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for rec in visual:
+        groups[(str(rec.get("metric") or ""), str(rec.get("unit") or ""))].append(rec)
+    keep: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for key, recs in groups.items():
+        parsed = [_as_float(r.get("value")) for r in recs]
+        parsed = [v for v in parsed if v is not None]
+        entities = {str(r.get("entity_id") or r.get("entity") or "") for r in recs}
+        if len(recs) >= 2 and parsed and len(set(parsed)) == 1 and len(entities) >= 2:
+            dropped.extend(recs)
+        else:
+            keep.extend(recs)
+    if dropped:
+        sample_value = parsed[0] if parsed else None
+        audit.append(
+            {
+                "stage": "dynamic_data",
+                "status": "dropped",
+                "reason": (
+                    f"implausible identical Qwen values across {len(dropped)} records "
+                    f"({len({str(r.get('entity_id') or r.get('entity')) for r in dropped})} entities), "
+                    f"value={sample_value}; CV geometry takes over"
+                ),
+            }
+        )
+    return keep
     if len(evidence_frames) <= 1:
         return {"should_save": False, "reason": "static_chart_points_from_single_visual_frame", "states": []}
 
